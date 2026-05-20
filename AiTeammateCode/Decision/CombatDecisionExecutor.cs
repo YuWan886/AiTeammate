@@ -5,6 +5,7 @@ using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Multiplayer;
 using MegaCrit.Sts2.Core.Entities.Players;
+using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using MegaCrit.Sts2.Core.MonsterMoves.Intents;
 using MegaCrit.Sts2.Core.Platform;
@@ -23,6 +24,20 @@ public class CombatDecisionExecutor
     public CombatDecisionExecutor(AiLogger? log = null)
     {
         _log = log ?? AiTeammateManager.Instance.AiLog;
+    }
+
+    public static bool TrySignalReadyToBeginEnemyTurn(Player aiPlayer)
+    {
+        var state = CombatManager.Instance.DebugOnlyGetState();
+        if (!CombatManager.Instance.IsInProgress || CombatManager.Instance.IsOverOrEnding)
+            return false;
+        if (state?.CurrentSide != CombatSide.Player)
+            return false;
+        if (!state.Players.Contains(aiPlayer))
+            return false;
+
+        CombatManager.Instance.SetReadyToBeginEnemyTurn(aiPlayer);
+        return true;
     }
 
     public async Task<int> Execute(List<DecisionAction> actions, List<DecisionAction> deferredActions, Player aiPlayer, CancellationToken ct = default, bool endTurn = true)
@@ -46,7 +61,7 @@ public class CombatDecisionExecutor
             foreach (var potionAction in potionActions)
             {
                 if (CombatManager.Instance.IsOverOrEnding) break;
-                if (UseOnePotion(aiPlayer, state, potionAction))
+                if (await UseOnePotion(aiPlayer, state, potionAction, ct))
                     AiTeammateManager.Instance.DirectiveManager.RegisterExecutedAction(aiPlayer, potionAction);
             }
 
@@ -119,7 +134,7 @@ public class CombatDecisionExecutor
                 {
                     _log.Log("AI_ACTION", $"结束回合 | 出牌{cardsPlayed}张 能量 {initialEnergy}→{combat.Energy}");
                     CombatManager.Instance.SetReadyToEndTurn(aiPlayer, canBackOut: false);
-                    CombatManager.Instance.SetReadyToBeginEnemyTurn(aiPlayer);
+                    TrySignalReadyToBeginEnemyTurn(aiPlayer);
                 }
                 catch (Exception endEx)
                 {
@@ -151,7 +166,7 @@ public class CombatDecisionExecutor
             {
                 _log.Log("AI_ACTION", $"结束回合 | 当前能量 {combat.Energy} 辉星 {combat.Stars}");
                 CombatManager.Instance.SetReadyToEndTurn(aiPlayer, canBackOut: false);
-                CombatManager.Instance.SetReadyToBeginEnemyTurn(aiPlayer);
+                TrySignalReadyToBeginEnemyTurn(aiPlayer);
             }
             catch (Exception endEx)
             {
@@ -258,7 +273,7 @@ public class CombatDecisionExecutor
         }
     }
 
-    private bool UseOnePotion(Player aiPlayer, CombatState state, DecisionAction action)
+    private async Task<bool> UseOnePotion(Player aiPlayer, CombatState state, DecisionAction action, CancellationToken ct)
     {
         var potions = aiPlayer.Potions;
         if (potions == null || !potions.Any()) return false;
@@ -292,11 +307,17 @@ public class CombatDecisionExecutor
         _log.Log("AI_ACTION", $"使用药水 [{PromptTextHelper.ResolveLocString(potion.Title, action.PotionName)}]{(target != null ? $" -> {target.Name}" : "")}");
         try
         {
-            // EnqueueManualUse works through the multiplayer action queue synchronizer,
-            // which is the correct path for AI players in multiplayer.
-            potion.EnqueueManualUse(target);
+            var usePotionAction = new UsePotionAction(potion, target, CombatManager.Instance.IsInProgress);
+            RunManager.Instance.ActionQueueSynchronizer.RequestEnqueue(usePotionAction);
             _log.Log("AI_ACTION", $"药水已入队: {PromptTextHelper.ResolveLocString(potion.Title, action.PotionName)}");
+            await usePotionAction.CompletionTask.WaitAsync(ct);
+            _log.Log("AI_ACTION", $"药水执行完成: {PromptTextHelper.ResolveLocString(potion.Title, action.PotionName)}");
             return true;
+        }
+        catch (OperationCanceledException)
+        {
+            _log.Log("AI_ACTION", $"药水执行被取消: {PromptTextHelper.ResolveLocString(potion.Title, action.PotionName)}");
+            throw;
         }
         catch (Exception ex)
         {

@@ -347,7 +347,7 @@ public class AiTeammateManager
             {
                 CombatManager.Instance.SetReadyToEndTurn(AiPlayer, false);
                 if (state.CurrentSide == CombatSide.Player && CombatManager.Instance.IsInProgress)
-                    CombatManager.Instance.SetReadyToBeginEnemyTurn(AiPlayer);
+                    CombatDecisionExecutor.TrySignalReadyToBeginEnemyTurn(AiPlayer);
             }
             catch { }
             return;
@@ -368,7 +368,7 @@ public class AiTeammateManager
                 CombatManager.Instance.SetReadyToEndTurn(AiPlayer, false);
                 var curState = CombatManager.Instance.DebugOnlyGetState();
                 if (curState?.CurrentSide == CombatSide.Player && CombatManager.Instance.IsInProgress)
-                    CombatManager.Instance.SetReadyToBeginEnemyTurn(AiPlayer);
+                    CombatDecisionExecutor.TrySignalReadyToBeginEnemyTurn(AiPlayer);
             }
             catch { }
             return;
@@ -515,7 +515,7 @@ public class AiTeammateManager
                         {
                             AiLog.Log("SYSTEM", "安全网：强制结束AI回合");
                             CombatManager.Instance.SetReadyToEndTurn(AiPlayer, false);
-                            CombatManager.Instance.SetReadyToBeginEnemyTurn(AiPlayer);
+                            CombatDecisionExecutor.TrySignalReadyToBeginEnemyTurn(AiPlayer);
                         }
                     }
                 }

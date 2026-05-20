@@ -1,6 +1,7 @@
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Players;
+using AiTeammate.AiTeammateCode.Decision;
 
 namespace AiTeammate.AiTeammateCode.Patches;
 
@@ -89,7 +90,7 @@ public static class CombatManagerPatch
                 .All(p => !p.Creature.IsAlive);
             if (allHumansDead)
             {
-                CombatManager.Instance.SetReadyToBeginEnemyTurn(manager.AiPlayer);
+                CombatDecisionExecutor.TrySignalReadyToBeginEnemyTurn(manager.AiPlayer);
             }
             return;
         }
@@ -104,7 +105,7 @@ public static class CombatManagerPatch
         // already ended its own turn.
         if (!CombatManager.Instance.IsPlayerReadyToEndTurn(manager.AiPlayer)) return;
 
-        CombatManager.Instance.SetReadyToBeginEnemyTurn(manager.AiPlayer);
+        CombatDecisionExecutor.TrySignalReadyToBeginEnemyTurn(manager.AiPlayer);
     }
 
     private static async void OnTurnStarted(CombatState state)

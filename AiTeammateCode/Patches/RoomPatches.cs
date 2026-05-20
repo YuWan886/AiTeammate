@@ -87,14 +87,14 @@ public static class OfferForRoomEndPatch
 public static class RewardsSetOfferPatch
 {
     [HarmonyPrefix]
-    public static bool Prefix(RewardsSet __instance)
+    public static bool Prefix(RewardsSet __instance, ref Task __result)
     {
         var manager = AiTeammateManager.Instance;
         if (!manager.IsInitialized || manager.AiPlayer == null) return true;
         if (__instance.Player.NetId != manager.AiPlayer.NetId) return true;
 
         manager.AiLog.Log("REWARD", "拦截Offer()，跳过原始方法");
-        _ = AutoClaimAiRewardsAsync(__instance, manager);
+        __result = AutoClaimAiRewardsAsync(__instance, manager);
         return false;
     }
 
@@ -651,9 +651,94 @@ public static class ShouldSelectLocalCardPatch
     }
 }
 
+internal static class AiPlayerChoiceContextHelper
+{
+    public static async Task EndChoiceAsync(PlayerChoiceContext context, Player player)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (manager.IsInitialized
+            && manager.AiPlayer != null
+            && player.NetId == manager.AiPlayer.NetId
+            && context is GameActionPlayerChoiceContext gameActionContext
+            && gameActionContext.Action.OwnerId == player.NetId)
+        {
+            RunManager.Instance.ActionQueueSynchronizer.RequestResumeActionAfterPlayerChoice(gameActionContext.Action);
+            await gameActionContext.Action.WaitForActionToResumeExecutingAfterPlayerChoice();
+            return;
+        }
+
+        await context.SignalPlayerChoiceEnded();
+    }
+}
+
 // ---- Intercept FromSimpleGrid for AI (e.g. Cleanse) ----
 // Instead of letting the game create a card selection screen and then trying
 // to auto-pick it, intercept the call before the screen is ever created.
+[HarmonyPatch(typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd), "FromChooseACardScreen")]
+public static class FromChooseACardScreenAiPatch
+{
+    [HarmonyPrefix]
+    public static bool Prefix(
+        PlayerChoiceContext context,
+        IReadOnlyList<CardModel> cards,
+        Player player,
+        bool canSkip,
+        ref Task<CardModel?> __result)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return true;
+        if (player.NetId != manager.AiPlayer.NetId) return true;
+
+        __result = SelectChooseACardForAiAsync(context, cards, player, canSkip, manager);
+        return false;
+    }
+
+    private static async Task<CardModel?> SelectChooseACardForAiAsync(
+        PlayerChoiceContext context,
+        IReadOnlyList<CardModel> cards,
+        Player player,
+        bool canSkip,
+        AiTeammateManager manager)
+    {
+        if (cards.Count == 0)
+            return null;
+
+        var cardList = cards.ToList();
+        var choiceId = RunManager.Instance.PlayerChoiceSynchronizer.ReserveChoiceId(player);
+        await context.SignalPlayerChoiceBegun(PlayerChoiceOptions.None);
+        try
+        {
+            CardModel? selected = null;
+            if (cardList.Count == 1 && !canSkip)
+            {
+                selected = cardList[0];
+            }
+            else
+            {
+                selected = CardGridSelectionPatch
+                    .PickCardsByHeuristic(cardList, 1, 1, "FromChooseACardScreen")
+                    .FirstOrDefault();
+            }
+
+            var selectedName = selected?.Title ?? selected?.Id.Entry ?? "(跳过)";
+            MainFile.Logger.Info($"[AI] FromChooseACardScreen pick: [{selectedName}]");
+            manager.AiLog.Log("AI_ACTION", $"选牌: {selectedName} | 启发式");
+
+            var index = selected == null ? -1 : cardList.IndexOf(selected);
+            RunManager.Instance.PlayerChoiceSynchronizer.SyncLocalChoice(
+                player,
+                choiceId,
+                PlayerChoiceResult.FromIndex(index));
+
+            return selected;
+        }
+        finally
+        {
+            await AiPlayerChoiceContextHelper.EndChoiceAsync(context, player);
+        }
+    }
+}
+
 [HarmonyPatch(typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd), "FromSimpleGrid")]
 public static class FromSimpleGridAiPatch
 {
@@ -790,6 +875,114 @@ public static class FromDeckForUpgradeAiPatch
     }
 }
 
+// ---- Intercept FromDeckForEnchantment for AI (events/relics/custom mod enchant flows) ----
+[HarmonyPatch(typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd), nameof(MegaCrit.Sts2.Core.Commands.CardSelectCmd.FromDeckForEnchantment),
+    new[] { typeof(Player), typeof(EnchantmentModel), typeof(int), typeof(Func<CardModel, bool>), typeof(CardSelectorPrefs) })]
+public static class FromDeckForEnchantmentAiPatch
+{
+    [HarmonyPrefix]
+    public static bool Prefix(
+        Player player,
+        EnchantmentModel enchantment,
+        int amount,
+        Func<CardModel, bool>? additionalFilter,
+        CardSelectorPrefs prefs,
+        ref Task<IEnumerable<CardModel>> __result)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return true;
+        if (player.NetId != manager.AiPlayer.NetId) return true;
+
+        __result = SelectDeckEnchantForAiAsync(player, enchantment, amount, additionalFilter, prefs, manager);
+        return false;
+    }
+
+    private static async Task<IEnumerable<CardModel>> SelectDeckEnchantForAiAsync(
+        Player player,
+        EnchantmentModel enchantment,
+        int amount,
+        Func<CardModel, bool>? additionalFilter,
+        CardSelectorPrefs prefs,
+        AiTeammateManager manager)
+    {
+        var deck = PileType.Deck.GetPile(player).Cards.ToList();
+        var candidates = deck
+            .Where(card => enchantment.CanEnchant(card) && (additionalFilter?.Invoke(card) ?? true))
+            .ToList();
+
+        if (candidates.Count == 0)
+        {
+            MainFile.Logger.Info($"[AI] FromDeckForEnchantment found no valid candidates for {enchantment.Id.Entry}");
+            manager.AiLog.Log("AI_ACTION", $"附魔选牌: 无可选目标 | {enchantment.Id.Entry}");
+            return Array.Empty<CardModel>();
+        }
+
+        if (candidates.Count <= prefs.MinSelect)
+        {
+            var forcedNames = string.Join(", ", candidates.Select(c => c.Title ?? c.Id.Entry));
+            MainFile.Logger.Info($"[AI] FromDeckForEnchantment forced pick: [{forcedNames}]");
+            manager.AiLog.Log("AI_ACTION", $"附魔选牌: {forcedNames} | 强制唯一候选");
+            return candidates;
+        }
+
+        List<CardModel> picked;
+        string reason;
+        try
+        {
+            var (indices, llmReason) = await manager.DecisionService.DecideCardSelectionAsync(
+                player,
+                candidates,
+                prefs.MinSelect,
+                prefs.MaxSelect,
+                "FromDeckForEnchantment",
+                CancellationToken.None);
+
+            picked = indices
+                .Where(i => i >= 0 && i < candidates.Count)
+                .Distinct()
+                .Take(Math.Max(1, prefs.MaxSelect))
+                .Select(i => candidates[i])
+                .ToList();
+            reason = llmReason;
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"AI enchant selection failed: {ex.Message}, falling back to heuristic");
+            picked = new List<CardModel>();
+            reason = "AI调用失败，启发式选择";
+        }
+
+        if (picked.Count < prefs.MinSelect)
+        {
+            var fallback = CardGridSelectionPatch.PickCardsByHeuristic(
+                candidates,
+                prefs.MinSelect,
+                prefs.MaxSelect,
+                "FromDeckForEnchantmentFallback");
+            foreach (var card in fallback)
+            {
+                if (picked.Contains(card)) continue;
+                picked.Add(card);
+                if (picked.Count >= prefs.MinSelect) break;
+            }
+        }
+
+        if (picked.Count > prefs.MaxSelect)
+            picked = picked.Take(prefs.MaxSelect).ToList();
+
+        var names = string.Join(", ", picked.Select(c => c.Title ?? c.Id.Entry));
+        var choiceId = RunManager.Instance.PlayerChoiceSynchronizer.ReserveChoiceId(player);
+        RunManager.Instance.PlayerChoiceSynchronizer.SyncLocalChoice(
+            player,
+            choiceId,
+            PlayerChoiceResult.FromMutableDeckCards(picked));
+
+        MainFile.Logger.Info($"[AI] FromDeckForEnchantment pick: [{names}] | enchant={enchantment.Id.Entry} amount={amount} reason={reason}");
+        manager.AiLog.Log("AI_ACTION", $"附魔选牌: {names} | {reason}");
+        return picked;
+    }
+}
+
 // ---- Intercept FromHand for AI (e.g. BurningPact, Survivor, TrueGrit) ----
 [HarmonyPatch(typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd), "FromHand")]
 public static class FromHandAiPatch
@@ -860,7 +1053,7 @@ public static class FromHandAiPatch
         }
         finally
         {
-            await context.SignalPlayerChoiceEnded();
+            await AiPlayerChoiceContextHelper.EndChoiceAsync(context, player);
         }
     }
 }
@@ -922,7 +1115,7 @@ public static class FromHandForUpgradeAiPatch
         }
         finally
         {
-            await context.SignalPlayerChoiceEnded();
+            await AiPlayerChoiceContextHelper.EndChoiceAsync(context, player);
         }
     }
 }
@@ -1341,7 +1534,10 @@ public static class ForceGetStateForPlayerPatch
         if (playerId >= 0xA1AA_A000 && playerId <= 0xA1AA_FFFF)
         {
             var getOrCreate = AccessTools.Method(typeof(PeerInputSynchronizer), "GetOrCreateStateForPlayer");
-            __result = getOrCreate.Invoke(__instance, new object[] { playerId });
+            if (getOrCreate == null)
+                return true;
+
+            __result = getOrCreate.Invoke(__instance, new object[] { playerId })!;
             return false;
         }
         return true;
