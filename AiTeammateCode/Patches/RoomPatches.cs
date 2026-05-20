@@ -1,0 +1,1457 @@
+using MegaCrit.Sts2.Core.AutoSlay.Helpers;
+using MegaCrit.Sts2.Core.Commands;
+using MegaCrit.Sts2.Core.Combat;
+using Godot;
+using HarmonyLib;
+using MegaCrit.Sts2.Core.Entities.Cards;
+using MegaCrit.Sts2.Core.Entities.Players;
+using MegaCrit.Sts2.Core.Hooks;
+using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Multiplayer.Game;
+using MegaCrit.Sts2.Core.Nodes;
+using MegaCrit.Sts2.Core.Nodes.Combat;
+using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
+using MegaCrit.Sts2.Core.Nodes.Screens.CardSelection;
+using MegaCrit.Sts2.Core.Nodes.Screens.Map;
+using MegaCrit.Sts2.Core.Rewards;
+using MegaCrit.Sts2.Core.Rooms;
+using MegaCrit.Sts2.Core.Runs;
+using MegaCrit.Sts2.Core.Entities.Multiplayer;
+using MegaCrit.Sts2.Core.Multiplayer.Game.PeerInput;
+using MegaCrit.Sts2.Core.Multiplayer.Game.Lobby;
+using MegaCrit.Sts2.Core.Nodes.Screens.CharacterSelect;
+using MegaCrit.Sts2.Core.CardSelection;
+using MegaCrit.Sts2.Core.GameActions;
+using MegaCrit.Sts2.Core.GameActions.Multiplayer;
+using AiTeammate.AiTeammateCode.Decision;
+
+namespace AiTeammate.AiTeammateCode.Patches;
+
+// ---- Rewards: OfferForRoomEnd is only called for the local player ---
+// Piggyback on the human's call to also trigger AI reward processing.
+// ---- Helper: run a Task for AI without logging NRE as ERROR ----
+// The AI player's game state (PlayerOdds, UnlockState, etc.) isn't fully
+// initialized for server-side reward/rest operations.  NREs thrown inside
+// these game methods are expected and harmless — the actual AI reward
+// processing is handled by RewardsSetOfferPatch which intercepts Offer().
+internal static class AiTaskRunner
+{
+    public static async void RunAiTaskSafely(Task task, string context)
+    {
+        try { await task; }
+        catch (NullReferenceException)
+        {
+            // Expected: AI state not fully initialized for this game path
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[AI] {context} error: {ex.Message}");
+        }
+    }
+}
+
+[HarmonyPatch(typeof(RewardsCmd), nameof(RewardsCmd.OfferForRoomEnd))]
+public static class OfferForRoomEndPatch
+{
+    [HarmonyPostfix]
+    public static void AfterOfferForRoomEnd(Player player, AbstractRoom room)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return;
+        if (player.NetId == manager.AiPlayer.NetId) return; // already handling AI
+
+        var aiPlayer = manager.AiPlayer;
+
+        // Verify AI was in this combat before triggering rewards
+        var combat = CombatManager.Instance.DebugOnlyGetState();
+        if (combat == null || !combat.Players.Any(p => p.NetId == aiPlayer.NetId))
+            return;
+
+        manager.AiLog.Log("AI_ACTION", "战斗结束，开始处理奖励");
+        MainFile.Logger.Info("[REWARD] Triggering AI reward processing");
+
+        try
+        {
+            // Run OfferForRoomEnd for AI. The inner WithRewardsFromRoom may throw
+            // NRE because AI PlayerOdds / UnlockState etc. aren't fully initialized.
+            // Actual reward processing is handled by RewardsSetOfferPatch which
+            // intercepts Offer() for AI players regardless of the caller.
+            AiTaskRunner.RunAiTaskSafely(RewardsCmd.OfferForRoomEnd(aiPlayer, room), "OfferForRoomEnd");
+        }
+        catch (Exception ex) { MainFile.Logger.Warn($"[REWARD] OfferForRoomEnd error: {ex.Message}"); }
+    }
+}
+
+// Intercept Offer() for AI — it will return early at IsMe check otherwise
+[HarmonyPatch(typeof(RewardsSet), nameof(RewardsSet.Offer))]
+public static class RewardsSetOfferPatch
+{
+    [HarmonyPrefix]
+    public static bool Prefix(RewardsSet __instance)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return true;
+        if (__instance.Player.NetId != manager.AiPlayer.NetId) return true;
+
+        manager.AiLog.Log("REWARD", "拦截Offer()，跳过原始方法");
+        _ = AutoClaimAiRewardsAsync(__instance, manager);
+        return false;
+    }
+
+    private static async Task AutoClaimAiRewardsAsync(RewardsSet rewardsSet, AiTeammateManager manager)
+    {
+        var log = manager.AiLog;
+        var aiPlayer = rewardsSet.Player;
+        log.Log("REWARD", $"AI rewards Offer() intercepted for {aiPlayer.Character?.Id.Entry}");
+
+        try
+        {
+            // Step 1: Generate the rewards (cards, gold amounts, etc.)
+            await rewardsSet.GenerateWithoutOffering();
+            var rewards = rewardsSet.Rewards.ToList();
+            log.Log("REWARD", $"Generated {rewards.Count} rewards");
+
+            // Step 2: Auto-claim non-card rewards (gold, relic, potion)
+            foreach (var reward in rewards.ToList())
+            {
+                if (reward is not CardReward)
+                {
+                    var rewardName = reward.GetType().Name;
+                    log.Log("REWARD", $"Auto-claim {rewardName}");
+                    log.Log("AI_ACTION", $"领取奖励: {rewardName}");
+                    try
+                    {
+                        await reward.OnSelectWrapper();
+                        log.Log("REWARD", $"Claimed {rewardName}");
+                    }
+                    catch (Exception ex)
+                    {
+                        log.LogError("REWARD", $"Failed to claim {rewardName}: {ex.Message}");
+                    }
+                }
+            }
+
+            // Step 3: Handle card rewards with AI decision
+            var cardRewards = rewards.OfType<CardReward>().ToList();
+            log.Log("REWARD", $"Card rewards: {cardRewards.Count}");
+
+            foreach (var cardReward in cardRewards)
+            {
+                var cards = cardReward.Cards.ToList();
+                if (cards.Count == 0)
+                {
+                    log.Log("REWARD", "Card reward has no cards, skipping");
+                    await cardReward.OnSelectWrapper();
+                    continue;
+                }
+
+                log.Log("REWARD", $"Card reward: {cards.Count} choices");
+
+                // Ask AI backend to choose
+                int pick;
+                string reason;
+                try
+                {
+                    var cardModels = cards.Cast<CardModel>().ToList();
+                    var (p, r) = await manager.DecisionService.DecideCardRewardAsync(aiPlayer, cardModels, CancellationToken.None);
+                    pick = p;
+                    reason = r;
+                    if (!string.IsNullOrWhiteSpace(reason))
+                        log.Log("AI_THINK", $"[选牌] {reason}");
+                    log.Log("REWARD", $"AI picked index={pick}");
+                }
+                catch (Exception ex)
+                {
+                    log.LogError("REWARD", $"AI card decision failed: {ex.Message}, defaulting to 0");
+                    pick = 0;
+                    reason = "决策失败，默认选第一张";
+                }
+
+                if (pick >= 0 && pick < cards.Count)
+                {
+                    var chosenCard = cards[pick];
+                    log.Log("AI_ACTION", $"选牌: {chosenCard.Id} | {reason}");
+                    log.Log("REWARD", $"AI chose card: {chosenCard.Id}");
+
+                    try
+                    {
+                        // Add card to deck
+                        var result = await CardPileCmd.Add(chosenCard, PileType.Deck);
+                        if (result.success)
+                        {
+                            log.Log("REWARD", $"Card {result.cardAdded.Id} added to deck");
+
+                            // Only sync if combat is fully over. During combat-to-reward
+                            // transitions, the combat state may not be cleaned up yet,
+                            // and syncing cards during combat is rejected by the game.
+                            if (CombatManager.Instance.IsOverOrEnding)
+                            {
+                                try
+                                {
+                                    RunManager.Instance.RewardSynchronizer.SyncLocalObtainedCard(result.cardAdded);
+
+                                    // Sync skipped cards
+                                    for (int i = 0; i < cards.Count; i++)
+                                    {
+                                        if (i != pick)
+                                            RunManager.Instance.RewardSynchronizer.SyncLocalSkippedCard(cards[i]);
+                                    }
+                                }
+                                catch (Exception syncEx)
+                                {
+                                    log.Log("REWARD", $"Card sync deferred (combat cleanup in progress): {syncEx.Message}");
+                                }
+                            }
+                            else
+                            {
+                                log.Log("REWARD", "Card sync skipped — combat still in progress, card added locally");
+                            }
+                        }
+                        else
+                        {
+                            log.Log("REWARD", "Card add failed, skipping card reward");
+                            RunManager.Instance.RewardSynchronizer.SyncLocalSkippedCard(chosenCard);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        log.LogError("REWARD", $"Card add error: {ex.Message}");
+                    }
+                }
+                else
+                {
+                    // Skip all cards
+                    log.Log("AI_ACTION", $"跳过选牌 | {reason}");
+                    log.Log("REWARD", "AI chose to skip card reward");
+                    foreach (var card in cards)
+                        RunManager.Instance.RewardSynchronizer.SyncLocalSkippedCard(card);
+                }
+
+                // Fire after-reward hook
+                try { await Hook.AfterRewardTaken(aiPlayer.RunState, aiPlayer, cardReward); }
+                catch (Exception ex) { log.Log("REWARD", $"AfterRewardTaken hook error: {ex.Message}"); }
+
+                cardReward.MarkContentAsSeen();
+            }
+
+            log.Log("REWARD", "AI reward processing complete");
+            log.Log("AI_ACTION", "战斗奖励处理完成");
+
+            // Signal AI player is ready to proceed to next act.
+            // In multiplayer, the ActChangeSynchronizer waits for ALL players
+            // to signal ready — without this the game hangs at "waiting for players".
+            try
+            {
+                if (RunManager.Instance.ActChangeSynchronizer != null)
+                {
+                    RunManager.Instance.ActionQueueSynchronizer.RequestEnqueue(
+                        new VoteToMoveToNextActAction(aiPlayer));
+                    log.Log("REWARD", "AI player voted to proceed to next act");
+                }
+            }
+            catch (Exception ex)
+            {
+                log.LogError("REWARD", $"Failed to signal AI ready for next act: {ex.Message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogError("REWARD", $"Fatal error: {ex.Message}\n{ex.StackTrace}");
+        }
+    }
+}
+
+// ---- Shop ----
+[HarmonyPatch(typeof(MerchantRoom), nameof(MerchantRoom.EnterInternal))]
+public static class MerchantRoomPatch
+{
+    [HarmonyPostfix]
+    public static void AfterEnter()
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return;
+
+        var aiPlayer = manager.AiPlayer!;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(2000);
+                await manager.OutOfCombatExecutor.AutoShop(aiPlayer, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                MainFile.Logger.Error($"Shop error: {ex.Message}");
+            }
+        });
+    }
+}
+
+// ---- Map Navigation ----
+[HarmonyPatch(typeof(NMapScreen), "_Ready")]
+public static class MapScreenPatch
+{
+    [HarmonyPostfix]
+    public static void AfterReady()
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return;
+
+        var aiPlayer = manager.AiPlayer!;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(2500);
+                await manager.OutOfCombatExecutor.AutoNavigateMap(aiPlayer, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                MainFile.Logger.Error($"Map navigation error: {ex.Message}");
+            }
+        });
+    }
+}
+
+// ---- Rest Site: BeginRestSite creates options for all players ----
+[HarmonyPatch(typeof(RestSiteSynchronizer), nameof(RestSiteSynchronizer.BeginRestSite))]
+public static class RestSiteBeginPatch
+{
+    [HarmonyPostfix]
+    public static void AfterBeginRestSite()
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return;
+
+        var aiPlayer = manager.AiPlayer!;
+        var sync = RunManager.Instance?.RestSiteSynchronizer;
+        if (sync == null) return;
+
+        var options = sync.GetOptionsForPlayer(aiPlayer);
+        if (options == null || options.Count == 0) return;
+
+        var optionIds = options.Select(o => o.OptionId).ToList();
+        var creature = aiPlayer.Creature;
+        var currentHp = creature.CurrentHp;
+        var maxHp = creature.MaxHp;
+        var mainSyncCtx = SynchronizationContext.Current; // capture main-thread context
+        MainFile.Logger.Info($"[REST] AI rest options: {string.Join(", ", optionIds)}");
+
+        // Pre-compute HP-safe fallback locally (fast, no LLM needed).
+        var hpPct = maxHp > 0 ? (currentHp * 100 / maxHp) : 100;
+        int healIdx = optionIds.IndexOf("HEAL");
+        int smithIdx = optionIds.IndexOf("SMITH");
+        int mendIdx = optionIds.IndexOf("MEND");
+        if (healIdx < 0) healIdx = 0;
+        if (smithIdx < 0) smithIdx = optionIds.Count > 1 ? 1 : 0;
+
+        int safeFallback;
+        if (hpPct <= 20) safeFallback = healIdx;
+        else if (hpPct <= 35) safeFallback = healIdx; // HEAL (not MEND) — AI needs its own HP
+        else if (hpPct <= 50) safeFallback = healIdx;
+        else safeFallback = smithIdx;
+
+        // Clamp to valid range
+        safeFallback = Math.Clamp(safeFallback, 0, options.Count - 1);
+        var localFallbackOption = options[safeFallback];
+        if (!localFallbackOption.IsEnabled)
+        {
+            for (int i = 0; i < options.Count; i++)
+                if (options[i].IsEnabled) { safeFallback = i; break; }
+        }
+
+        var fallbackReason = $"HP{hpPct}%，快速安全策略（{localFallbackOption.OptionId}）";
+        MainFile.Logger.Info($"[REST] AI fallback prepared: {localFallbackOption.OptionId}");
+
+        // Let the LLM make the actual decision, including SMITH upgrade indices.
+        // If it times out or returns invalid data, fall back to the safe local rule.
+        _ = Task.Run(async () =>
+        {
+            RestSiteDecisionResult decision;
+            try
+            {
+                using var cts = new CancellationTokenSource(5000); // 5s max for diagnostics
+                decision = await manager.DecisionService.DecideRestSiteAsync(
+                    aiPlayer, currentHp, maxHp, options, cts.Token);
+            }
+            catch
+            {
+                decision = new RestSiteDecisionResult
+                {
+                    Choice = safeFallback,
+                    Reason = fallbackReason
+                };
+            }
+
+            var applyPick = decision.Choice;
+            if (applyPick < 0 || applyPick >= options.Count || !options[applyPick].IsEnabled)
+                applyPick = safeFallback;
+
+            var applyReason = string.IsNullOrWhiteSpace(decision.Reason) ? fallbackReason : decision.Reason;
+            var chosenOption = options[applyPick];
+
+            manager.AiLog.Log("AI_THINK", $"[休息站] {applyReason}");
+            manager.AiLog.Log("AI_ACTION", $"休息站选择: {chosenOption.OptionId} | {applyReason}");
+            MainFile.Logger.Info($"[REST] AI chose {chosenOption.OptionId} via {(decision.Choice == safeFallback ? "fallback/LLM" : "LLM")}");
+
+            if (chosenOption.OptionId == "SMITH" && decision.UpgradeIndices.Count > 0)
+            {
+                manager.SetPendingRestSiteUpgradeIndices(decision.UpgradeIndices);
+                MainFile.Logger.Info($"[REST] Pending SMITH upgrade indices: {string.Join(",", decision.UpgradeIndices)}");
+            }
+            else
+            {
+                manager.SetPendingRestSiteUpgradeIndices(null);
+            }
+
+            if (mainSyncCtx != null)
+            {
+                mainSyncCtx.Post(_ =>
+                {
+                    _ = ApplyRestSiteChoiceAsync(sync, aiPlayer, options, applyPick, manager);
+                }, null);
+            }
+            else
+            {
+                _ = ApplyRestSiteChoiceAsync(sync, aiPlayer, options, applyPick, manager);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Execute the rest site choice for the AI player.
+    /// OnSelect() on RestSiteOption (e.g. HealRestSiteOption) internally calls
+    /// Hook.AfterRestSiteHeal + RewardsCmd.OfferCustom which NRE for AI players
+    /// because their RunState/UnlockState aren't fully initialized.
+    /// Instead, we apply the effect directly (heal HP, etc.) then manually
+    /// update the synchronizer state so the game UI shows the AI has chosen.
+    /// </summary>
+    private static async Task ApplyRestSiteChoiceAsync(RestSiteSynchronizer sync, Player aiPlayer,
+        IReadOnlyList<MegaCrit.Sts2.Core.Entities.RestSite.RestSiteOption> options, int pick,
+        AiTeammateManager manager)
+    {
+        var chosen = options[pick];
+        var log = manager.AiLog;
+        bool effectApplied = false;
+
+        try
+        {
+            // Step 1: Apply the actual effect directly (bypass OnSelect's hooks)
+            switch (chosen.OptionId)
+            {
+                case "HEAL":
+                {
+                    var creature = aiPlayer.Creature;
+                    if (creature == null)
+                    {
+                        log.LogError("REST", "AI creature is null, cannot heal");
+                        return;
+                    }
+                    int healAmount = (int)(creature.MaxHp * 0.3m);
+                    int oldHp = creature.CurrentHp;
+                    await MegaCrit.Sts2.Core.Commands.CreatureCmd.Heal(creature, healAmount, playAnim: false);
+                    effectApplied = true;
+                    log.Log("REST", $"Direct heal: {oldHp} → {creature.CurrentHp}/{creature.MaxHp} (+{healAmount})");
+                    MainFile.Logger.Info($"[REST] AI healed: {oldHp} → {creature.CurrentHp}/{creature.MaxHp}");
+                    break;
+                }
+                case "MEND":
+                {
+                    // MEND heals OTHER characters by 30% max HP.
+                    // OnSelect() would open a target selection screen which our auto-pick
+                    // can't handle, so we apply the effect directly — heal the lowest-HP teammate.
+                    var state = CombatManager.Instance.DebugOnlyGetState();
+                    var teammates = state?.Players
+                        .Where(p => p != aiPlayer && p.Creature.IsAlive)
+                        .OrderBy(p => p.Creature.CurrentHp)
+                        .ToList();
+
+                    if (teammates == null || teammates.Count == 0)
+                    {
+                        log.Log("REST", "MEND: no alive teammates to heal");
+                        break;
+                    }
+
+                    // Heal the lowest-HP teammate
+                    var target = teammates[0];
+                    var targetCreature = target.Creature;
+                    int mendAmount = (int)(targetCreature.MaxHp * 0.3m);
+                    int oldTargetHp = targetCreature.CurrentHp;
+                    await MegaCrit.Sts2.Core.Commands.CreatureCmd.Heal(targetCreature, mendAmount, playAnim: false);
+                    effectApplied = true;
+                    var teammateName = target.Character?.Id.Entry ?? "Teammate";
+                    log.Log("REST", $"MEND healed teammate {teammateName}: {oldTargetHp} → {targetCreature.CurrentHp}/{targetCreature.MaxHp} (+{mendAmount})");
+                    MainFile.Logger.Info($"[REST] AI mended {teammateName}: {oldTargetHp} → {targetCreature.CurrentHp}/{targetCreature.MaxHp}");
+                    break;
+                }
+                case "SMITH":
+                    // Upgrade options open a card selection screen; our ChooseACardSelectionPatch
+                    // auto-picks a card and handles the upgrade.  Hook.AfterRestSiteSmith
+                    // may NRE for AI (missing RunState entries) but the card upgrade
+                    // already completed before that point.
+                    try
+                    {
+                        log.Log("REST", $"Calling OnSelect for {chosen.OptionId}");
+                        // Timeout after 15s to prevent hanging if card selection auto-pick fails
+                        var onSelectTask = chosen.OnSelect();
+                        var timeoutTask = Task.Delay(15_000);
+                        var completed = await Task.WhenAny(onSelectTask, timeoutTask);
+                        if (completed == timeoutTask)
+                        {
+                            log.Log("REST", $"{chosen.OptionId} OnSelect timed out — upgrade may still have been applied");
+                        }
+                        else
+                        {
+                            await onSelectTask; // propagate any exception
+                        }
+                        effectApplied = true;
+                        log.Log("REST", $"{chosen.OptionId} upgrade completed");
+                    }
+                    catch (NullReferenceException)
+                    {
+                        // Hook.AfterRestSiteSmith or VFX may NRE — upgrade already applied
+                        effectApplied = true;
+                        log.Log("REST", $"{chosen.OptionId} OnSelect NRE (expected) — upgrade should be done");
+                    }
+                    catch (Exception ex)
+                    {
+                        // Card selection may have already applied the upgrade via patch
+                        effectApplied = true;
+                        log.Log("REST", $"{chosen.OptionId} OnSelect error: {ex.Message} — upgrade may still be done");
+                    }
+                    break;
+                default:
+                    // LIFT, DIG, etc.
+                    try
+                    {
+                        log.Log("REST", $"Trying OnSelect for {chosen.OptionId}");
+                        var onSelectTask = chosen.OnSelect();
+                        var timeoutTask = Task.Delay(15_000);
+                        var completed = await Task.WhenAny(onSelectTask, timeoutTask);
+                        if (completed == timeoutTask)
+                        {
+                            log.Log("REST", $"{chosen.OptionId} OnSelect timed out");
+                        }
+                        else
+                        {
+                            await onSelectTask;
+                            effectApplied = true;
+                        }
+                        log.Log("REST", $"OnSelect completed for {chosen.OptionId}");
+                    }
+                    catch (NullReferenceException)
+                    {
+                        log.Log("REST", $"OnSelect NRE for {chosen.OptionId}, action may be incomplete");
+                    }
+                    break;
+            }
+
+            // Step 2: Update synchronizer state so the UI shows the AI has chosen.
+            // ChooseOption (private) calls option.OnSelect() internally which NREs.
+            // We bypass that and directly set lastChosenOptionIndex + fire events.
+            UpdateSyncStateDirectly(sync, aiPlayer, options, chosen, pick, effectApplied, log);
+        }
+        catch (Exception ex)
+        {
+            log.LogError("REST", $"ApplyRestSiteChoice error: {ex.Message}");
+            MainFile.Logger.Error($"[REST] ApplyRestSiteChoice error: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Manually update RestSiteSynchronizer internal state for the AI player,
+    /// without going through ChooseOption (which calls OnSelect and NREs).
+    /// Sets lastChosenOptionIndex and fires AfterPlayerOptionChosen so the
+    /// rest site UI shows the "completed" indicator.
+    /// </summary>
+    private static void UpdateSyncStateDirectly(RestSiteSynchronizer sync, Player aiPlayer,
+        IReadOnlyList<MegaCrit.Sts2.Core.Entities.RestSite.RestSiteOption> options,
+        MegaCrit.Sts2.Core.Entities.RestSite.RestSiteOption chosenOption, int pick,
+        bool effectApplied, AiLogger log)
+    {
+        try
+        {
+            // Access _restSites (List<PlayerRestSite>) via Traverse
+            var restSitesTraverse = Traverse.Create(sync).Field("_restSites");
+            var restSites = restSitesTraverse.GetValue();
+            if (restSites == null)
+            {
+                log.Log("REST", "_restSites is null, cannot update sync state");
+                return;
+            }
+
+            // Find the PlayerRestSite whose options list matches ours
+            var restSitesList = (System.Collections.IList)restSites;
+            object? targetSite = null;
+            foreach (var site in restSitesList)
+            {
+                if (site == null) continue;
+                var siteOptions = Traverse.Create(site).Field("options").GetValue();
+                if (ReferenceEquals(siteOptions, options))
+                {
+                    targetSite = site;
+                    break;
+                }
+            }
+
+            if (targetSite == null)
+            {
+                log.Log("REST", "Could not find AI player's rest site entry in _restSites");
+                return;
+            }
+
+            // Set lastChosenOptionIndex
+            var lastIndexTraverse = Traverse.Create(targetSite).Field("lastChosenOptionIndex");
+            lastIndexTraverse.SetValue((uint?)pick);
+            log.Log("REST", $"Sync state updated: lastChosenOptionIndex = {pick}");
+
+            // Fire AfterPlayerOptionChosen event so the UI refreshes
+            try
+            {
+                var afterEvent = (Action<MegaCrit.Sts2.Core.Entities.RestSite.RestSiteOption, bool, ulong>?)
+                    Traverse.Create(sync).Field("AfterPlayerOptionChosen").GetValue();
+                afterEvent?.Invoke(chosenOption, effectApplied, aiPlayer.NetId);
+                log.Log("REST", "AfterPlayerOptionChosen fired");
+            }
+            catch (Exception ex)
+            {
+                MainFile.Logger.Warn($"[REST] AfterPlayerOptionChosen fire failed: {ex.Message}");
+            }
+
+            // Fire BeforePlayerOptionChosen for completeness
+            try
+            {
+                var beforeEvent = (Action<MegaCrit.Sts2.Core.Entities.RestSite.RestSiteOption, ulong>?)
+                    Traverse.Create(sync).Field("BeforePlayerOptionChosen").GetValue();
+                beforeEvent?.Invoke(chosenOption, aiPlayer.NetId);
+            }
+            catch { /* optional */ }
+        }
+        catch (Exception ex)
+        {
+            log.Log("REST", $"UpdateSyncStateDirectly error: {ex.Message}");
+            MainFile.Logger.Warn($"[REST] UpdateSyncStateDirectly: {ex.Message}");
+        }
+    }
+}
+
+// ---- Fix: prevent AI from hanging on card selections ----
+// CardSelectCmd.ShouldSelectLocalCard returns false for AI, causing WaitForRemoteChoice (softlock)
+[HarmonyPatch(typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd), "ShouldSelectLocalCard")]
+public static class ShouldSelectLocalCardPatch
+{
+    [HarmonyPostfix]
+    public static void Postfix(Player player, ref bool __result)
+    {
+        if (__result) return;
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return;
+        if (player.NetId == manager.AiPlayer.NetId)
+            __result = true;
+    }
+}
+
+// ---- Intercept FromSimpleGrid for AI (e.g. Cleanse) ----
+// Instead of letting the game create a card selection screen and then trying
+// to auto-pick it, intercept the call before the screen is ever created.
+[HarmonyPatch(typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd), "FromSimpleGrid")]
+public static class FromSimpleGridAiPatch
+{
+    [HarmonyPrefix]
+    public static bool Prefix(PlayerChoiceContext context, IReadOnlyList<CardModel> cardsIn,
+        Player player, CardSelectorPrefs prefs, ref Task<IEnumerable<CardModel>> __result)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return true;
+        if (player.NetId != manager.AiPlayer.NetId) return true;
+
+        // Handle AI card selection directly — no screen needed
+        MainFile.Logger.Info($"[AI] Intercepting FromSimpleGrid for AI: {cardsIn.Count} cards, min={prefs.MinSelect} max={prefs.MaxSelect}");
+        var cards = cardsIn.ToList();
+        var picked = CardGridSelectionPatch.PickCardsByHeuristic(cards, prefs.MinSelect, prefs.MaxSelect, "FromSimpleGrid");
+        var names = string.Join(", ", picked.Select(c => c.Title ?? c.Id.Entry));
+        MainFile.Logger.Info($"[AI] FromSimpleGrid pick: [{names}]");
+        manager.AiLog.Log("AI_ACTION", $"选牌: {names} | 启发式");
+
+        // Sync the choice
+        var choiceId = RunManager.Instance.PlayerChoiceSynchronizer.ReserveChoiceId(player);
+        var indexes = picked.Select(c => cards.IndexOf(c)).ToList();
+        RunManager.Instance.PlayerChoiceSynchronizer.SyncLocalChoice(player, choiceId,
+            PlayerChoiceResult.FromIndexes(indexes));
+
+        __result = Task.FromResult((IEnumerable<CardModel>)picked);
+        return false; // skip original
+    }
+}
+
+// ---- Intercept FromDeckGeneric for AI (e.g. card removal from deck) ----
+[HarmonyPatch(typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd), "FromDeckGeneric")]
+public static class FromDeckGenericAiPatch
+{
+    [HarmonyPrefix]
+    public static bool Prefix(Player player, CardSelectorPrefs prefs,
+        Func<CardModel, bool>? filter, Func<CardModel, int>? sortingOrder,
+        ref Task<IEnumerable<CardModel>> __result)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return true;
+        if (player.NetId != manager.AiPlayer.NetId) return true;
+
+        // Build the card list the same way as the original method
+        var source = PileType.Deck.GetPile(player).Cards.ToList();
+        var list = (filter == null) ? source.ToList() : source.Where(filter).ToList();
+        if (sortingOrder != null) list = list.OrderBy(sortingOrder).ToList();
+        if (list.Count == 0)
+        {
+            __result = Task.FromResult(Enumerable.Empty<CardModel>());
+            return false;
+        }
+
+        MainFile.Logger.Info($"[AI] Intercepting FromDeckGeneric for AI: {list.Count} cards, min={prefs.MinSelect} max={prefs.MaxSelect}");
+        var picked = CardGridSelectionPatch.PickCardsByHeuristic(list, prefs.MinSelect, prefs.MaxSelect, "FromDeckGeneric");
+        var names = string.Join(", ", picked.Select(c => c.Title ?? c.Id.Entry));
+        MainFile.Logger.Info($"[AI] FromDeckGeneric pick: [{names}]");
+        manager.AiLog.Log("AI_ACTION", $"选牌: {names} | 启发式");
+
+        var choiceId = RunManager.Instance.PlayerChoiceSynchronizer.ReserveChoiceId(player);
+        RunManager.Instance.PlayerChoiceSynchronizer.SyncLocalChoice(player, choiceId,
+            PlayerChoiceResult.FromMutableDeckCards(picked));
+
+        __result = Task.FromResult((IEnumerable<CardModel>)picked);
+        return false; // skip original
+    }
+}
+
+// ---- Intercept FromDeckForUpgrade for AI (rest site SMITH, upgrade events/relics) ----
+[HarmonyPatch(typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd), "FromDeckForUpgrade")]
+public static class FromDeckForUpgradeAiPatch
+{
+    [HarmonyPrefix]
+    public static bool Prefix(Player player, CardSelectorPrefs prefs, ref Task<IEnumerable<CardModel>> __result)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return true;
+        if (player.NetId != manager.AiPlayer.NetId) return true;
+
+        var cards = PileType.Deck.GetPile(player).Cards
+            .Where(c => c.IsUpgradable)
+            .ToList();
+
+        if (cards.Count == 0)
+        {
+            __result = Task.FromResult(Enumerable.Empty<CardModel>());
+            return false;
+        }
+
+        var pendingIndices = manager.ConsumePendingRestSiteUpgradeIndices();
+        List<CardModel> picked;
+        string reason;
+
+        if (pendingIndices is { Count: > 0 })
+        {
+            picked = pendingIndices
+                .Where(i => i >= 0 && i < cards.Count)
+                .Distinct()
+                .Take(Math.Max(1, prefs.MaxSelect))
+                .Select(i => cards[i])
+                .ToList();
+            reason = "休息站 LLM 选牌";
+        }
+        else
+        {
+            picked = CardGridSelectionPatch.PickCardsByHeuristic(cards, prefs.MinSelect, prefs.MaxSelect, "FromDeckForUpgrade");
+            reason = "启发式";
+        }
+
+        if (picked.Count < prefs.MinSelect)
+        {
+            var fallback = CardGridSelectionPatch.PickCardsByHeuristic(cards, prefs.MinSelect, prefs.MaxSelect, "FromDeckForUpgradeFallback");
+            foreach (var card in fallback)
+            {
+                if (picked.Contains(card)) continue;
+                picked.Add(card);
+                if (picked.Count >= prefs.MinSelect) break;
+            }
+        }
+
+        if (picked.Count > prefs.MaxSelect)
+            picked = picked.Take(prefs.MaxSelect).ToList();
+
+        var names = string.Join(", ", picked.Select(c => c.Title ?? c.Id.Entry));
+        MainFile.Logger.Info($"[AI] FromDeckForUpgrade pick: [{names}] | {reason}");
+        manager.AiLog.Log("AI_ACTION", $"升级选牌: {names} | {reason}");
+
+        var choiceId = RunManager.Instance.PlayerChoiceSynchronizer.ReserveChoiceId(player);
+        RunManager.Instance.PlayerChoiceSynchronizer.SyncLocalChoice(player, choiceId,
+            PlayerChoiceResult.FromMutableDeckCards(picked));
+
+        __result = Task.FromResult((IEnumerable<CardModel>)picked);
+        return false;
+    }
+}
+
+// ---- Intercept FromHand for AI (e.g. BurningPact, Survivor, TrueGrit) ----
+[HarmonyPatch(typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd), "FromHand")]
+public static class FromHandAiPatch
+{
+    [HarmonyPrefix]
+    public static bool Prefix(
+        PlayerChoiceContext context,
+        Player player,
+        CardSelectorPrefs prefs,
+        Func<CardModel, bool>? filter,
+        AbstractModel source,
+        ref Task<IEnumerable<CardModel>> __result)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return true;
+        if (player.NetId != manager.AiPlayer.NetId) return true;
+
+        __result = SelectFromHandForAiAsync(context, player, prefs, filter, source, manager);
+        return false;
+    }
+
+    private static async Task<IEnumerable<CardModel>> SelectFromHandForAiAsync(
+        PlayerChoiceContext context,
+        Player player,
+        CardSelectorPrefs prefs,
+        Func<CardModel, bool>? filter,
+        AbstractModel source,
+        AiTeammateManager manager)
+    {
+        if (CombatManager.Instance.IsOverOrEnding)
+            return Array.Empty<CardModel>();
+
+        NPlayerHand.Instance?.CancelAllCardPlay();
+
+        var cards = PileType.Hand.GetPile(player).Cards
+            .Where(filter ?? (_ => true))
+            .ToList();
+
+        if (cards.Count == 0)
+            return cards;
+
+        if (!prefs.RequireManualConfirmation && cards.Count <= prefs.MinSelect)
+            return cards;
+
+        var choiceId = RunManager.Instance.PlayerChoiceSynchronizer.ReserveChoiceId(player);
+        await context.SignalPlayerChoiceBegun(PlayerChoiceOptions.CancelPlayCardActions);
+        try
+        {
+            var pickCount = CardGridSelectionPatch.ResolveHandSelectionCount(cards.Count, prefs.MinSelect, prefs.MaxSelect);
+            var selectionTag = CardGridSelectionPatch.DescribeHandSelectionSource(source, prefs, "FromHand");
+            var picked = pickCount == 0
+                ? new List<CardModel>()
+                : CardGridSelectionPatch.PickCardsByHeuristic(cards, pickCount, pickCount, selectionTag);
+
+            var names = picked.Count > 0
+                ? string.Join(", ", picked.Select(c => c.Title ?? c.Id.Entry))
+                : "(空)";
+
+            MainFile.Logger.Info($"[AI] FromHand pick: [{names}] for {selectionTag} (min={prefs.MinSelect} max={prefs.MaxSelect})");
+            manager.AiLog.Log("AI_ACTION", $"手牌选牌: {names} | 启发式");
+
+            RunManager.Instance.PlayerChoiceSynchronizer.SyncLocalChoice(
+                player,
+                choiceId,
+                PlayerChoiceResult.FromMutableCombatCards(picked));
+
+            return picked;
+        }
+        finally
+        {
+            await context.SignalPlayerChoiceEnded();
+        }
+    }
+}
+
+// ---- Intercept FromHandForUpgrade for AI (e.g. Armaments) ----
+[HarmonyPatch(typeof(MegaCrit.Sts2.Core.Commands.CardSelectCmd), "FromHandForUpgrade")]
+public static class FromHandForUpgradeAiPatch
+{
+    [HarmonyPrefix]
+    public static bool Prefix(
+        PlayerChoiceContext context,
+        Player player,
+        AbstractModel source,
+        ref Task<CardModel?> __result)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return true;
+        if (player.NetId != manager.AiPlayer.NetId) return true;
+
+        __result = SelectUpgradeFromHandForAiAsync(context, player, source, manager);
+        return false;
+    }
+
+    private static async Task<CardModel?> SelectUpgradeFromHandForAiAsync(
+        PlayerChoiceContext context,
+        Player player,
+        AbstractModel source,
+        AiTeammateManager manager)
+    {
+        if (CombatManager.Instance.IsOverOrEnding)
+            return null;
+
+        NPlayerHand.Instance?.CancelAllCardPlay();
+
+        var cards = PileType.Hand.GetPile(player).Cards
+            .Where(c => c.IsUpgradable)
+            .ToList();
+
+        if (cards.Count <= 1)
+            return cards.FirstOrDefault();
+
+        var choiceId = RunManager.Instance.PlayerChoiceSynchronizer.ReserveChoiceId(player);
+        await context.SignalPlayerChoiceBegun(PlayerChoiceOptions.CancelPlayCardActions);
+        try
+        {
+            var picked = CardGridSelectionPatch.PickCardsByHeuristic(cards, 1, 1, "Upgrade");
+            var selected = picked.FirstOrDefault();
+            var selectedName = selected?.Title ?? selected?.Id.Entry ?? "(空)";
+
+            MainFile.Logger.Info($"[AI] FromHandForUpgrade pick: [{selectedName}]");
+            manager.AiLog.Log("AI_ACTION", $"手牌升级选择: {selectedName} | 启发式");
+
+            RunManager.Instance.PlayerChoiceSynchronizer.SyncLocalChoice(
+                player,
+                choiceId,
+                PlayerChoiceResult.FromMutableCombatCard(selected));
+
+            return selected;
+        }
+        finally
+        {
+            await context.SignalPlayerChoiceEnded();
+        }
+    }
+}
+
+// ---- Choose-a-Card Selection (discard, Survivor effect, event card picks, etc.) ----
+[HarmonyPatch(typeof(NChooseACardSelectionScreen), nameof(NChooseACardSelectionScreen.AfterOverlayShown))]
+public static class ChooseACardSelectionPatch
+{
+    [HarmonyPostfix]
+    public static void AfterOverlayShown(NChooseACardSelectionScreen __instance)
+    {
+        AutoPickForAi(__instance, "ChooseACard");
+    }
+
+    private static void AutoPickForAi(NChooseACardSelectionScreen screen, string source)
+    {
+        if (!GodotObject.IsInstanceValid(screen)) return;
+
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return;
+
+        var holders = UiHelper.FindAll<NCardHolder>(screen)
+            .Where(h => h.Visible && h.CardModel != null)
+            .ToList();
+
+        if (holders.Count == 0) return;
+
+        var aiNetId = manager.AiPlayer.NetId;
+
+        var aiHolders = holders
+            .Where(h => h.CardModel?.Owner?.NetId == aiNetId)
+            .ToList();
+
+        var noOwnerHolders = holders
+            .Where(h => h.CardModel?.Owner == null)
+            .ToList();
+
+        if (aiHolders.Count == 0 && noOwnerHolders.Count == holders.Count)
+            aiHolders = holders;
+        else if (aiHolders.Count == 0)
+            return;
+
+        // For in-combat (discard/Survivor/etc.) use fast heuristic.
+        // Out-of-combat uses async LLM.
+        var cards = aiHolders
+            .Select(h => h.CardModel)
+            .Where(c => c != null)
+            .Cast<CardModel>()
+            .ToList();
+
+        if (CombatManager.Instance.IsInProgress)
+        {
+            var picked = CardGridSelectionPatch.PickCardsByHeuristic(cards, 1, 1, source);
+            var name = picked[0].Title ?? picked[0].Id.Entry ?? "?";
+            MainFile.Logger.Info($"AI heuristic pick: [{name}] for {source}");
+            manager.AiLog.Log("AI_ACTION", $"智能选牌: {name} | 启发式选择");
+
+            var tcsField = AccessTools.Field(typeof(NChooseACardSelectionScreen), "_completionSource");
+            var tcs = tcsField?.GetValue(screen) as TaskCompletionSource<IEnumerable<CardModel>>;
+            if (tcs != null && !tcs.Task.IsCompleted)
+                tcs.TrySetResult(picked);
+
+            // Defer removal to avoid re-entrancy during Push()
+            Callable.From(() =>
+            {
+                try
+                {
+                    if (GodotObject.IsInstanceValid(screen))
+                        MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack.Instance?.Remove(screen);
+                }
+                catch { try { if (GodotObject.IsInstanceValid(screen)) screen.Hide(); } catch { } }
+            }).CallDeferred();
+        }
+        else
+        {
+            _ = DoIntelligentSinglePickAsync(screen, manager, cards, source);
+        }
+    }
+
+    private static async Task DoIntelligentSinglePickAsync(
+        NChooseACardSelectionScreen screen, AiTeammateManager manager,
+        List<CardModel> cards, string source)
+    {
+
+        var tcsField = AccessTools.Field(typeof(NChooseACardSelectionScreen), "_completionSource");
+        var tcs = tcsField?.GetValue(screen) as TaskCompletionSource<IEnumerable<CardModel>>;
+
+        // Hide screen so the human isn't blocked
+        screen.Visible = false;
+        try { MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack.Instance?.HideBackstop(); } catch { }
+
+        CardModel picked;
+        string reason;
+        try
+        {
+            var (indices, r) = await manager.DecisionService.DecideCardSelectionAsync(
+                manager.AiPlayer!, cards, 1, 1, source, CancellationToken.None);
+            reason = r;
+            picked = indices.Count > 0 && indices[0] < cards.Count ? cards[indices[0]] : cards[0];
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"AI intelligent single pick failed: {ex.Message}, falling back to heuristic");
+            reason = "AI调用失败，启发式选择";
+            picked = CardGridSelectionPatch.PickCardsByHeuristic(cards, 1, 1, source)[0];
+        }
+
+        var name = picked.Title ?? picked.Id.Entry ?? "?";
+        MainFile.Logger.Info($"AI intelligent pick: [{name}] for {source}: {reason}");
+        if (!string.IsNullOrWhiteSpace(reason))
+            manager.AiLog.Log("AI_THINK", $"[{source}] {reason}");
+        manager.AiLog.Log("AI_ACTION", $"智能选牌: {name} | {reason}");
+
+        tcs?.TrySetResult(new[] { picked });
+
+        if (GodotObject.IsInstanceValid(screen))
+        {
+            var s = screen;
+            Callable.From(() =>
+            {
+                try { MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack.Instance?.Remove(s); }
+                catch { try { s.QueueFree(); } catch { } }
+            }).CallDeferred();
+        }
+    }
+}
+
+// ---- In-Combat Card Grid Selection ----
+[HarmonyPatch(typeof(NCardGridSelectionScreen), nameof(NCardGridSelectionScreen.AfterOverlayShown))]
+public static class CardGridSelectionPatch
+{
+    [HarmonyPostfix]
+    public static void AfterOverlayShown(NCardGridSelectionScreen __instance)
+    {
+        AutoPickGridForAi(__instance);
+    }
+
+    internal static void AutoPickGridForAi(NCardGridSelectionScreen screen)
+    {
+        if (!GodotObject.IsInstanceValid(screen)) return;
+
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return;
+
+        var holders = UiHelper.FindAll<NCardHolder>(screen)
+            .Where(h => h.Visible && h.CardModel != null)
+            .ToList();
+
+        if (holders.Count == 0) return;
+
+        var aiNetId = manager.AiPlayer.NetId;
+        var aiHolders = holders
+            .Where(h => h.CardModel?.Owner?.NetId == aiNetId)
+            .ToList();
+
+        if (aiHolders.Count == 0)
+        {
+            var noOwnerCount = holders.Count(h => h.CardModel?.Owner == null);
+            if (noOwnerCount == holders.Count)
+                aiHolders = holders;
+            else
+                return;
+        }
+
+        // Read _prefs to determine how many cards to select (MinSelect / MaxSelect)
+        int minSelect = 1;
+        int maxSelect = 1;
+        try
+        {
+            var prefsField = AccessTools.Field(screen.GetType(), "_prefs");
+            if (prefsField != null)
+            {
+                var prefs = prefsField.GetValue(screen);
+                if (prefs != null)
+                {
+                    minSelect = (int)(AccessTools.Property(prefs.GetType(), "MinSelect")?.GetValue(prefs) ?? 1);
+                    maxSelect = (int)(AccessTools.Property(prefs.GetType(), "MaxSelect")?.GetValue(prefs) ?? minSelect);
+                }
+            }
+        }
+        catch { /* use defaults */ }
+
+        int toPick = Math.Min(maxSelect, aiHolders.Count);
+        if (toPick < minSelect) toPick = Math.Min(minSelect, aiHolders.Count);
+
+        MainFile.Logger.Info($"AI auto-picking {toPick} card(s) in {screen.GetType().Name} (min={minSelect} max={maxSelect}, {aiHolders.Count} eligible)");
+
+        // For in-combat card selections (Cleanse, enchant, transform, discard, etc.)
+        // use a fast heuristic — LLM calls take 1-8s and would stall the AI's turn.
+        // Out-of-combat selections (event card picks) go through the LLM path.
+        var cards = aiHolders
+            .Select(h => h.CardModel)
+            .Where(c => c != null)
+            .Cast<CardModel>()
+            .ToList();
+
+        bool isInCombat = CombatManager.Instance.IsInProgress;
+        var screenTypeName = screen.GetType().Name;
+        bool isUpgradeScreen = screenTypeName.Contains("Upgrade", StringComparison.OrdinalIgnoreCase);
+
+        // For combat OR upgrade screens (rest site SMITH): use fast heuristic.
+        // Upgrade screens open for AI during rest sites and must be dismissed
+        // immediately — otherwise NOverlayStack blocks human player input.
+        if (isInCombat || isUpgradeScreen)
+        {
+            // Fast local heuristic
+            var picked = PickCardsByHeuristic(cards, minSelect, maxSelect, screenTypeName);
+            var names = string.Join(", ", picked.Select(c => c.Title ?? c.Id.Entry));
+            MainFile.Logger.Info($"AI heuristic pick: [{names}] for {screenTypeName}");
+            manager.AiLog.Log("AI_ACTION", $"智能选牌: {names} ({picked.Count}张) | 启发式选择");
+
+            // Complete TCS synchronously so the game's await on CardsSelected() continues
+            var tcsField = AccessTools.Field(typeof(NCardGridSelectionScreen), "_completionSource");
+            var tcs = tcsField?.GetValue(screen) as TaskCompletionSource<IEnumerable<CardModel>>;
+            if (tcs != null && !tcs.Task.IsCompleted)
+                tcs.TrySetResult(picked);
+
+            // CRITICAL: Do NOT call NOverlayStack.Remove() synchronously here.
+            // AfterOverlayShown is called DURING Push(), and calling Remove()
+            // re-entrantly corrupts the overlay stack state, leaving the backstop
+            // (black overlay) visible and blocking mouse input.
+            // Instead, defer the removal to the next frame after Push() completes.
+            Callable.From(() =>
+            {
+                try
+                {
+                    if (GodotObject.IsInstanceValid(screen))
+                        MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack.Instance?.Remove(screen);
+                }
+                catch
+                {
+                    try { if (GodotObject.IsInstanceValid(screen)) screen.Hide(); } catch { }
+                }
+            }).CallDeferred();
+        }
+        else
+        {
+            // Out-of-combat: use async LLM for smarter picks
+            _ = DoIntelligentGridPickAsync(screen, manager, cards, minSelect, maxSelect);
+        }
+    }
+
+    /// <summary>
+    /// Fast heuristic for in-combat card selection (Cleanse, enchant, transform, etc.).
+    /// Prioritizes removing/selecting weak cards over strong ones.
+    /// </summary>
+    internal static List<CardModel> PickCardsByHeuristic(
+        List<CardModel> cards, int minSelect, int maxSelect, string screenType)
+    {
+        int toPick = Math.Min(maxSelect, cards.Count);
+        if (toPick < minSelect) toPick = minSelect;
+
+        // Determine selection context from screen class name
+        bool isRemoval = screenType.Contains("DeckCardSelect") || screenType.Contains("Remove");
+        bool isEnchant = screenType.Contains("Enchant");
+        bool isUpgrade = screenType.Contains("Upgrade");
+        bool isTransform = screenType.Contains("Transform");
+
+        // Score each card (higher score = more likely to be picked for removal,
+        // lower score = more likely to be kept / picked for upgrade/enchant)
+        var scored = cards.Select(c =>
+        {
+            int score = 0;
+            var id = c.Id.Entry.ToLowerInvariant();
+            var title = (c.Title ?? "").ToLowerInvariant();
+            var rarity = c.Rarity.ToString().ToLowerInvariant();
+
+            // Curses and status cards: always best to remove/worst to keep
+            if (rarity.Contains("curse") || rarity.Contains("basic"))
+                score += 100;
+            // Basic Strike/Defend variants
+            if (title.Contains("strike") || title.Contains("打击"))
+                score += 50;
+            if (title.Contains("defend") || title.Contains("防御"))
+                score += 40;
+            // Common cards: decent removal candidates
+            if (rarity.Contains("common"))
+                score += 20;
+            // Rare cards: bad to remove
+            if (rarity.Contains("rare"))
+                score -= 50;
+            // Upgraded cards: bad to remove
+            if (id.Contains("plus") || title.Contains("+"))
+                score -= 60;
+            // High-cost cards in a low-energy deck: might be good to remove
+            // (heuristic only, no energy context available here)
+
+            return (card: c, score);
+        }).ToList();
+
+        if (isRemoval)
+        {
+            // For removal: pick highest-score cards (worst cards)
+            return scored.OrderByDescending(x => x.score).Take(toPick).Select(x => x.card).ToList();
+        }
+        else if (isEnchant || isUpgrade)
+        {
+            // For enchant/upgrade: pick lowest-score cards (best cards to improve)
+            // But avoid already-upgraded cards
+            var candidates = scored
+                .Where(x => !x.card.Id.Entry.ToLowerInvariant().Contains("plus"))
+                .ToList();
+            if (candidates.Count == 0) candidates = scored;
+            return candidates.OrderBy(x => x.score).Take(toPick).Select(x => x.card).ToList();
+        }
+        else
+        {
+            // For transform / unknown: pick mid-score cards (basic/mediocre)
+            return scored.OrderByDescending(x => x.score).Take(toPick).Select(x => x.card).ToList();
+        }
+    }
+
+    internal static int ResolveHandSelectionCount(int cardCount, int minSelect, int maxSelect)
+    {
+        if (cardCount <= 0 || maxSelect <= 0)
+            return 0;
+
+        var safeMax = Math.Min(cardCount, Math.Max(minSelect, maxSelect));
+        if (minSelect == maxSelect)
+            return safeMax;
+
+        return Math.Min(cardCount, Math.Max(0, minSelect));
+    }
+
+    internal static string DescribeHandSelectionSource(AbstractModel? source, CardSelectorPrefs prefs, string fallback)
+    {
+        if (source is CardModel card)
+            return card.Id.Entry;
+
+        var typeName = source?.GetType().Name;
+        if (!string.IsNullOrWhiteSpace(typeName))
+            return typeName;
+
+        var promptText = prefs.Prompt.GetFormattedText();
+        return string.IsNullOrWhiteSpace(promptText) ? fallback : promptText;
+    }
+
+    /// <summary>
+    /// Out-of-combat async LLM-based card selection (events, rest sites, etc.).
+    /// Not used during combat — PickCardsByHeuristic is used there instead.
+    /// </summary>
+    private static async Task DoIntelligentGridPickAsync(
+        NCardGridSelectionScreen screen, AiTeammateManager manager,
+        List<CardModel> cards, int minSelect, int maxSelect)
+    {
+        var screenType = screen.GetType().Name;
+
+        var tcsField = AccessTools.Field(typeof(NCardGridSelectionScreen), "_completionSource");
+        var tcs = tcsField?.GetValue(screen) as TaskCompletionSource<IEnumerable<CardModel>>;
+
+        // Hide screen so the human isn't blocked while LLM thinks
+        screen.Visible = false;
+        try { MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack.Instance?.HideBackstop(); } catch { }
+
+        List<CardModel> pickedCards;
+        string reason;
+        try
+        {
+            var (indices, r) = await manager.DecisionService.DecideCardSelectionAsync(
+                manager.AiPlayer!, cards, minSelect, maxSelect, screenType,
+                CancellationToken.None);
+            reason = r;
+            pickedCards = indices.Select(i => cards[i]).ToList();
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"AI intelligent grid pick failed: {ex.Message}, falling back to heuristic");
+            reason = "AI调用失败，启发式选择";
+            pickedCards = PickCardsByHeuristic(cards, minSelect, maxSelect, screenType);
+        }
+
+        var names = string.Join(", ", pickedCards.Select(c => c.Title ?? c.Id.Entry));
+        MainFile.Logger.Info($"AI intelligent pick: [{names}] for {screenType}: {reason}");
+        if (!string.IsNullOrWhiteSpace(reason))
+            manager.AiLog.Log("AI_THINK", $"[{screenType}] {reason}");
+        manager.AiLog.Log("AI_ACTION", $"智能选牌: {names} ({pickedCards.Count}张) | {reason}");
+
+        // Complete TCS (thread-safe) and schedule screen cleanup on main thread
+        tcs?.TrySetResult(pickedCards);
+
+        if (GodotObject.IsInstanceValid(screen))
+        {
+            var s = screen;
+            Callable.From(() =>
+            {
+                try { MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack.Instance?.Remove(s); }
+                catch { try { s.QueueFree(); } catch { } }
+            }).CallDeferred();
+        }
+    }
+}
+
+// ---- In-Combat Deck Card Selection (e.g. Cleanse, card removal effects) ----
+// NDeckCardSelectScreen overrides AfterOverlayShown(), so the base-class patch
+// on NCardGridSelectionScreen doesn't fire for it. We need a separate patch.
+[HarmonyPatch(typeof(NDeckCardSelectScreen), nameof(NDeckCardSelectScreen.AfterOverlayShown))]
+public static class DeckCardSelectPatch
+{
+    [HarmonyPostfix]
+    public static void AfterOverlayShown(NDeckCardSelectScreen __instance)
+    {
+        CardGridSelectionPatch.AutoPickGridForAi(__instance);
+    }
+}
+
+// ---- Fix: PeerInputSynchronizer throws for AI players (no peer input state) ----
+// NHandImageCollection.UpdateHandVisibility calls GetScreenType→ForceGetStateForPlayer
+// for every player. AI players have no PeerInputState → InvalidOperationException → hang.
+// Auto-create a default state for AI players instead of throwing.
+[HarmonyPatch(typeof(PeerInputSynchronizer), "ForceGetStateForPlayer")]
+public static class ForceGetStateForPlayerPatch
+{
+    [HarmonyPrefix]
+    public static bool Prefix(ulong playerId, ref object __result, PeerInputSynchronizer __instance)
+    {
+        if (playerId >= 0xA1AA_A000 && playerId <= 0xA1AA_FFFF)
+        {
+            var getOrCreate = AccessTools.Method(typeof(PeerInputSynchronizer), "GetOrCreateStateForPlayer");
+            __result = getOrCreate.Invoke(__instance, new object[] { playerId });
+            return false;
+        }
+        return true;
+    }
+}
+
+// ---- Auto-reconnect AI player when loading a saved multiplayer run ----
+// When the host exits and re-enters a game, the LoadRunLobby waits for all
+// players from the save to reconnect via Steam. The AI has no network peer
+// so it can never send a ClientLoadJoinRequestMessage → never appears in
+// ConnectedPlayerIds → warning popup every time and potential game break.
+// This patch adds the AI to ConnectedPlayerIds immediately on host init,
+// before any clients connect, so the AI is always "already connected".
+[HarmonyPatch(typeof(NMultiplayerLoadGameScreen), "InitializeAsHost")]
+public static class LoadGameScreenHostPatch
+{
+    private const ulong AiNetIdMin = 0xA1AA_A000;
+    private const ulong AiNetIdMax = 0xA1AA_FFFF;
+
+    [HarmonyPostfix]
+    public static void AfterInitializeAsHost(NMultiplayerLoadGameScreen __instance)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized) return;
+
+        try
+        {
+            var lobbyField = AccessTools.Field(typeof(NMultiplayerLoadGameScreen), "_runLobby");
+            var lobby = lobbyField?.GetValue(__instance) as LoadRunLobby;
+            if (lobby == null) return;
+
+            var players = lobby.Run?.Players;
+            if (players == null) return;
+
+            foreach (var p in players)
+            {
+                if (p.NetId >= AiNetIdMin && p.NetId <= AiNetIdMax)
+                {
+                    if (!lobby.ConnectedPlayerIds.Contains(p.NetId))
+                    {
+                        lobby.ConnectedPlayerIds.Add(p.NetId);
+                        lobby.LobbyListener.PlayerConnected(p.NetId);
+                        MainFile.Logger.Info($"[LOAD] AI player {p.NetId} ({p.CharacterId}) auto-reconnected to loaded lobby");
+                    }
+
+                    // Also mark AI as ready so IsAboutToBeginGame() passes.
+                    // _readyPlayers is private — add via reflection.
+                    try
+                    {
+                        var readyField = AccessTools.Field(typeof(LoadRunLobby), "_readyPlayers");
+                        var readyPlayers = (HashSet<ulong>?)readyField?.GetValue(lobby);
+                        if (readyPlayers != null && readyPlayers.Add(p.NetId))
+                            lobby.LobbyListener.PlayerReadyChanged(p.NetId);
+                    }
+                    catch (Exception ex)
+                    {
+                        MainFile.Logger.Warn($"[LOAD] Failed to mark AI as ready: {ex.Message}");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[LOAD] Failed to auto-reconnect AI: {ex.Message}");
+        }
+    }
+}
+
+// ---- Re-detect AI player after loading a saved multiplayer run ----
+[HarmonyPatch(typeof(NGame), nameof(NGame.LoadRun))]
+public static class LoadRunPatch
+{
+    [HarmonyPostfix]
+    public static void AfterLoadRun()
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized) return;
+        manager.DetectAndBindAiPlayer();
+        if (manager.AiPlayer != null)
+            MainFile.Logger.Info($"AI player re-detected after save load: {manager.AiPlayer.Character?.Id.Entry}");
+    }
+}
+
+// ---- Auto-pick relic for AI in treasure rooms ----
+[HarmonyPatch(typeof(TreasureRoomRelicSynchronizer), "BeginRelicPicking")]
+public static class TreasureRoomRelicAutoPickPatch
+{
+    [HarmonyPostfix]
+    public static void AfterBeginRelicPicking(TreasureRoomRelicSynchronizer __instance)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null) return;
+
+        var relics = __instance.CurrentRelics;
+        if (relics == null || relics.Count == 0) return;
+
+        var aiPlayer = manager.AiPlayer!;
+        var index = System.Random.Shared.Next(relics.Count);
+        var picked = relics[index];
+
+        MainFile.Logger.Info($"AI auto-picking relic {index}/{relics.Count}: {picked.Id.Entry}");
+        manager.AiLog.Log("AI_ACTION", $"选择遗物: {picked.Id.Entry} ({relics.Count}选1, 随机)");
+
+        try
+        {
+            __instance.OnPicked(aiPlayer, index);
+        }
+        catch (System.Exception ex)
+        {
+            MainFile.Logger.Warn($"AI relic pick failed: {ex.Message}");
+        }
+    }
+}

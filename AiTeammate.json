@@ -1,0 +1,11 @@
+{
+  "id": "AiTeammate",
+  "name": "AI 队友",
+  "author": "一条鱼丸_",
+  "description": "在多人模式中添加由 AI 操控的队友角色，具备独立人格、团队协作决策、聊天沟通和手牌建议功能。",
+  "version": "v1.0.0",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [],
+  "affects_gameplay": true
+}
