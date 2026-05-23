@@ -579,6 +579,86 @@ public class DecisionService
             return (valid, fallbackReason);
         }
     }
+
+    // ---- Hextech Runes ----
+
+    public async Task<(int choice, List<int>? reroll, string reason)> DecideHextechRuneAsync(
+        Player aiPlayer,
+        List<RuneOptionInfo> options,
+        MonsterHexInfo? monsterHex,
+        CancellationToken ct,
+        bool allowReroll = true)
+    {
+        var context = _contextBuilder.BuildHextechRuneContext(aiPlayer, options, monsterHex);
+        var systemPrompt = BuildSystemPrompt(includeTeamPrinciples: false);
+
+        var instruction = new StringBuilder();
+        instruction.AppendLine("请以 JSON 格式返回海克斯符文选择：");
+        instruction.Append("{\"thinking\":\"分析\",\"choice\":0~");
+        instruction.Append(options.Count - 1);
+        instruction.Append(",\"reason\":\"理由\"");
+        if (allowReroll)
+            instruction.Append(",\"reroll\":[槽位索引数组或null]");
+        instruction.AppendLine("}");
+        if (allowReroll)
+            instruction.AppendLine("如果三个选项都不理想，reroll 可指定要重投的槽位索引（如 [0,2]），重投后会给你新选项再选一次。");
+
+        var response = await SendNonCombatDecisionWithRetryAsync(
+            systemPrompt,
+            BuildTaskPrompt(aiPlayer, context, instruction.ToString().TrimEnd()),
+            512,
+            0.3f,
+            ct: ct);
+
+        if (!response.IsSuccess)
+            return (HextechRunesDecisionHandler.PickHeuristicFallback(aiPlayer, options), null, "AI不可用，使用启发式选择");
+
+        try
+        {
+            var json = ResponseParser.ExtractJson(response.Content);
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            var thinking = root.TryGetProperty("thinking", out var th) ? th.GetString() ?? "" : "";
+            if (!string.IsNullOrWhiteSpace(thinking))
+                AiTeammateManager.Instance.AiLog.Log("AI_THINK", $"[海克斯符文思考] {thinking}");
+
+            var choice = root.TryGetProperty("choice", out var ch) && ch.ValueKind == System.Text.Json.JsonValueKind.Number
+                ? ch.GetInt32() : -1;
+            var reason = root.TryGetProperty("reason", out var r) ? r.GetString() ?? "" : "";
+
+            List<int>? reroll = null;
+            if (allowReroll && root.TryGetProperty("reroll", out var rerollArr) &&
+                rerollArr.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                reroll = new List<int>();
+                foreach (var elem in rerollArr.EnumerateArray())
+                {
+                    if (elem.ValueKind == System.Text.Json.JsonValueKind.Number)
+                    {
+                        var idx = elem.GetInt32();
+                        if (idx >= 0 && idx < options.Count && !reroll.Contains(idx))
+                            reroll.Add(idx);
+                    }
+                }
+                if (reroll.Count == 0) reroll = null;
+            }
+
+            if (choice < 0 || choice >= options.Count)
+            {
+                if (reroll != null && reroll.Count > 0)
+                    return (-1, reroll, reason);
+                return (HextechRunesDecisionHandler.PickHeuristicFallback(aiPlayer, options), null, reason);
+            }
+
+            return (choice, reroll, reason);
+        }
+        catch
+        {
+            var fallbackChoice = HextechRunesDecisionHandler.PickHeuristicFallback(aiPlayer, options);
+            return (fallbackChoice, null, "解析失败，使用启发式选择");
+        }
+    }
 }
 
 public class DecisionResult

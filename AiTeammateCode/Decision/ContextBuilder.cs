@@ -972,6 +972,81 @@ public class ContextBuilder
         return sb.ToString();
     }
 
+    public string BuildHextechRuneContext(Player aiPlayer, List<RuneOptionInfo> options, MonsterHexInfo? monsterHex)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("[海克斯符文选择]");
+
+        AppendPlayerBrief(sb, aiPlayer);
+
+        var strategy = BuildRunStrategyLabel(aiPlayer);
+        if (!string.IsNullOrWhiteSpace(strategy))
+            sb.AppendLine($"构筑策略: {strategy}");
+
+        var relics = aiPlayer.Relics;
+        if (relics != null && relics.Any())
+        {
+            var keyRelics = relics
+                .Where(r =>
+                {
+                    var id = r.Id.Entry.ToLowerInvariant();
+                    return id.Contains("strength") || id.Contains("dexterity")
+                        || id.Contains("energy") || id.Contains("draw")
+                        || id.Contains("block") || id.Contains("damage")
+                        || id.Contains("vulnerable") || id.Contains("weak")
+                        || id.Contains("poison") || id.Contains("orb");
+                })
+                .Take(5)
+                .Select(r => r.Id.Entry)
+                .ToList();
+            if (keyRelics.Count > 0)
+                sb.AppendLine($"关键遗物: {string.Join(", ", keyRelics)}");
+        }
+
+        try
+        {
+            var runState = aiPlayer.RunState;
+            if (runState != null)
+                sb.AppendLine($"当前: 第{runState.CurrentActIndex + 1}幕 第{runState.TotalFloor}层");
+        }
+        catch { }
+
+        sb.AppendLine();
+
+        if (monsterHex != null && !monsterHex.IsRemoved)
+        {
+            sb.AppendLine($"[敌人Hex] {monsterHex.Title}");
+            if (!string.IsNullOrWhiteSpace(monsterHex.Description))
+                sb.AppendLine($"  效果: {monsterHex.Description}");
+        }
+        else
+        {
+            sb.AppendLine("[敌人Hex] 已移除或无");
+        }
+        sb.AppendLine();
+
+        sb.AppendLine("符文选项（三选一）：");
+        for (int i = 0; i < options.Count; i++)
+        {
+            var opt = options[i];
+            var desc = PromptTextHelper.Truncate(opt.Description, 120);
+            sb.AppendLine($"{i}. {opt.Name}");
+            if (!string.IsNullOrWhiteSpace(desc))
+                sb.AppendLine($"   {desc}");
+        }
+
+        var allNames = string.Join(" ", options.Select(o => o.Name));
+        var enrichment = _query.EnrichContext(allNames);
+        if (enrichment.Length > 0)
+        {
+            sb.AppendLine();
+            sb.Append("[相关资料]");
+            sb.Append(enrichment);
+        }
+
+        return sb.ToString();
+    }
+
     /// <summary>Compact one-line player state for non-combat contexts.</summary>
     private void AppendPlayerBrief(StringBuilder sb, Player p)
     {

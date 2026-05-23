@@ -15,6 +15,7 @@ using AiTeammate.AiTeammateCode.Decision;
 using AiTeammate.AiTeammateCode.Personality;
 using AiTeammate.AiTeammateCode.Suggestion;
 using AiTeammate.AiTeammateCode.Teamwork;
+using AiTeammate.AiTeammateCode.Patches;
 using MegaCrit.Sts2.Core.Runs;
 
 namespace AiTeammate.AiTeammateCode;
@@ -103,6 +104,25 @@ public class AiTeammateManager
         IsInitialized = true;
         MainFile.Logger.Info("AI 队友管理器初始化完成");
         AiLog.Log("SYSTEM", "AI 队友管理器初始化完成");
+
+        // HextechRunes integration (soft dependency)
+        try
+        {
+            if (HextechRunesDecisionHandler.IsAvailable)
+            {
+                var harmony = new HarmonyLib.Harmony(MainFile.ModId + ".HextechRunes");
+                HextechRunesPatchInstaller.TryInstall(harmony);
+                AiLog.Log("SYSTEM", "海克斯符文集成已启用");
+            }
+            else
+            {
+                MainFile.Logger.Info("[HextechRunes] 未检测到海克斯符文mod，跳过集成");
+            }
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[HextechRunes] 集成初始化失败: {ex.Message}");
+        }
     }
 
     public void OnAiPlayerJoined(Player aiPlayer)

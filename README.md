@@ -1,9 +1,10 @@
 【只在正式版上测试过】
+【Wsdx233大佬制作的手机移植版也可以运行】
 
 ## 使用方法
 
 1. 先安装mod进入游戏
-2. `win + r` 输入 `%AppData%\SlayTheSpire2\ai_teammate`
+2. `win + r` 输入 `%AppData%\SlayTheSpire2\ai_teammate` 手机上的目录在：文件浏览器 => default => 1 => ai_teammate
 3. 打开 `config.json`
    
 ``` json
@@ -15,4 +16,9 @@
     }
   }
 ```
-4. 推荐用 **deepseek-v4-flash** ，因为真的很便宜。
+
+4. 推荐用 **deepseek-v4-flash** ，因为真的很便宜。（比鱼丸会打xD）
+
+## 特殊兼容mods
+
+- 海克斯符文
