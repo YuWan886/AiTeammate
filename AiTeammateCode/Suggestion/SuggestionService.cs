@@ -3,9 +3,11 @@ using System.Text.Json;
 using MegaCrit.Sts2.Core.Entities.Players;
 using AiTeammate.AiTeammateCode.Backend;
 using AiTeammate.AiTeammateCode.Cache;
+using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Context;
 using AiTeammate.AiTeammateCode.Decision;
 using AiTeammate.AiTeammateCode.Personality;
+using AiTeammate.AiTeammateCode.Settings;
 
 namespace AiTeammate.AiTeammateCode.Suggestion;
 
@@ -28,11 +30,17 @@ public class SuggestionService
 
     public async Task<List<CardSuggestion>> AnalyzeAsync(Player player, CancellationToken ct)
     {
-        var context = _contextBuilder.BuildSuggestionContext(player);
+        if (!AiSettingsStore.Current.EnableSuggestions)
+            return new();
+
+        // This runs on the thread pool when triggered from chat, but reads live combat state and
+        // formats card text — both main-thread-only.
+        var (context, prelude) = MainThread.Invoke(() => (
+            _contextBuilder.BuildSuggestionContext(player),
+            _conversationContext.BuildRunPrelude(player, _contextBuilder)));
         if (string.IsNullOrWhiteSpace(context)) return new();
 
         var systemPrompt = _promptBuilder.BuildSystemPrompt(requireJson: true);
-        var prelude = _conversationContext.BuildRunPrelude(player, _contextBuilder);
 
         var sb = new StringBuilder();
         if (!string.IsNullOrWhiteSpace(prelude))
@@ -67,7 +75,8 @@ public class SuggestionService
             FrequencyPenalty = 0.1f
         };
 
-        using var timeoutCts = new CancellationTokenSource(8000);
+        using var timeoutCts = new CancellationTokenSource(
+            Math.Clamp(AiSettingsStore.Current.DecisionTimeoutMs, 5000, 60000));
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
 
         var response = await _backend.SendAsync(request, linkedCts.Token);
@@ -82,7 +91,7 @@ public class SuggestionService
     {
         try
         {
-            using var doc = JsonDocument.Parse(content);
+            using var doc = JsonDocument.Parse(ResponseParser.ExtractJson(content));
             var root = doc.RootElement;
             var results = new List<CardSuggestion>();
 

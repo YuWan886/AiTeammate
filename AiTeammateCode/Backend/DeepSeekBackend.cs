@@ -1,6 +1,5 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net.Http.Headers;
-using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 
@@ -200,84 +199,6 @@ public class DeepSeekBackend : IAiBackend
         }
     }
 
-    public async IAsyncEnumerable<string> SendStreamingAsync(AiRequest request, [EnumeratorCancellation] CancellationToken ct)
-    {
-        // 构建 messages（与 SendSingleAsync 逻辑一致）
-        var messages = new List<object>();
-
-        var systemPrompt = request.SystemPrompt ?? "";
-        if (request.EnableJsonMode && !HasJsonKeyword(systemPrompt))
-            systemPrompt = systemPrompt.TrimEnd() + "\n\n请严格以 JSON 格式输出。";
-
-        if (!string.IsNullOrWhiteSpace(systemPrompt))
-            messages.Add(new { role = "system", content = systemPrompt });
-
-        foreach (var msg in request.ConversationHistory)
-        {
-            if (string.IsNullOrWhiteSpace(msg.Content)) continue;
-            messages.Add(new { role = msg.Role, content = msg.Content });
-        }
-
-        var userPrompt = request.UserPrompt ?? "";
-        if (request.EnableJsonMode && !HasJsonKeyword(userPrompt) && !HasJsonKeyword(systemPrompt))
-            userPrompt += "\n\n请以 JSON 格式返回结果。";
-
-        messages.Add(new { role = "user", content = userPrompt });
-
-        var bodyDict = new Dictionary<string, object>
-        {
-            ["model"] = _model,
-            ["messages"] = messages,
-            ["max_tokens"] = request.MaxTokens,
-            ["temperature"] = request.Temperature,
-            ["stream"] = true
-        };
-
-        if (request.TopP > 0)
-            bodyDict["top_p"] = request.TopP;
-
-        // 流式模式下一般不启用 json_object（流式 JSON 难以解析）
-        // 但如果显式要求了，仍然传递
-
-        var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/chat/completions");
-        httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
-        httpRequest.Content = new StringContent(JsonSerializer.Serialize(bodyDict), Encoding.UTF8, "application/json");
-        httpRequest.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
-
-        var response = await _client.SendAsync(httpRequest, HttpCompletionOption.ResponseHeadersRead, ct);
-        using var stream = await response.Content.ReadAsStreamAsync();
-        using var reader = new StreamReader(stream);
-
-        while (!reader.EndOfStream)
-        {
-            ct.ThrowIfCancellationRequested();
-            var line = await reader.ReadLineAsync();
-            if (line == null) break;
-            if (!line.StartsWith("data: ")) continue;
-            var data = line.Substring(6);
-            if (data == "[DONE]") break;
-
-            string? pendingText = null;
-            try
-            {
-                using var doc = JsonDocument.Parse(data);
-                var choices = doc.RootElement.GetProperty("choices");
-                if (choices.GetArrayLength() == 0) continue;
-                var delta = choices[0].GetProperty("delta");
-                if (delta.TryGetProperty("content", out var content))
-                {
-                    var text = content.GetString();
-                    if (!string.IsNullOrEmpty(text))
-                        pendingText = text;
-                }
-            }
-            catch (JsonException) { }
-
-            if (pendingText != null)
-                yield return pendingText;
-        }
-    }
-
     public async Task<bool> ValidateConnectionAsync(CancellationToken ct)
     {
         var request = new AiRequest
@@ -315,4 +236,6 @@ public class DeepSeekBackend : IAiBackend
     {
         return model.Contains("deepseek", StringComparison.OrdinalIgnoreCase);
     }
+
+    public void Dispose() => _client.Dispose();
 }

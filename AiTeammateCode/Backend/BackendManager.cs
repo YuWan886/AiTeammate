@@ -1,42 +1,69 @@
+using AiTeammate.AiTeammateCode.Settings;
+
 namespace AiTeammate.AiTeammateCode.Backend;
 
+/// <summary>
+/// Holds the configured backends and rebuilds them whenever the relevant settings change, so
+/// editing an API key or model in the settings page takes effect without restarting the game.
+/// </summary>
 public class BackendManager
 {
-    private readonly Dictionary<string, IAiBackend> _backends = new();
-    private IAiBackend? _active;
+    private static readonly string[] Names = ["DeepSeek", "OpenAI", "Ollama"];
 
-    public IAiBackend? Active => _active;
-    public IReadOnlyDictionary<string, IAiBackend> All => _backends;
+    private readonly Dictionary<string, IAiBackend> _backends = new(StringComparer.Ordinal);
+    private string _fingerprint = "";
 
-    public void Register(IAiBackend backend)
+    public IAiBackend? Active { get; private set; }
+
+    /// <summary>Rebuilds backend instances if any connection-relevant setting changed. 同步设置。</summary>
+    public void SyncFromSettings()
     {
-        _backends[backend.BackendName] = backend;
-    }
+        var settings = AiSettingsStore.Current;
+        var fingerprint = string.Join('|',
+            settings.ActiveBackend,
+            settings.DeepSeekApiKey, settings.DeepSeekModel, settings.DeepSeekBaseUrl,
+            settings.OpenAiApiKey, settings.OpenAiModel, settings.OpenAiBaseUrl,
+            settings.OllamaModel, settings.OllamaBaseUrl,
+            settings.EnableModelThinking);
 
-    public void SwitchTo(string name)
-    {
-        if (_backends.TryGetValue(name, out var backend))
-            _active = backend;
-    }
+        if (fingerprint == _fingerprint)
+            return;
 
-    public async Task<bool> TestConnectionAsync(string name, CancellationToken ct)
-    {
-        if (!_backends.TryGetValue(name, out var backend))
-            return false;
-        return await backend.ValidateConnectionAsync(ct);
+        _fingerprint = fingerprint;
+
+        var oldBackends = _backends.Values.ToList();
+        _backends.Clear();
+
+        foreach (var name in Names)
+        {
+            var backend = BackendFactory.Create(name, settings);
+            if (backend != null)
+                _backends[name] = backend;
+        }
+
+        Active = _backends.TryGetValue(settings.ActiveBackend, out var active) ? active : null;
+
+        // Drop pooled HTTP clients from the replaced instances.
+        foreach (var old in oldBackends.OfType<IDisposable>())
+            old.Dispose();
     }
 
     public async Task<AiResponse> SendAsync(AiRequest request, CancellationToken ct)
     {
-        if (_active == null)
+        SyncFromSettings();
+
+        var active = Active;
+        if (active == null)
             return new AiResponse { IsSuccess = false, ErrorMessage = "No active backend" };
 
-        // Fast-fail: if backend is not available (no API key configured, etc.),
-        // don't waste time on an HTTP call that will fail.
-        if (!_active.IsAvailable)
-            return new AiResponse { IsSuccess = false, ErrorMessage = $"Backend '{_active.BackendName}' is not configured (missing API key)" };
+        // Fast-fail: missing API key should not wait for an HTTP timeout.
+        if (!active.IsAvailable)
+            return new AiResponse
+            {
+                IsSuccess = false,
+                ErrorMessage = $"Backend '{active.BackendName}' is not configured (missing API key)"
+            };
 
-        // Log outgoing request
         AiTrafficLogger.Instance.LogRequest(
             request.Type.ToString(),
             request.SystemPrompt,
@@ -46,35 +73,19 @@ public class BackendManager
             request.Temperature);
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var response = await _active.SendAsync(request, ct);
+        var response = await active.SendAsync(request, ct);
         sw.Stop();
 
-        // Log incoming response
         if (response.IsSuccess)
         {
             AiTrafficLogger.Instance.LogResponse(
-                request.Type.ToString(),
-                true,
-                response.Content,
-                response.TokensUsed,
-                sw.ElapsedMilliseconds);
+                request.Type.ToString(), true, response.Content, response.TokensUsed, sw.ElapsedMilliseconds);
         }
         else
         {
-            AiTrafficLogger.Instance.LogError(
-                request.Type.ToString(),
-                response.ErrorMessage);
+            AiTrafficLogger.Instance.LogError(request.Type.ToString(), response.ErrorMessage);
         }
 
         return response;
-    }
-
-    public IAsyncEnumerable<string> SendStreamingAsync(AiRequest request, CancellationToken ct)
-    {
-        if (_active == null)
-            throw new InvalidOperationException("No active backend configured. Please set up an AI backend in settings.");
-        if (!_active.IsAvailable)
-            throw new InvalidOperationException($"Backend '{_active.BackendName}' is not configured (missing API key). Please set up an AI backend in settings.");
-        return _active.SendStreamingAsync(request, ct);
     }
 }

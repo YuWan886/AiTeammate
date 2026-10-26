@@ -1,12 +1,15 @@
-using MegaCrit.Sts2.Core.Combat;
+﻿using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Players;
 using AiTeammate.AiTeammateCode;
 using AiTeammate.AiTeammateCode.Backend;
 using AiTeammate.AiTeammateCode.Context;
 using AiTeammate.AiTeammateCode.Decision;
 using AiTeammate.AiTeammateCode.Personality;
+using AiTeammate.AiTeammateCode.Settings;
 using AiTeammate.AiTeammateCode.Cache;
 using AiTeammate.AiTeammateCode.Teamwork;
+using AiTeammate.AiTeammateCode.Solo;
+using AiTeammate.AiTeammateCode.Localization;
 using System.Text.Json;
 
 namespace AiTeammate.AiTeammateCode.Chat;
@@ -18,27 +21,25 @@ public class ChatManager
     private readonly ContextBuilder _contextBuilder;
     private readonly ConversationContextManager _conversationContext;
     private readonly PlayerDirectiveManager _directiveManager;
-    private readonly int _cooldownMs;
     private DateTime _lastAutoMessage = DateTime.MinValue;
 
     public List<ChatMessage> RecentMessages { get; } = new();
     public event Action<ChatMessage>? OnMessageReceived;
 
-    public ChatManager(BackendManager backend, PersonalityManager personality, ContentQueryService query, ConversationContextManager conversationContext, PlayerDirectiveManager directiveManager, int cooldownMs = 15000)
+    public ChatManager(BackendManager backend, PersonalityManager personality, ContentQueryService query, ConversationContextManager conversationContext, PlayerDirectiveManager directiveManager)
     {
         _backend = backend;
         _promptBuilder = new PersonalityPromptBuilder(personality);
         _contextBuilder = new ContextBuilder(query);
         _conversationContext = conversationContext;
         _directiveManager = directiveManager;
-        _cooldownMs = cooldownMs;
     }
 
     public void AddSystemMessage(string content)
     {
         var msg = new ChatMessage
         {
-            SenderName = "系统",
+            SenderName = AiLoc.T("chat.system_sender", "System"),
             IsAi = false,
             Content = content,
             Type = ChatMessageType.SystemInfo
@@ -76,7 +77,7 @@ public class ChatManager
         {
             var thinkMsg = new ChatMessage
             {
-                SenderName = "AI 思考",
+                SenderName = AiLoc.T("chat.thought_sender", "AI thoughts"),
                 IsAi = true,
                 Content = thinking,
                 Type = ChatMessageType.Suggestion
@@ -88,6 +89,10 @@ public class ChatManager
 
     public async Task<ChatMessage> HandlePlayerMessage(string playerName, string content, CancellationToken ct)
     {
+        // Solo climb: a message is also an interrupt — hold the automation while we talk.
+        if (SoloRunController.IsActive)
+            AiFlowControl.BeginConversationPause(TimeSpan.FromSeconds(60));
+
         var playerMsg = new ChatMessage
         {
             SenderName = playerName,
@@ -99,7 +104,7 @@ public class ChatManager
         OnMessageReceived?.Invoke(playerMsg);
 
         // Check if player is requesting card suggestions
-        if (IsSuggestionRequest(content))
+        if (AiSettingsStore.Current.EnableSuggestions && IsSuggestionRequest(content))
         {
             _ = Task.Run(async () =>
             {
@@ -113,14 +118,16 @@ public class ChatManager
         var combatContext = BuildCombatChatContext(aiPlayer);
         var chatContext = _contextBuilder.BuildChatContext(RecentMessages, recentWindow: 4);
         var directiveContext = _directiveManager.BuildChatDirectiveContext();
+        var latestInput = AiLoc.T("prompt.chat.player_said", "Player {Name} says: \"{Text}\"",
+            ("Name", playerName), ("Text", content));
         var userPrompt = BuildInteractiveChatPrompt(
             runPrelude,
             combatContext,
             directiveContext,
             chatContext,
-            $"玩家 {playerName} 说：\"{content}\"");
+            latestInput);
 
-        var parsed = await SendInteractiveChatAsync(userPrompt, $"玩家 {playerName} 说：\"{content}\"", ct);
+        var parsed = await SendInteractiveChatAsync(userPrompt, latestInput, ct);
         if (parsed.Directives.Count > 0)
         {
             _directiveManager.RecordAcceptedDirectives(playerName, parsed.Directives);
@@ -130,7 +137,7 @@ public class ChatManager
 
         var replyContent = !string.IsNullOrWhiteSpace(parsed.Reply)
             ? parsed.Reply
-            : "（收到，我会看情况执行。）";
+            : AiLoc.T("chat.reply.ack", "(Got it — I'll act if it makes sense.)");
 
         var aiMsg = new ChatMessage
         {
@@ -142,16 +149,28 @@ public class ChatManager
         RecentMessages.Add(aiMsg);
         OnMessageReceived?.Invoke(aiMsg);
 
+        // Let the AI answer, then give the player a moment to keep talking before resuming.
+        if (SoloRunController.IsActive)
+            AiFlowControl.EndConversationPauseSoon(TimeSpan.FromSeconds(3));
+
         return aiMsg;
     }
 
     public async Task<ChatMessage?> TryAutoMessage(Player aiPlayer, string triggerEvent, CancellationToken ct)
     {
-        var (probability, _) = GetTriggerProbability(triggerEvent);
-        if (new Random().NextDouble() > probability) return null;
+        var settings = AiSettingsStore.Current;
+        if (!settings.EnableAIChat)
+            return null;
+
+        // Don't chatter while the human has interrupted the AI.
+        if (AiFlowControl.IsPaused)
+            return null;
+
+        var probability = GetTriggerProbability(triggerEvent);
+        if (Random.Shared.NextDouble() > probability) return null;
 
         var elapsed = DateTime.UtcNow - _lastAutoMessage;
-        if (elapsed.TotalMilliseconds < _cooldownMs) return null;
+        if (elapsed.TotalMilliseconds < Math.Max(0, settings.ChatCooldownMs)) return null;
 
         _lastAutoMessage = DateTime.UtcNow;
 
@@ -159,7 +178,10 @@ public class ChatManager
         var runPrelude = _conversationContext.BuildRunPrelude(aiPlayer, _contextBuilder);
         var snapshot = _contextBuilder.BuildCombatPromptSnapshot(aiPlayer).RenderEssentials();
         var chatContext = _contextBuilder.BuildChatContext(RecentMessages, recentWindow: 4);
-        var userPrompt = BuildChatPrompt(runPrelude, $"{snapshot}\n\n{chatContext}", $"触发事件：{triggerEvent}", "请用角色语气说一句简短的话（15字以内），禁止重复最近的发言，禁止使用\"让我分析\"\"当前局势\"等套话，要像一个真实的玩家在打字沟通。");
+        var autoTrigger = AiLoc.T("prompt.chat.auto_trigger", "Trigger event: {Event}", ("Event", triggerEvent));
+        var autoInstruction = AiLoc.T("prompt.chat.auto_instruction",
+            "Say one short line in character (under 15 words). Don't repeat recent lines or use filler like \"let me analyze\" or \"the current situation\"; sound like a real player typing.");
+        var userPrompt = BuildChatPrompt(runPrelude, $"{snapshot}\n\n{chatContext}", autoTrigger, autoInstruction);
 
         var request = new AiRequest
         {
@@ -187,19 +209,19 @@ public class ChatManager
         return msg;
     }
 
-    private (double probability, ChatMessageType type) GetTriggerProbability(string triggerEvent)
+    private static double GetTriggerProbability(string triggerEvent)
     {
         return triggerEvent switch
         {
-            "AiTurnStart" => (0.3, ChatMessageType.Suggestion),
-            "AiKeyCard" => (0.8, ChatMessageType.Normal),
-            "AiLowHp" => (0.7, ChatMessageType.Warning),
-            "PlayerLowHp" => (0.6, ChatMessageType.Warning),
-            "PlayerKeyCard" => (0.4, ChatMessageType.Normal),
-            "BossStart" => (0.9, ChatMessageType.Normal),
-            "CombatWon" => (0.8, ChatMessageType.Normal),
-            "EnemyIntent" => (0.5, ChatMessageType.Suggestion),
-            _ => (0.1, ChatMessageType.Normal)
+            "AiTurnStart" => 0.3,
+            "AiKeyCard" => 0.8,
+            "AiLowHp" => 0.7,
+            "PlayerLowHp" => 0.6,
+            "PlayerKeyCard" => 0.4,
+            "BossStart" => 0.9,
+            "CombatWon" => 0.8,
+            "EnemyIntent" => 0.5,
+            _ => 0.1
         };
     }
 
@@ -230,7 +252,7 @@ public class ChatManager
 
         if (!string.IsNullOrWhiteSpace(combatContext))
         {
-            sb.AppendLine("[当前战斗状态]");
+            sb.AppendLine(AiLoc.T("prompt.chat.combat_state", "[Current combat state]"));
             sb.AppendLine(combatContext);
             sb.AppendLine();
         }
@@ -244,24 +266,30 @@ public class ChatManager
         sb.AppendLine(chatContext);
         sb.AppendLine();
         sb.AppendLine(latestInput);
-        sb.AppendLine("请先判断这句话是否包含需要你后续执行的团队指令，再决定是否答应。");
-        sb.AppendLine("请以 JSON 格式返回（json output required）：");
+        sb.AppendLine(AiLoc.T("prompt.chat.judge",
+            "First decide whether the message contains a team directive you should carry out later, then decide whether to accept it."));
+        sb.AppendLine(AiLoc.T("prompt.chat.json_prefix", "Return JSON (json output required):"));
         sb.AppendLine("```json");
-        sb.AppendLine("{\"reply\":\"40字以内回复\",\"directives\":[{\"type\":\"focus_target|use_potion_on_teammate|protect_teammate|support_teammate|general_tactic\",\"accepted\":true,\"summary\":\"你理解到的执行要求\",\"target\":\"目标怪物或玩家名，没有则空\",\"item_hint\":\"药水名或效果关键词，没有则空\",\"duration_turns\":1,\"reason\":\"接受或拒绝原因\"}]}");
+        sb.AppendLine(AiLoc.T("prompt.chat.json_schema",
+            "{\"reply\":\"reply under 40 words\",\"directives\":[{\"type\":\"focus_target|use_potion_on_teammate|protect_teammate|support_teammate|general_tactic\",\"accepted\":true,\"summary\":\"what you understood\",\"target\":\"target enemy or player, empty if none\",\"item_hint\":\"potion name or effect keyword, empty if none\",\"duration_turns\":1,\"reason\":\"why you accepted or rejected\"}]}"));
         sb.AppendLine("```");
-        sb.AppendLine("规则:");
-        sb.AppendLine("1. 没有明确行动请求时，directives 返回空数组。");
-        sb.AppendLine("2. “给我上药水/奶我/给我加 buff”优先使用 use_potion_on_teammate 或 support_teammate。");
-        sb.AppendLine("3. “下回合先集火某只怪/先打某个目标”使用 focus_target，并写清目标。");
-        sb.AppendLine("4. 只有当你愿意尝试执行时 accepted=true；如果当前没有资源、不值得或太危险，可以 accepted=false。");
-        sb.AppendLine("5. reply 要像真实队友在打字沟通，不能是脚本说明文。");
+        sb.AppendLine(AiLoc.T("prompt.chat.rules_header", "Rules:"));
+        sb.AppendLine(AiLoc.T("prompt.chat.rule.1", "1. Return an empty array for directives when there is no explicit action request."));
+        sb.AppendLine(AiLoc.T("prompt.chat.rule.2", "2. For \"use a potion on me / heal me / buff me\", prefer use_potion_on_teammate or support_teammate."));
+        sb.AppendLine(AiLoc.T("prompt.chat.rule.3", "3. For \"focus that enemy next turn / hit that target first\", use focus_target and name the target."));
+        sb.AppendLine(AiLoc.T("prompt.chat.rule.4", "4. Set accepted=true only when you're willing to try; set accepted=false if you lack resources, it isn't worth it, or it's too dangerous."));
+        sb.AppendLine(AiLoc.T("prompt.chat.rule.5", "5. The reply must read like a real teammate typing, not a scripted explanation."));
         return sb.ToString();
     }
 
     private List<AiMessage> BuildHistory()
     {
         var history = new List<AiMessage>();
-        foreach (var msg in RecentMessages.TakeLast(4))
+        var take = Math.Clamp(AiSettingsStore.Current.MaxChatHistoryForPrompt, 0, 30);
+        if (take == 0)
+            return history;
+
+        foreach (var msg in RecentMessages.TakeLast(take))
         {
             history.Add(new AiMessage
             {
@@ -287,15 +315,20 @@ public class ChatManager
             ConversationHistory = BuildHistory()
         };
 
-        var response = await _backend.SendAsync(request, ct);
+        using var timeoutCts = new CancellationTokenSource(
+            Math.Clamp(AiSettingsStore.Current.ChatTimeoutMs, 2000, 60000));
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+        var response = await _backend.SendAsync(request, linkedCts.Token);
         if (!response.IsSuccess)
-            return new InteractiveChatResult { Reply = "（思考中...）" };
+            return new InteractiveChatResult { Reply = AiLoc.T("chat.reply.thinking", "(Thinking...)") };
 
         var parsed = TryParseInteractiveChatResponse(response.Content);
         if (parsed != null)
             return parsed;
 
-        var fallbackPrompt = BuildChatPrompt("", _contextBuilder.BuildChatContext(RecentMessages, recentWindow: 4), latestInput, "请用你的角色风格简短回复（40字以内）。");
+        var fallbackPrompt = BuildChatPrompt("", _contextBuilder.BuildChatContext(RecentMessages, recentWindow: 4), latestInput,
+            AiLoc.T("prompt.chat.fallback_instruction", "Reply briefly in your character's style (under 40 words)."));
         var fallbackRequest = new AiRequest
         {
             SystemPrompt = _promptBuilder.BuildSystemPrompt(chatMode: true),
@@ -310,7 +343,7 @@ public class ChatManager
         var fallbackResponse = await _backend.SendAsync(fallbackRequest, ct);
         return new InteractiveChatResult
         {
-            Reply = fallbackResponse.IsSuccess ? fallbackResponse.Content.Trim() : "（收到。）"
+            Reply = fallbackResponse.IsSuccess ? fallbackResponse.Content.Trim() : AiLoc.T("chat.reply.received", "(Got it.)")
         };
     }
 
@@ -472,7 +505,7 @@ public class ChatManager
             var suggestions = await manager.SuggestionService.AnalyzeAsync(humanPlayer, System.Threading.CancellationToken.None);
             if (suggestions.Count > 0)
             {
-                manager.CardHighlighter?.ApplyHighlights(suggestions, humanPlayer);
+                Compat.MainThread.Post(() => manager.CardHighlighter?.ApplyHighlights(suggestions, humanPlayer));
             }
         }
         catch (Exception ex)

@@ -4,8 +4,11 @@ using MegaCrit.Sts2.Core.Models;
 using AiTeammate.AiTeammateCode;
 using AiTeammate.AiTeammateCode.Backend;
 using AiTeammate.AiTeammateCode.Cache;
+using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Context;
 using AiTeammate.AiTeammateCode.Personality;
+using AiTeammate.AiTeammateCode.Settings;
+using AiTeammate.AiTeammateCode.Solo;
 
 namespace AiTeammate.AiTeammateCode.Decision;
 
@@ -17,31 +20,29 @@ public class DecisionService
     private readonly PersonalityManager _personalityManager;
     private readonly MemoryManager _memoryManager;
     private readonly ConversationContextManager _conversationContext;
-    private readonly int _timeoutMs;
-    private readonly int _nonCombatRetryCount;
+    private readonly AiToolRunner _tools;
 
     public DecisionService(
         BackendManager backend,
         PersonalityManager personality,
         ContentQueryService query,
-        ConversationContextManager conversationContext,
-        int timeoutMs = 8000,
-        int nonCombatRetryCount = 2)
+        ConversationContextManager conversationContext)
     {
         _backend = backend;
         _promptBuilder = new PersonalityPromptBuilder(personality);
         _contextBuilder = new ContextBuilder(query);
-        _timeoutMs = Math.Max(timeoutMs, 15000);
-        _nonCombatRetryCount = nonCombatRetryCount;
         _personalityManager = personality;
         _memoryManager = new MemoryManager();
         _conversationContext = conversationContext;
+        _tools = new AiToolRunner(_contextBuilder, query);
     }
 
     private string BuildSystemPrompt(bool includeTeamPrinciples)
     {
-        var prompt = _promptBuilder.BuildSystemPrompt(requireJson: true, includeTeamPrinciples: includeTeamPrinciples);
-        return includeTeamPrinciples
+        // Solo climb has no teammates; team-coordination rules would only add noise.
+        var withTeam = includeTeamPrinciples && !SoloRunController.IsActive;
+        var prompt = _promptBuilder.BuildSystemPrompt(requireJson: true, includeTeamPrinciples: withTeam);
+        return withTeam
             ? _promptBuilder.AppendTeamPrinciples(prompt)
             : prompt;
     }
@@ -54,9 +55,12 @@ public class DecisionService
         string systemPrompt, string userPrompt,
         int maxTokens, float temp,
         List<AiMessage>? history = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        int? timeoutOverrideMs = null)
     {
-        using var timeoutCts = new CancellationTokenSource(_timeoutMs);
+        var settings = AiSettingsStore.Current;
+        var timeoutMs = Math.Clamp(timeoutOverrideMs ?? settings.DecisionTimeoutMs, 5000, 120000);
+        using var timeoutCts = new CancellationTokenSource(timeoutMs);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
         return await _backend.SendAsync(new AiRequest
         {
@@ -80,9 +84,10 @@ public class DecisionService
         string systemPrompt, string userPrompt,
         int maxTokens, float temp,
         List<AiMessage>? history = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        int? timeoutOverrideMs = null)
     {
-        int maxAttempts = _nonCombatRetryCount + 1; // 首次尝试 + 重试次数
+        int maxAttempts = Math.Clamp(AiSettingsStore.Current.NonCombatRetryCount, 0, 5) + 1; // 首次尝试 + 重试次数
         AiResponse? lastResponse = null;
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
@@ -91,10 +96,10 @@ public class DecisionService
             {
                 // 重试前等待，递增延迟
                 await Task.Delay(500 * attempt, ct);
-                MainFile.Logger.Info($"[DecisionService] 非战斗决策重试 ({attempt}/{_nonCombatRetryCount})");
+                MainFile.Logger.Info($"[DecisionService] 非战斗决策重试 ({attempt}/{maxAttempts - 1})");
             }
 
-            lastResponse = await SendDecisionAsync(systemPrompt, userPrompt, maxTokens, temp, history, ct);
+            lastResponse = await SendDecisionAsync(systemPrompt, userPrompt, maxTokens, temp, history, ct, timeoutOverrideMs);
 
             if (lastResponse.IsSuccess)
                 return lastResponse;
@@ -104,9 +109,99 @@ public class DecisionService
                 return lastResponse;
         }
 
-        MainFile.Logger.Warn($"[DecisionService] 非战斗决策 {_nonCombatRetryCount} 次重试均失败");
+        MainFile.Logger.Warn($"[DecisionService] 非战斗决策 {maxAttempts - 1} 次重试均失败");
         return lastResponse!;
     }
+
+    /// <summary>
+    /// Sends a decision request and runs any read-only tool calls the model asks for, then re-asks.
+    /// The initial prompt enters the history exactly once; tool results plus the follow-up
+    /// instruction form the final user message so roles stay user/assistant alternating.
+    /// <paramref name="hasAnswer"/> marks responses that already contain a usable decision — those
+    /// win over tool calls so the turn never stalls. Returns the last response unchanged when the
+    /// tool budget is spent; callers fall back to their own defaults in that case.
+    /// </summary>
+    private async Task<AiResponse> RequestWithToolsAsync(
+        Player aiPlayer,
+        string systemPrompt,
+        string firstPrompt,
+        int maxTokens,
+        float temp,
+        int maxToolRounds,
+        int toolRoundTimeoutMs,
+        Func<System.Text.Json.JsonElement, bool> hasAnswer,
+        bool retryOnFailure,
+        CancellationToken ct)
+    {
+        var history = new List<AiMessage>();
+        var prompt = firstPrompt;
+
+        for (var round = 0; ; round++)
+        {
+            var response = retryOnFailure
+                ? await SendNonCombatDecisionWithRetryAsync(systemPrompt, prompt, maxTokens, temp, history, ct,
+                    round > 0 ? toolRoundTimeoutMs : null)
+                : await SendDecisionAsync(systemPrompt, prompt, maxTokens, temp, history, ct,
+                    round > 0 ? toolRoundTimeoutMs : null);
+
+            if (!response.IsSuccess)
+                return response;
+
+            var calls = ResponseParser.ExtractToolCalls(response.Content);
+            if (calls.Count == 0)
+                return response;
+
+            if (HasAnswer(response.Content, hasAnswer))
+            {
+                MainFile.Logger.Warn("[DecisionService] 响应同时包含决策内容与 tool_calls，忽略工具调用");
+                return response;
+            }
+
+            if (round >= maxToolRounds)
+                return response;
+
+            // The human interrupted mid-decision in solo climb: don't spend another request.
+            if (SoloRunController.IsActive && AiFlowControl.IsPaused)
+                return response;
+
+            var toolOutput = MainThread.Invoke(() => _tools.Execute(aiPlayer, calls));
+            LogToolCalls(calls, toolOutput);
+
+            history.Add(new AiMessage { Role = "user", Content = prompt });
+            history.Add(new AiMessage { Role = "assistant", Content = response.Content });
+            prompt = "工具结果：\n" + toolOutput +
+                     "\n\n请基于上面的工具结果，直接输出最终决策 JSON；不要再次调用工具。";
+        }
+    }
+
+    private static bool HasAnswer(string content, Func<System.Text.Json.JsonElement, bool> hasAnswer)
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(ResponseParser.ExtractJson(content));
+            return hasAnswer(doc.RootElement);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool HasChoiceKey(System.Text.Json.JsonElement root) => root.TryGetProperty("choice", out _);
+    private static bool HasChoicesKey(System.Text.Json.JsonElement root) => root.TryGetProperty("choices", out _);
+    private static bool HasIndicesKey(System.Text.Json.JsonElement root) => root.TryGetProperty("indices", out _);
+
+    private static bool HasCombatActions(System.Text.Json.JsonElement root) =>
+        root.TryGetProperty("actions", out var actions)
+        && actions.ValueKind == System.Text.Json.JsonValueKind.Array
+        && actions.GetArrayLength() > 0;
+
+    /// <summary>Out-of-combat decisions get two tool rounds; 0 disables tools for this call.</summary>
+    private static int OutOfCombatToolRounds =>
+        AiSettingsStore.Current.EnableOutOfCombatReadTools ? MaxOutOfCombatToolRounds : 0;
+
+    private const int MaxOutOfCombatToolRounds = 2;
+    private const int MaxOutOfCombatToolTimeoutMs = 15000;
 
     public void ResetCombatHistory(string? combatId = null)
     {
@@ -115,25 +210,72 @@ public class DecisionService
 
     // ---- Combat ----
 
+    /// <summary>Extra request rounds per combat decision that may be spent on read-only tool calls.</summary>
+    private const int MaxToolRounds = 1;
+
+    /// <summary>Upper bound for the follow-up request after a tool call (shares the 45s turn budget).</summary>
+    private const int MaxToolRoundTimeoutMs = 12000;
+
     public async Task<DecisionResult> DecideCombatAsync(Player aiPlayer, CancellationToken ct)
     {
         var systemPrompt = BuildSystemPrompt(includeTeamPrinciples: true);
-        var prelude = BuildContextPrelude(aiPlayer);
-        var snapshot = _conversationContext.BuildCombatContext(aiPlayer, _contextBuilder);
-        var directiveContext = AiTeammateManager.Instance.DirectiveManager.BuildCombatDirectivePrompt(aiPlayer);
-        var userPrompt = BuildCombatDecisionPrompt(prelude, snapshot, directiveContext);
+        var allowTools = AiSettingsStore.Current.EnableReadTools;
 
-        var response = await SendDecisionAsync(systemPrompt, userPrompt, 1024, 0.3f, history: null, ct);
+        // The prompt reads live combat state and formats card descriptions through the game's
+        // localization formatter, which is main-thread-only (shared SmartFormat pools). Build it in a
+        // single main-thread hop; only the HTTP round trip runs on the thread pool.
+        var firstPrompt = MainThread.Invoke(() =>
+        {
+            var prelude = BuildContextPrelude(aiPlayer);
+            var snapshot = _conversationContext.BuildCombatContext(aiPlayer, _contextBuilder);
+            var directiveContext = AiTeammateManager.Instance.DirectiveManager.BuildCombatDirectivePrompt(aiPlayer);
+            return BuildCombatDecisionPrompt(prelude, snapshot, directiveContext, allowTools);
+        });
 
-        if (!response.IsSuccess) return DecisionResult.Fallback();
+        // The tool round is an extra request inside the 45s turn budget: keep it short.
+        var toolTimeoutMs = Math.Min(AiSettingsStore.Current.DecisionTimeoutMs, MaxToolRoundTimeoutMs);
+
+        var response = await RequestWithToolsAsync(aiPlayer, systemPrompt, firstPrompt, 1024, 0.3f,
+            allowTools ? MaxToolRounds : 0, toolTimeoutMs, HasCombatActions, retryOnFailure: false, ct);
+
+        if (!response.IsSuccess)
+            return DecisionResult.Fallback();
 
         var result = ResponseParser.ParseDecision(response.Content);
+
+        // Tool calls that were never executed (tools disabled, budget spent, or interrupted) are
+        // not a plan: end the turn instead of idling with no actions.
+        if (result.ToolCalls.Count > 0 && result.Actions.Count == 0 && result.DeferredActions.Count == 0)
+            return DecisionResult.Fallback();
+
         if (!result.IsFallback)
-            _conversationContext.RecordCombatDecision(aiPlayer, _contextBuilder, result);
+            MainThread.Run(() => _conversationContext.RecordCombatDecision(aiPlayer, _contextBuilder, result));
         return result;
     }
 
-    private string BuildCombatDecisionPrompt(string prelude, string snapshot, string directiveContext)
+    private static void LogToolCalls(IReadOnlyList<ToolCall> calls, string output)
+    {
+        var names = string.Join(", ", calls.Select(call => call.Args.Count == 0
+            ? call.Name
+            : $"{call.Name}({string.Join(",", call.Args.Select(arg => $"{arg.Key}={arg.Value}"))})"));
+        MainFile.Logger.Info($"[DecisionService] 工具调用: {names}");
+
+        try
+        {
+            var manager = AiTeammateManager.Instance;
+            if (manager?.AiLog == null)
+                return;
+
+            var summary = output.Length > 200 ? output[..200] + "…" : output;
+            manager.AiLog.Log("AI_TOOL", $"[工具] {names} -> {summary}");
+        }
+        catch
+        {
+            // Tool logging must never break the decision path.
+        }
+    }
+
+    private string BuildCombatDecisionPrompt(string prelude, string snapshot, string directiveContext, bool allowReadTools)
     {
         var sb = new StringBuilder();
         if (!string.IsNullOrWhiteSpace(prelude))
@@ -160,6 +302,10 @@ public class DecisionService
         sb.AppendLine("若队友手里有易伤/破甲/力量/补刀机会，优先先出防御、力量、过牌等铺垫牌，把会受益的攻击放进 deferred_actions。");
         sb.AppendLine("若敌人已被队友压到残血，除非你能稳定完成击杀，否则不要抢斩杀；用 chat_message 明确集火目标。");
         sb.AppendLine("若上方存在[玩家战术指令]，应优先考虑执行；尤其是集火目标和给队友上药水。若你认为不该执行，请在 thinking 和 chat_message 中体现理由。");
+
+        if (allowReadTools)
+            AppendToolInstructions(sb, combat: true);
+
         return sb.ToString();
     }
 
@@ -167,10 +313,18 @@ public class DecisionService
     {
         var sb = new StringBuilder();
         var profile = _personalityManager.Active;
-        if (profile != null)
+        var settings = AiSettingsStore.Current;
+
+        if (SoloRunController.IsActive)
+        {
+            sb.AppendLine("【单人爬塔】你正在独自爬塔，队伍里只有你一个，不需要等待或配合队友；按自己的节奏和判断推进。");
+            sb.AppendLine();
+        }
+
+        if (profile != null && settings.EnableLongTermMemory && settings.MaxMemoriesPerPrompt > 0)
         {
             var memory = _memoryManager.Load(profile.Id);
-            var memories = _memoryManager.GetRelevantMemories(profile.Id, 3);
+            var memories = _memoryManager.GetRelevantMemories(profile.Id, settings.MaxMemoriesPerPrompt);
             var memoryContext = _promptBuilder.BuildMemoryContext(memories, memory.SelfReflection);
             if (!string.IsNullOrWhiteSpace(memoryContext))
             {
@@ -198,7 +352,32 @@ public class DecisionService
 
         sb.AppendLine(context);
         sb.AppendLine(instruction);
+
+        if (AiSettingsStore.Current.EnableOutOfCombatReadTools)
+            AppendToolInstructions(sb, combat: false);
+
         return sb.ToString();
+    }
+
+    /// <summary>Advertises the read-only tools and their call format at the end of a prompt.</summary>
+    private static void AppendToolInstructions(StringBuilder sb, bool combat)
+    {
+        sb.AppendLine();
+        if (combat)
+        {
+            sb.AppendLine("【只读工具（可选）】如果上面的信息不足，你可以先只返回工具调用，不要返回 actions：");
+            sb.AppendLine("{\"thinking\":\"为什么要查\",\"tool_calls\":[{\"name\":\"read_relics\"}]}");
+            sb.AppendLine(AiToolRunner.DescribeCombatTools());
+            sb.AppendLine("规则：每次决策最多一轮工具调用；系统会把工具结果发回给你，之后必须直接输出最终决策 JSON，不要再次调用工具。抽牌堆顺序无法获得。");
+            sb.AppendLine("多人模式下队友行只给出牌堆张数；需要队友的具体牌时传 player（队友名或角色名），例如 {\"pile\":\"draw\",\"player\":\"队友名\"}。");
+        }
+        else
+        {
+            sb.AppendLine("【只读工具（可选）】如果上面的信息不足，你可以先只返回工具调用，不要返回决策字段：");
+            sb.AppendLine("{\"thinking\":\"为什么要查\",\"tool_calls\":[{\"name\":\"read_map\"}]}");
+            sb.AppendLine(AiToolRunner.DescribeOutOfCombatTools());
+            sb.AppendLine("规则：本决策最多两轮工具调用；收到工具结果后必须直接输出最终决策 JSON，不要再次调用工具。");
+        }
     }
 
     // ---- Card Reward ----
@@ -210,7 +389,8 @@ public class DecisionService
         var systemPrompt = BuildSystemPrompt(includeTeamPrinciples: false);
         var userPrompt = BuildTaskPrompt(aiPlayer, context, "请以 JSON 格式返回选牌决策：{\"choice\":0~2选一张, \"reason\":\"理由\"} 或 {\"choice\":-1, \"reason\":\"跳过理由\"}");
 
-        var response = await SendNonCombatDecisionWithRetryAsync(systemPrompt, userPrompt, 256, 0.4f, ct: ct);
+        var response = await RequestWithToolsAsync(aiPlayer, systemPrompt, userPrompt, 256, 0.4f,
+            OutOfCombatToolRounds, MaxOutOfCombatToolTimeoutMs, HasChoiceKey, retryOnFailure: true, ct);
 
         if (!response.IsSuccess) return (0, "AI不可用，默认选第一张");
 
@@ -232,15 +412,29 @@ public class DecisionService
 
     // ---- Map Navigation ----
 
-    public async Task<(int choice, string reason)> DecideMapNavigationAsync(Player aiPlayer, CancellationToken ct)
+    /// <summary>
+    /// Map choice with an explicit option list (solo climb and multiplayer votes). Returns -1 when
+    /// the backend fails so the caller can apply its own heuristic.
+    /// </summary>
+    public async Task<(int choice, string reason)> DecideMapNavigationAsync(
+        Player aiPlayer, IReadOnlyList<string> options, CancellationToken ct)
     {
-        var context = _contextBuilder.BuildMapContext(aiPlayer);
+        if (options.Count == 0)
+            return (-1, "");
+
+        var sb = new StringBuilder(_contextBuilder.BuildMapContext(aiPlayer));
+        sb.AppendLine("可前往的节点：");
+        for (var i = 0; i < options.Count; i++)
+            sb.AppendLine($"{i}. {options[i]}");
+
         var systemPrompt = BuildSystemPrompt(includeTeamPrinciples: false);
-        var userPrompt = BuildTaskPrompt(aiPlayer, context, "请以 JSON 格式返回选路决策：{\"choice\": 目标索引, \"reason\": \"简短理由\"}");
+        var userPrompt = BuildTaskPrompt(aiPlayer, sb.ToString(),
+            "请以 JSON 格式返回选路决策：{\"choice\": 目标索引, \"reason\": \"简短理由\"}");
 
-        var response = await SendNonCombatDecisionWithRetryAsync(systemPrompt, userPrompt, 256, 0.4f, ct: ct);
-
-        if (!response.IsSuccess) return (0, "AI不可用，默认选第一个");
+        var response = await RequestWithToolsAsync(aiPlayer, systemPrompt, userPrompt, 256, 0.4f,
+            OutOfCombatToolRounds, MaxOutOfCombatToolTimeoutMs, HasChoiceKey, retryOnFailure: true, ct);
+        if (!response.IsSuccess)
+            return (-1, "AI不可用");
 
         try
         {
@@ -252,9 +446,8 @@ public class DecisionService
         }
         catch
         {
-            var fallbackChoice = ResponseParser.TryExtractChoice(response.Content) ?? 0;
-            var fallbackReason = ResponseParser.TryExtractReason(response.Content);
-            return (fallbackChoice, fallbackReason);
+            return (ResponseParser.TryExtractChoice(response.Content) ?? -1,
+                ResponseParser.TryExtractReason(response.Content));
         }
     }
 
@@ -274,7 +467,9 @@ public class DecisionService
         if (smithOption?.IsEnabled == true)
             instruction.AppendLine($"如果 choice 对应 SMITH，upgrade_indices 必须从上面的可升级卡牌列表中选择 1~{smithCount} 个不重复索引；否则返回空数组。");
 
-        var response = await SendNonCombatDecisionWithRetryAsync(systemPrompt, BuildTaskPrompt(aiPlayer, context, instruction.ToString().TrimEnd()), 256, 0.3f, ct: ct);
+        var response = await RequestWithToolsAsync(aiPlayer, systemPrompt,
+            BuildTaskPrompt(aiPlayer, context, instruction.ToString().TrimEnd()), 256, 0.3f,
+            OutOfCombatToolRounds, MaxOutOfCombatToolTimeoutMs, HasChoiceKey, retryOnFailure: true, ct);
 
         int healIdx = optionIds.IndexOf("HEAL");
         int smithIdx = optionIds.IndexOf("SMITH");
@@ -397,7 +592,9 @@ public class DecisionService
         var systemPrompt = BuildSystemPrompt(includeTeamPrinciples: false);
         var instruction = $"请以 JSON 格式返回购物决策：{{\"choices\":[索引列表], \"reason\":\"理由\"}}\nchoices 为要购买的物品索引数组（可多选），留空 [] 表示离开商店。索引范围 0~{entries.Count - 1}。";
 
-        var response = await SendNonCombatDecisionWithRetryAsync(systemPrompt, BuildTaskPrompt(aiPlayer, context, instruction), 384, 0.3f, ct: ct);
+        var response = await RequestWithToolsAsync(aiPlayer, systemPrompt,
+            BuildTaskPrompt(aiPlayer, context, instruction), 384, 0.3f,
+            OutOfCombatToolRounds, MaxOutOfCombatToolTimeoutMs, HasChoicesKey, retryOnFailure: true, ct);
 
         if (!response.IsSuccess) return (new List<int>(), "AI不可用，跳过购物");
 
@@ -446,12 +643,17 @@ public class DecisionService
 
         var context = BuildCardSelectionContext(aiPlayer, cards, selectionType);
         var systemPrompt = BuildSystemPrompt(includeTeamPrinciples: false);
-        var response = await SendNonCombatDecisionWithRetryAsync(
+        var response = await RequestWithToolsAsync(
+            aiPlayer,
             systemPrompt,
             BuildTaskPrompt(aiPlayer, context, $"请以 JSON 格式返回选牌决策：{{\"indices\":[...], \"reason\":\"理由\"}} 选{minSelect}~{maxSelect}张"),
             1024,
             0.4f,
-            ct: ct);
+            OutOfCombatToolRounds,
+            MaxOutOfCombatToolTimeoutMs,
+            HasIndicesKey,
+            retryOnFailure: true,
+            ct);
 
         if (!response.IsSuccess)
             return (new List<int>(), "AI不可用");
@@ -553,12 +755,17 @@ public class DecisionService
     {
         var context = _contextBuilder.BuildEventContext(aiPlayer, optionDescs);
         var systemPrompt = BuildSystemPrompt(includeTeamPrinciples: false);
-        var response = await SendNonCombatDecisionWithRetryAsync(
+        var response = await RequestWithToolsAsync(
+            aiPlayer,
             systemPrompt,
             BuildTaskPrompt(aiPlayer, context, $"请以 JSON 格式返回事件决策：{{\"choice\":0~{optionDescs.Count - 1}, \"reason\":\"理由\"}}"),
             1024,
             0.3f,
-            ct: ct);
+            OutOfCombatToolRounds,
+            MaxOutOfCombatToolTimeoutMs,
+            HasChoiceKey,
+            retryOnFailure: true,
+            ct);
 
         if (!response.IsSuccess) return (0, "AI不可用，默认选第一个");
 
@@ -603,12 +810,17 @@ public class DecisionService
         if (allowReroll)
             instruction.AppendLine("如果三个选项都不理想，reroll 可指定要重投的槽位索引（如 [0,2]），重投后会给你新选项再选一次。");
 
-        var response = await SendNonCombatDecisionWithRetryAsync(
+        var response = await RequestWithToolsAsync(
+            aiPlayer,
             systemPrompt,
             BuildTaskPrompt(aiPlayer, context, instruction.ToString().TrimEnd()),
             512,
             0.3f,
-            ct: ct);
+            OutOfCombatToolRounds,
+            MaxOutOfCombatToolTimeoutMs,
+            HasChoiceKey,
+            retryOnFailure: true,
+            ct);
 
         if (!response.IsSuccess)
             return (HextechRunesDecisionHandler.PickHeuristicFallback(aiPlayer, options), null, "AI不可用，使用启发式选择");
@@ -667,6 +879,10 @@ public class DecisionResult
     public string ChatMessage { get; set; } = "";
     public List<DecisionAction> Actions { get; set; } = new();
     public List<DecisionAction> DeferredActions { get; set; } = new();
+
+    /// <summary>Read-only tool calls the model asked for instead of acting. 模型请求的工具调用。</summary>
+    public List<ToolCall> ToolCalls { get; set; } = new();
+
     public bool IsFallback { get; set; }
 
     public static DecisionResult Fallback()

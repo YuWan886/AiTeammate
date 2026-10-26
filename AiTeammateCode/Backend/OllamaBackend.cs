@@ -1,6 +1,5 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net.Http.Headers;
-using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 
@@ -114,63 +113,6 @@ public class OllamaBackend : IAiBackend
         }
     }
 
-    public async IAsyncEnumerable<string> SendStreamingAsync(AiRequest request, [EnumeratorCancellation] CancellationToken ct)
-    {
-        var messages = new List<object>();
-        if (!string.IsNullOrWhiteSpace(request.SystemPrompt))
-            messages.Add(new { role = "system", content = request.SystemPrompt });
-        foreach (var msg in request.ConversationHistory)
-            messages.Add(new { role = msg.Role, content = msg.Content });
-        messages.Add(new { role = "user", content = request.UserPrompt });
-
-        var body = new
-        {
-            model = _model,
-            messages,
-            max_tokens = request.MaxTokens,
-            temperature = request.Temperature,
-            stream = true
-        };
-
-        var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/chat/completions");
-        httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
-        httpRequest.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
-        httpRequest.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
-
-        var response = await _client.SendAsync(httpRequest, HttpCompletionOption.ResponseHeadersRead, ct);
-        using var stream = await response.Content.ReadAsStreamAsync();
-        using var reader = new StreamReader(stream);
-
-        while (!reader.EndOfStream)
-        {
-            ct.ThrowIfCancellationRequested();
-            var line = await reader.ReadLineAsync();
-            if (line == null) break;
-            if (!line.StartsWith("data: ")) continue;
-            var data = line.Substring(6);
-            if (data == "[DONE]") break;
-
-            string? pendingText = null;
-            try
-            {
-                using var doc = JsonDocument.Parse(data);
-                var choices = doc.RootElement.GetProperty("choices");
-                if (choices.GetArrayLength() == 0) continue;
-                var delta = choices[0].GetProperty("delta");
-                if (delta.TryGetProperty("content", out var content))
-                {
-                    var text = content.GetString();
-                    if (!string.IsNullOrEmpty(text))
-                        pendingText = text;
-                }
-            }
-            catch (JsonException) { }
-
-            if (pendingText != null)
-                yield return pendingText;
-        }
-    }
-
     public async Task<bool> ValidateConnectionAsync(CancellationToken ct)
     {
         var request = new AiRequest
@@ -183,4 +125,6 @@ public class OllamaBackend : IAiBackend
         var response = await SendAsync(request, ct);
         return response.IsSuccess;
     }
+
+    public void Dispose() => _client.Dispose();
 }

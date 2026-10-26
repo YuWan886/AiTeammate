@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Multiplayer;
@@ -8,14 +8,17 @@ using MegaCrit.Sts2.Core.Models.Characters;
 using MegaCrit.Sts2.Core.Multiplayer.Game.Lobby;
 using AiTeammate.AiTeammateCode.Backend;
 using AiTeammate.AiTeammateCode.Cache;
+using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Chat;
-using AiTeammate.AiTeammateCode.Config;
 using AiTeammate.AiTeammateCode.Context;
 using AiTeammate.AiTeammateCode.Decision;
 using AiTeammate.AiTeammateCode.Personality;
+using AiTeammate.AiTeammateCode.Settings;
+using AiTeammate.AiTeammateCode.Solo;
 using AiTeammate.AiTeammateCode.Suggestion;
 using AiTeammate.AiTeammateCode.Teamwork;
 using AiTeammate.AiTeammateCode.Patches;
+using AiTeammate.AiTeammateCode.Localization;
 using MegaCrit.Sts2.Core.Runs;
 
 namespace AiTeammate.AiTeammateCode;
@@ -26,7 +29,6 @@ public class AiTeammateManager
     private static readonly Lazy<AiTeammateManager> _instance = new(() => new());
     public static AiTeammateManager Instance => _instance.Value;
 
-    public ConfigManager ConfigManager { get; private set; } = null!;
     public BackendManager BackendManager { get; private set; } = null!;
     public PersonalityManager PersonalityManager { get; private set; } = null!;
     public ContentCacheService CacheService { get; private set; } = null!;
@@ -44,7 +46,9 @@ public class AiTeammateManager
     public AiLogger AiLog { get; private set; } = null!;
     public Player? AiPlayer { get; private set; }
     public bool IsInitialized { get; private set; }
-    public bool IsAiTurn { get; private set; }
+
+    /// <summary>True when the AI drives the local player in a solo climb. 单人爬塔接管中。</summary>
+    public bool IsSoloControlled { get; private set; }
 
     private readonly Lock _turnLock = new();
     private readonly Lock _restSiteUpgradeLock = new();
@@ -57,24 +61,9 @@ public class AiTeammateManager
 
     public void Initialize()
     {
-        ConfigManager = new ConfigManager();
-        var config = ConfigManager.Load();
-
-        // Backend
+        // Backend instances are rebuilt on demand from the live RitsuLib settings.
         BackendManager = new BackendManager();
-        foreach (var (name, beConfig) in config.Backends)
-        {
-            IAiBackend? backend = name switch
-            {
-                "DeepSeek" => new DeepSeekBackend(beConfig.ApiKey, beConfig.Model, beConfig.BaseUrl, config.EnableModelThinking),
-                "OpenAI" => new OpenAiBackend(beConfig.ApiKey, beConfig.Model, beConfig.BaseUrl, config.EnableModelThinking),
-                "Ollama" => new OllamaBackend(beConfig.ApiKey, beConfig.Model, beConfig.BaseUrl, config.EnableModelThinking),
-                _ => null
-            };
-            if (backend != null)
-                BackendManager.Register(backend);
-        }
-        BackendManager.SwitchTo(config.ActiveBackend);
+        BackendManager.SyncFromSettings();
 
         // Cache
         CacheService = new ContentCacheService();
@@ -83,7 +72,7 @@ public class AiTeammateManager
 
         // Personality
         PersonalityManager = new PersonalityManager();
-        PersonalityManager.Load(config.ActivePersonalityId);
+        PersonalityManager.Load();
 
         // Logger
         AiLog = new AiLogger();
@@ -93,8 +82,8 @@ public class AiTeammateManager
         DirectiveManager = new PlayerDirectiveManager();
 
         // Services
-        DecisionService = new DecisionService(BackendManager, PersonalityManager, QueryService, ConversationContext, config.DecisionTimeoutMs, config.NonCombatRetryCount);
-        ChatManager = new ChatManager(BackendManager, PersonalityManager, QueryService, ConversationContext, DirectiveManager, config.ChatCooldownMs);
+        DecisionService = new DecisionService(BackendManager, PersonalityManager, QueryService, ConversationContext);
+        ChatManager = new ChatManager(BackendManager, PersonalityManager, QueryService, ConversationContext, DirectiveManager);
         SuggestionService = new SuggestionService(BackendManager, PersonalityManager, QueryService, ConversationContext);
         CombatExecutor = new CombatDecisionExecutor(AiLog);
         OutOfCombatExecutor = new OutOfCombatExecutor(DecisionService);
@@ -102,6 +91,7 @@ public class AiTeammateManager
         Validator = new DecisionValidator();
 
         IsInitialized = true;
+        SoloRunController.InstallRunHook();
         MainFile.Logger.Info("AI 队友管理器初始化完成");
         AiLog.Log("SYSTEM", "AI 队友管理器初始化完成");
 
@@ -131,10 +121,31 @@ public class AiTeammateManager
         ConversationContext.ResetAll();
         DirectiveManager.ResetAll();
         ResetExtraPlayerTurnCombatDecisionState();
-        ChatManager.AddSystemMessage($"{PersonalityManager.Active?.Name ?? "AI 队友"} 加入了队伍");
+        var speakerName = PersonalityManager.Active?.Name ?? AiLoc.T("chat.ai_default_name", "AI Teammate");
+        ChatManager.AddSystemMessage(AiLoc.T("system.ai_joined", "{Name} joined the team", ("Name", speakerName)));
         Patches.NGamePatch.RefreshChatUi();
         MainFile.Logger.Info($"AI 玩家已加入: {aiPlayer.Character?.Id.Entry}");
         AiLog.Log("SYSTEM", $"AI 玩家加入: {aiPlayer.Character?.Id.Entry} (NetId={aiPlayer.NetId})");
+    }
+
+    /// <summary>Binds the local singleplayer player to AI control (solo climb mode).</summary>
+    public void BindSoloPlayer(Player player)
+    {
+        IsSoloControlled = true;
+        OnAiPlayerJoined(player);
+    }
+
+    /// <summary>Stops AI control of the local player (mode disabled, run ended).</summary>
+    public void ReleaseSoloControl()
+    {
+        if (!IsSoloControlled)
+            return;
+
+        IsSoloControlled = false;
+        AiPlayer = null;
+        CardHighlighter?.ClearAllHighlights();
+        MainFile.Logger.Info("AI 已停止控制本地玩家");
+        AiLog.Log("SYSTEM", "AI 已释放本地玩家控制权");
     }
 
     public void ResetExtraPlayerTurnCombatDecisionState()
@@ -209,14 +220,14 @@ public class AiTeammateManager
         // Reset AI player for a new run (old reference is stale)
         AiPlayer = null;
 
-        if (lobby.Players.Count >= lobby.MaxPlayers)
+        if (lobby.Players.Count >= Compat.GameCompat.MaxPlayers(lobby))
         {
-            MainFile.Logger.Warn($"Lobby is full ({lobby.Players.Count}/{lobby.MaxPlayers})");
+            MainFile.Logger.Warn($"Lobby is full ({lobby.Players.Count}/{Compat.GameCompat.MaxPlayers(lobby)})");
             return null;
         }
 
         int slot = -1;
-        for (int i = 0; i < lobby.MaxPlayers; i++)
+        for (int i = 0; i < Compat.GameCompat.MaxPlayers(lobby); i++)
         {
             if (!lobby.Players.Any(p => p.slotId == i))
             {
@@ -226,7 +237,7 @@ public class AiTeammateManager
         }
         if (slot < 0) return null;
 
-        ulong aiNetId = 0xA1AA_A000 + (ulong)slot;
+        ulong aiNetId = AiIdentity.NetIdBase + (ulong)slot;
 
         var chars = GetAiCharacterOptions();
         if (chars.Count == 0) return null;
@@ -240,6 +251,9 @@ public class AiTeammateManager
             character = character,
             unlockState = hostPlayer.unlockState,
             maxMultiplayerAscensionUnlocked = hostPlayer.maxMultiplayerAscensionUnlocked,
+#if STS2_API_0_111_OR_LATER
+            isModded = true,
+#endif
             isReady = false
         };
 
@@ -251,7 +265,7 @@ public class AiTeammateManager
     public void RemoveAiFromLobby(StartRunLobby lobby)
     {
         var aiPlayer = lobby.Players.FirstOrDefault(p =>
-            p.id >= 0xA1AA_A000 && p.id <= 0xA1AA_FFFF);
+            AiIdentity.IsAi(p.id));
         if (aiPlayer.id != 0)
         {
             lobby.Players.Remove(aiPlayer);
@@ -263,7 +277,7 @@ public class AiTeammateManager
     {
         for (int i = 0; i < lobby.Players.Count; i++)
         {
-            if (lobby.Players[i].id >= 0xA1AA_A000 && lobby.Players[i].id <= 0xA1AA_FFFF)
+            if (AiIdentity.IsAi(lobby.Players[i].id))
             {
                 var p = lobby.Players[i];
                 p.character = character;
@@ -277,7 +291,7 @@ public class AiTeammateManager
     {
         for (int i = 0; i < lobby.Players.Count; i++)
         {
-            if (lobby.Players[i].id >= 0xA1AA_A000 && lobby.Players[i].id <= 0xA1AA_FFFF)
+            if (AiIdentity.IsAi(lobby.Players[i].id))
             {
                 var p = lobby.Players[i];
                 p.isReady = ready;
@@ -289,12 +303,12 @@ public class AiTeammateManager
 
     public bool IsAiInLobby(StartRunLobby lobby)
     {
-        return lobby.Players.Any(p => p.id >= 0xA1AA_A000 && p.id <= 0xA1AA_FFFF);
+        return lobby.Players.Any(p => AiIdentity.IsAi(p.id));
     }
 
     public LobbyPlayer? GetAiLobbyPlayer(StartRunLobby lobby)
     {
-        var p = lobby.Players.FirstOrDefault(p => p.id >= 0xA1AA_A000 && p.id <= 0xA1AA_FFFF);
+        var p = lobby.Players.FirstOrDefault(p => AiIdentity.IsAi(p.id));
         return p.id != 0 ? p : null;
     }
 
@@ -312,9 +326,12 @@ public class AiTeammateManager
     {
         if (AiPlayer != null) return;
 
+        if (SoloRunController.TryBind(this))
+            return;
+
         foreach (var player in state.Players)
         {
-            if (player.NetId >= 0xA1AA_A000 && player.NetId <= 0xA1AA_FFFF)
+            if (AiIdentity.IsAi(player.NetId))
             {
                 OnAiPlayerJoined(player);
                 return;
@@ -327,12 +344,20 @@ public class AiTeammateManager
     /// </summary>
     public void DetectAndBindAiPlayer()
     {
-        if (AiPlayer != null) return;
+        if (AiPlayer != null)
+        {
+            SoloRunController.TryBind(this); // keeps solo control in sync with the settings toggle
+            return;
+        }
+
+        if (SoloRunController.TryBind(this))
+            return;
+
         var state = RunManager.Instance?.DebugOnlyGetState();
         if (state == null) return;
         foreach (var player in state.Players)
         {
-            if (player.NetId >= 0xA1AA_A000 && player.NetId <= 0xA1AA_FFFF)
+            if (AiIdentity.IsAi(player.NetId))
             {
                 OnAiPlayerJoined(player);
                 return;
@@ -365,9 +390,9 @@ public class AiTeammateManager
             AiLog.Log("SYSTEM", "AI已阵亡，跳过回合处理");
             try
             {
+                // The player→enemy transition is signalled after end-of-turn phase one
+                // (CombatTurnTransitionPatch); an extra signal here would start a second one.
                 CombatManager.Instance.SetReadyToEndTurn(AiPlayer, false);
-                if (state.CurrentSide == CombatSide.Player && CombatManager.Instance.IsInProgress)
-                    CombatDecisionExecutor.TrySignalReadyToBeginEnemyTurn(AiPlayer);
             }
             catch { }
             return;
@@ -380,17 +405,21 @@ public class AiTeammateManager
         var hasPotions = AiPlayer.Potions?.Any() == true;
         if (combat == null || (combat.Hand.Cards.Count == 0 && !hasPotions))
         {
-            // Try to end turn immediately so we don't stall.
-            // Must call both SetReadyToEndTurn AND SetReadyToBeginEnemyTurn,
-            // otherwise the game hangs when the human player is dead and can't signal.
+            // End the turn immediately so we don't stall. The player→enemy transition is signalled
+            // once after end-of-turn phase one (CombatTurnTransitionPatch).
             try
             {
                 CombatManager.Instance.SetReadyToEndTurn(AiPlayer, false);
-                var curState = CombatManager.Instance.DebugOnlyGetState();
-                if (curState?.CurrentSide == CombatSide.Player && CombatManager.Instance.IsInProgress)
-                    CombatDecisionExecutor.TrySignalReadyToBeginEnemyTurn(AiPlayer);
             }
             catch { }
+            return;
+        }
+
+        // Solo climb: the human may have interrupted the AI to chat. Hold the turn (without
+        // ending it) until they let the AI continue; SoloRunController restarts processing then.
+        if (IsSoloControlled && AiFlowControl.IsPaused)
+        {
+            AiLog.Log("SYSTEM", "AI 已被玩家暂停，等待继续");
             return;
         }
 
@@ -406,6 +435,7 @@ public class AiTeammateManager
         // Set to true once we've confirmed this is the AI's turn to process.
         bool turnInProgress = true;
         bool shouldAdvanceDirectives = true;
+        bool pausedHold = false;
         try
         {
             ct.ThrowIfCancellationRequested();
@@ -421,6 +451,13 @@ public class AiTeammateManager
             for (var decisionPass = 1; decisionPass <= MaxCombatDecisionPassesPerTurn; decisionPass++)
             {
                 effectiveCt.ThrowIfCancellationRequested();
+
+                if (IsSoloControlled && AiFlowControl.IsPaused)
+                {
+                    pausedHold = true;
+                    AiLog.Log("COMBAT", "玩家打断：暂停出牌，保留本回合");
+                    break;
+                }
 
                 if (decisionPass > 1)
                 {
@@ -466,6 +503,13 @@ public class AiTeammateManager
 
                 effectiveCt.ThrowIfCancellationRequested();
 
+                if (IsSoloControlled && AiFlowControl.IsPaused)
+                {
+                    pausedHold = true;
+                    AiLog.Log("COMBAT", "玩家打断：暂停出牌，保留本回合");
+                    break;
+                }
+
                 // Back on main thread — validate and execute card actions
                 var validActions = result.IsFallback
                     ? Validator.ApplyFallback(AiPlayer)
@@ -474,6 +518,21 @@ public class AiTeammateManager
                     ? new List<DecisionAction>()
                     : Validator.ValidateDeferred(result.DeferredActions, AiPlayer);
                 await CombatExecutor.Execute(validActions, validDeferred, AiPlayer, effectiveCt, endTurn: false);
+
+                if (IsSoloControlled && (AiFlowControl.IsPaused || CombatExecutor.PausedMidTurn))
+                {
+                    pausedHold = true;
+                    AiLog.Log("COMBAT", "玩家打断：暂停出牌，保留本回合");
+                    break;
+                }
+            }
+
+            if (pausedHold)
+            {
+                // Keep the turn open: the human is talking to the AI. Resume restarts processing.
+                turnInProgress = false;
+                shouldAdvanceDirectives = false;
+                return;
             }
 
             if (HasExtraPlayerTurnCombatDecisionOpportunity())
@@ -517,8 +576,7 @@ public class AiTeammateManager
 
             // Safety net: if combat is still active and it's still the player's turn,
             // force-end the AI's turn so we never deadlock the game.
-            // This handles cases where card execution throws mid-turn (e.g., mod conflicts)
-            // or when the human player has died and the game is waiting for AI to signal.
+            // This handles cases where card execution throws mid-turn (e.g., mod conflicts).
             if (turnInProgress)
             {
                 try
@@ -535,7 +593,6 @@ public class AiTeammateManager
                         {
                             AiLog.Log("SYSTEM", "安全网：强制结束AI回合");
                             CombatManager.Instance.SetReadyToEndTurn(AiPlayer, false);
-                            CombatDecisionExecutor.TrySignalReadyToBeginEnemyTurn(AiPlayer);
                         }
                     }
                 }
@@ -550,14 +607,13 @@ public class AiTeammateManager
     public async Task OnPlayerTurnStarted(Player player)
     {
         if (!IsInitialized || SuggestionService == null) return;
+        if (!AiSettingsStore.Current.EnableSuggestions) return;
 
         try
         {
             var suggestions = await SuggestionService.AnalyzeAsync(player, CancellationToken.None);
             if (suggestions.Count > 0)
-            {
-                CardHighlighter.ApplyHighlights(suggestions, player);
-            }
+                MainThread.Post(() => CardHighlighter.ApplyHighlights(suggestions, player));
         }
         catch (Exception ex)
         {
@@ -583,18 +639,11 @@ public class AiTeammateManager
         }
     }
 
-    public void OnPlayerHpChanged(Player player)
-    {
-        if (player?.Creature == null || AiPlayer == null) return;
-        if (player.Creature.CurrentHp < player.Creature.MaxHp * 0.3f)
-        {
-            _ = ChatManager.TryAutoMessage(AiPlayer, "PlayerLowHp", CancellationToken.None);
-        }
-    }
-
     public async Task GenerateMemory(MemoryCategory category, string context, CancellationToken ct)
     {
         if (PersonalityManager.Active == null) return;
+        if (!AiSettingsStore.Current.EnablePersonalityGrowth || !AiSettingsStore.Current.EnableLongTermMemory)
+            return;
 
         var promptBuilder = new PersonalityPromptBuilder(PersonalityManager);
         var systemPrompt = promptBuilder.BuildSystemPrompt(requireJson: true);
@@ -643,9 +692,13 @@ public class AiTeammateManager
 
     public void CheckAndTriggerSelfReflection(string profileId)
     {
+        var settings = AiSettingsStore.Current;
+        if (!settings.EnablePersonalityGrowth || !settings.EnableLongTermMemory)
+            return;
+
         var memoryManager = new MemoryManager();
         var memory = memoryManager.Load(profileId);
-        var threshold = ConfigManager.Load().MemoryMergeThreshold;
+        var threshold = Math.Max(20, settings.MemoryMergeThreshold);
 
         if (memory.Entries.Count < threshold) return;
 

@@ -1,8 +1,9 @@
-using HarmonyLib;
+﻿using HarmonyLib;
 using MegaCrit.Sts2.Core.Multiplayer;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
 using MegaCrit.Sts2.Core.Multiplayer.Game.Lobby;
 using MegaCrit.Sts2.Core.Saves.Runs;
+using AiTeammate.AiTeammateCode.Compat;
 
 namespace AiTeammate.AiTeammateCode.Patches;
 
@@ -13,9 +14,6 @@ namespace AiTeammate.AiTeammateCode.Patches;
 [HarmonyPatch(typeof(CombatStateSynchronizer), "CheckSyncCompleted")]
 public static class CombatStateSynchronizerPatch
 {
-    private const ulong AiNetIdBase = 0xA1AA_A000;
-    private const ulong AiNetIdMax = 0xA1AA_FFFF;
-
     [HarmonyPrefix]
     public static bool BeforeCheckSyncCompleted(CombatStateSynchronizer __instance)
     {
@@ -39,10 +37,10 @@ public static class CombatStateSynchronizerPatch
             return false;
         }
 
-        foreach (ulong id in runLobby.ConnectedPlayerIds)
+        foreach (ulong id in Compat.GameCompat.ConnectedPlayerIds(runLobby))
         {
             // Skip AI players — they have no real network peer
-            if (id >= AiNetIdBase && id <= AiNetIdMax)
+            if (AiIdentity.IsAi(id))
                 continue;
             if (syncData == null || !syncData.ContainsKey(id))
                 return false; // still waiting for real players

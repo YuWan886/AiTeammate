@@ -4,3 +4,7 @@ packages/
 *.user
 CLAUDE.md
 AGENTS.md
+bin/
+obj/
+.build-variants-tmp/
+*.pdb

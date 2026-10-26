@@ -8,8 +8,10 @@ using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using MegaCrit.Sts2.Core.MonsterMoves.Intents;
+using MegaCrit.Sts2.Core.Multiplayer.Game;
 using MegaCrit.Sts2.Core.Platform;
 using MegaCrit.Sts2.Core.Runs;
+using AiTeammate.AiTeammateCode.Solo;
 
 namespace AiTeammate.AiTeammateCode.Decision;
 
@@ -26,22 +28,68 @@ public class CombatDecisionExecutor
         _log = log ?? AiTeammateManager.Instance.AiLog;
     }
 
+    /// <summary>
+    /// True when solo mode stopped this turn mid-way because the human interrupted the AI.
+    /// The turn is intentionally left open (not ended) so it can continue after the chat.
+    /// </summary>
+    public bool PausedMidTurn { get; private set; }
+
+    private static bool SoloPaused =>
+        AiTeammateManager.Instance.IsSoloControlled && AiFlowControl.IsPaused;
+
+    private static bool _signaledReadyToBeginEnemyTurn;
+
+    /// <summary>
+    /// Clears the per-transition signal guard. Called by the combat patch whenever a player turn
+    /// starts, because <c>CombatManager</c> clears its own ready-to-begin set at that point.
+    /// </summary>
+    public static void ResetReadyToBeginEnemyTurnSignal() => _signaledReadyToBeginEnemyTurn = false;
+
+    /// <summary>
+    /// Tells <c>CombatManager</c> that the AI player is ready to switch to the enemy side.
+    /// The AI has no network peer, so nothing else ever sends its <c>ReadyToBeginEnemyTurnAction</c>.
+    /// Called once per player→enemy transition by <c>CombatTurnTransitionPatch</c>, which hooks the
+    /// game enqueueing the local player's ready action (i.e. after end-of-turn phase one).
+    /// </summary>
     public static bool TrySignalReadyToBeginEnemyTurn(Player aiPlayer)
     {
-        var state = CombatManager.Instance.DebugOnlyGetState();
-        if (!CombatManager.Instance.IsInProgress || CombatManager.Instance.IsOverOrEnding)
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null)
             return false;
+
+        var combatManager = CombatManager.Instance;
+        if (!combatManager.IsInProgress || combatManager.IsOverOrEnding)
+            return false;
+
+        // 0.107.x: SetReadyToBeginEnemyTurn starts the whole player→enemy transition unconditionally
+        // in singleplayer (`allPlayersReady || netType == Singleplayer`) with no "already claimed"
+        // guard, and the game itself enqueues the local player's ReadyToBeginEnemyTurnAction. The
+        // local player is the only player there (and in solo climb it *is* the AI), so an extra call
+        // here starts a second concurrent AfterAllPlayersReadyToBeginEnemyTurn — which is what makes
+        // the game throw "EndPlayerTurnPhaseTwo called while the current side is Enemy!" and
+        // "EndEnemyTurn called while the current side is Player!". Let the game drive it.
+        var netType = RunManager.Instance?.NetService?.Type;
+        if (netType is null or NetGameType.None or NetGameType.Singleplayer or NetGameType.Replay)
+            return false;
+
+        var state = combatManager.DebugOnlyGetState();
         if (state?.CurrentSide != CombatSide.Player)
             return false;
         if (!state.Players.Contains(aiPlayer))
             return false;
 
-        CombatManager.Instance.SetReadyToBeginEnemyTurn(aiPlayer);
+        // Repeated calls while the ready set is already full would claim the transition again.
+        if (_signaledReadyToBeginEnemyTurn)
+            return false;
+
+        _signaledReadyToBeginEnemyTurn = true;
+        combatManager.SetReadyToBeginEnemyTurn(aiPlayer);
         return true;
     }
 
     public async Task<int> Execute(List<DecisionAction> actions, List<DecisionAction> deferredActions, Player aiPlayer, CancellationToken ct = default, bool endTurn = true)
     {
+        PausedMidTurn = false;
         var state = CombatManager.Instance.DebugOnlyGetState();
         var combat = aiPlayer.PlayerCombatState;
         if (state == null || combat == null) return 0;
@@ -60,9 +108,16 @@ public class CombatDecisionExecutor
                 .ToList();
             foreach (var potionAction in potionActions)
             {
+                if (SoloPaused) { PausedMidTurn = true; break; }
                 if (CombatManager.Instance.IsOverOrEnding) break;
                 if (await UseOnePotion(aiPlayer, state, potionAction, ct))
                     AiTeammateManager.Instance.DirectiveManager.RegisterExecutedAction(aiPlayer, potionAction);
+            }
+
+            if (PausedMidTurn)
+            {
+                _log.Log("COMBAT", "玩家打断：停止出牌（保留当前回合）");
+                return cardsPlayed;
             }
 
             var immediateActions = actions
@@ -87,6 +142,7 @@ public class CombatDecisionExecutor
             }
 
             cardsPlayed += await PlayPlannedActions(aiPlayer, setupActions, "第1阶段出牌", deferredPhase: false, ct);
+            if (PausedMidTurn) return cardsPlayed;
 
             var coordinatedAttackQueue = new List<DecisionAction>();
             coordinatedAttackQueue.AddRange(deferredActions);
@@ -99,6 +155,7 @@ public class CombatDecisionExecutor
 
                 await WaitForCoordinationWindow(aiPlayer, coordinatedAttackQueue, deferredActions.Count > 0, ct);
                 cardsPlayed += await PlayPlannedActions(aiPlayer, coordinatedAttackQueue, "第2阶段出牌", deferredPhase: true, ct);
+                if (PausedMidTurn) return cardsPlayed;
             }
 
             // Phase 3: Play any remaining playable cards
@@ -127,14 +184,17 @@ public class CombatDecisionExecutor
             // game can transition through AllPlayersReadyToEndTurn → CheckWinCondition → EndCombatInternal.
             var currentState = CombatManager.Instance.DebugOnlyGetState();
             if (endTurn
+                && !PausedMidTurn
                 && CombatManager.Instance.IsInProgress
                 && currentState?.CurrentSide == CombatSide.Player)
             {
                 try
                 {
                     _log.Log("AI_ACTION", $"结束回合 | 出牌{cardsPlayed}张 能量 {initialEnergy}→{combat.Energy}");
+                    // The player→enemy transition is signalled once, after end-of-turn phase one
+                    // (see TrySignalReadyToBeginEnemyTurn); signalling here would race the queued
+                    // ReadyToBeginEnemyTurnAction.
                     CombatManager.Instance.SetReadyToEndTurn(aiPlayer, canBackOut: false);
-                    TrySignalReadyToBeginEnemyTurn(aiPlayer);
                 }
                 catch (Exception endEx)
                 {
@@ -165,8 +225,8 @@ public class CombatDecisionExecutor
             try
             {
                 _log.Log("AI_ACTION", $"结束回合 | 当前能量 {combat.Energy} 辉星 {combat.Stars}");
+                // Transition signal is handled after end-of-turn phase one (TrySignalReadyToBeginEnemyTurn).
                 CombatManager.Instance.SetReadyToEndTurn(aiPlayer, canBackOut: false);
-                TrySignalReadyToBeginEnemyTurn(aiPlayer);
             }
             catch (Exception endEx)
             {
@@ -197,6 +257,12 @@ public class CombatDecisionExecutor
         foreach (var action in actions)
         {
             ct.ThrowIfCancellationRequested();
+
+            if (SoloPaused)
+            {
+                PausedMidTurn = true;
+                break;
+            }
 
             if (CombatManager.Instance.IsOverOrEnding) break;
             if (played >= MaxCardsPerTurn) break;
@@ -337,6 +403,7 @@ public class CombatDecisionExecutor
 
         for (int i = 0; i < maxExtra; i++)
         {
+            if (SoloPaused) { PausedMidTurn = true; break; }
             if (CombatManager.Instance.IsOverOrEnding) break;
             if (combat.Energy <= 0 && combat.Stars <= 0) break;
 
@@ -470,16 +537,21 @@ public class CombatDecisionExecutor
                 if (string.IsNullOrWhiteSpace(desc))
                     continue;
 
-                if (desc.Contains("易伤") || desc.Contains("破甲") || desc.Contains("虚弱"))
+                if (desc.Contains("易伤") || desc.Contains("破甲") || desc.Contains("虚弱")
+                    || desc.Contains("Vulnerable") || desc.Contains("Weak"))
                     return true;
-                if (desc.Contains("力量") || desc.Contains("敏捷") || desc.Contains("缓冲"))
+                if (desc.Contains("力量") || desc.Contains("敏捷") || desc.Contains("缓冲")
+                    || desc.Contains("Strength") || desc.Contains("Dexterity") || desc.Contains("Buffer"))
                     return true;
-                if (desc.Contains("所有敌人") || desc.Contains("每个敌人"))
+                if (desc.Contains("所有敌人") || desc.Contains("每个敌人")
+                    || desc.Contains("ALL enemies") || desc.Contains("all enemies"))
                     return true;
 
                 if (card.Type == CardType.Attack)
                 {
                     var damageMatch = System.Text.RegularExpressions.Regex.Match(desc, @"造成(\d+)点伤害");
+                    if (!damageMatch.Success)
+                        damageMatch = System.Text.RegularExpressions.Regex.Match(desc, @"[Dd]eal (\d+) damage");
                     if (damageMatch.Success && int.TryParse(damageMatch.Groups[1].Value, out var damage)
                         && state.Enemies.Any(e => e.IsAlive && e.CurrentHp <= damage + 2))
                         return true;
@@ -585,7 +657,7 @@ public class CombatDecisionExecutor
     {
         try
         {
-            return card.GetDescriptionForPile(PileType.Hand) ?? "";
+            return PromptTextHelper.GetCardDescriptionText(card, PileType.Hand);
         }
         catch
         {
@@ -605,7 +677,7 @@ public class CombatDecisionExecutor
         if (string.IsNullOrWhiteSpace(targetName)) return null;
 
         var normalized = NormalizeTargetText(targetName);
-        if (normalized is "你" or "你自己" or "自己" or "ai" or "self")
+        if (normalized is "你" or "你自己" or "自己" or "ai" or "self" or "me" or "myself" or "you")
             return aiPlayer.Creature;
 
         var enemy = state.Enemies.FirstOrDefault(e =>
@@ -617,7 +689,8 @@ public class CombatDecisionExecutor
         if (player != null)
             return player.Creature;
 
-        if (normalized is "我" or "我自己" or "玩家" or "人类玩家" or "队友")
+        if (normalized is "我" or "我自己" or "玩家" or "人类玩家" or "队友"
+            or "player" or "human" or "teammate" or "ally")
             return state.Players.FirstOrDefault(p => p != aiPlayer && p.Creature.IsAlive)?.Creature;
 
         return null;
@@ -625,7 +698,8 @@ public class CombatDecisionExecutor
 
     private static bool MatchesPlayerAlias(Player player, Player aiPlayer, string normalizedTarget, string rawTarget)
     {
-        if (player == aiPlayer && normalizedTarget is not "你" and not "你自己" and not "自己" and not "ai" and not "self")
+        if (player == aiPlayer && normalizedTarget is not "你" and not "你自己" and not "自己"
+            and not "ai" and not "self" and not "me" and not "myself" and not "you")
             return false;
 
         var aliases = new[]

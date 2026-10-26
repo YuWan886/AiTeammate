@@ -6,7 +6,7 @@ namespace AiTeammate.AiTeammateCode.Personality;
 
 public class MemoryManager
 {
-    private const string MemoryDir = "user://ai_teammate/memories";
+    private const string MemoryDir = ModPaths.MemoryDir;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -36,8 +36,8 @@ public class MemoryManager
 
     public void Save(PersonalityMemory memory)
     {
-        if (!DirAccess.DirExistsAbsolute(MemoryDir))
-            DirAccess.MakeDirAbsolute(MemoryDir);
+        if (!ModPaths.EnsureDir(MemoryDir))
+            return;
 
         var path = GetPath(memory.ProfileId);
         using var file = Godot.FileAccess.Open(path, Godot.FileAccess.ModeFlags.Write);

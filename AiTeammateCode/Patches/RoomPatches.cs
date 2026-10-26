@@ -1,6 +1,7 @@
-using MegaCrit.Sts2.Core.AutoSlay.Helpers;
+﻿using MegaCrit.Sts2.Core.AutoSlay.Helpers;
 using MegaCrit.Sts2.Core.Commands;
 using MegaCrit.Sts2.Core.Combat;
+using MegaCrit.Sts2.Core.Context;
 using Godot;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Entities.Cards;
@@ -13,6 +14,7 @@ using MegaCrit.Sts2.Core.Nodes.Combat;
 using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
 using MegaCrit.Sts2.Core.Nodes.Screens.CardSelection;
 using MegaCrit.Sts2.Core.Nodes.Screens.Map;
+using MegaCrit.Sts2.Core.Nodes.Screens.TreasureRoomRelic;
 using MegaCrit.Sts2.Core.Rewards;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
@@ -24,6 +26,8 @@ using MegaCrit.Sts2.Core.CardSelection;
 using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using AiTeammate.AiTeammateCode.Decision;
+using AiTeammate.AiTeammateCode.Compat;
+using AiTeammate.AiTeammateCode.Solo;
 
 namespace AiTeammate.AiTeammateCode.Patches;
 
@@ -106,6 +110,10 @@ public static class RewardsSetOfferPatch
 
         try
         {
+            // Solo climb: if the human interrupted the AI, hold the reward flow too.
+            if (SoloRunController.IsActive)
+                await AiFlowControl.WaitWhilePausedAsync();
+
             // Step 1: Generate the rewards (cards, gold amounts, etc.)
             await rewardsSet.GenerateWithoutOffering();
             var rewards = rewardsSet.Rewards.ToList();
@@ -116,12 +124,15 @@ public static class RewardsSetOfferPatch
             {
                 if (reward is not CardReward)
                 {
+                    if (SoloRunController.IsActive)
+                        await AiFlowControl.WaitWhilePausedAsync();
+
                     var rewardName = reward.GetType().Name;
                     log.Log("REWARD", $"Auto-claim {rewardName}");
                     log.Log("AI_ACTION", $"领取奖励: {rewardName}");
                     try
                     {
-                        await reward.OnSelectWrapper();
+                        await reward.SelectUnsynchronized();
                         log.Log("REWARD", $"Claimed {rewardName}");
                     }
                     catch (Exception ex)
@@ -140,12 +151,17 @@ public static class RewardsSetOfferPatch
                 var cards = cardReward.Cards.ToList();
                 if (cards.Count == 0)
                 {
+                    // Don't call SelectUnsynchronized on an empty CardReward: OnSelect opens the
+                    // native card-selection screen, which has nothing to show for the AI.
                     log.Log("REWARD", "Card reward has no cards, skipping");
-                    await cardReward.OnSelectWrapper();
+                    cardReward.MarkContentAsSeen();
                     continue;
                 }
 
                 log.Log("REWARD", $"Card reward: {cards.Count} choices");
+
+                if (SoloRunController.IsActive)
+                    await AiFlowControl.WaitWhilePausedAsync();
 
                 // Ask AI backend to choose
                 int pick;
@@ -237,21 +253,34 @@ public static class RewardsSetOfferPatch
             log.Log("REWARD", "AI reward processing complete");
             log.Log("AI_ACTION", "战斗奖励处理完成");
 
-            // Signal AI player is ready to proceed to next act.
-            // In multiplayer, the ActChangeSynchronizer waits for ALL players
-            // to signal ready — without this the game hangs at "waiting for players".
-            try
+            if (SoloRunController.IsActive)
             {
-                if (RunManager.Instance.ActChangeSynchronizer != null)
+                // Room-end rewards normally end with the rewards screen's proceed button.
+                // Our interception suppresses that screen, so perform the step ourselves.
+                if (rewardsSet.Room != null)
                 {
-                    RunManager.Instance.ActionQueueSynchronizer.RequestEnqueue(
-                        new VoteToMoveToNextActAction(aiPlayer));
-                    log.Log("REWARD", "AI player voted to proceed to next act");
+                    await AiFlowControl.WaitWhilePausedAsync();
+                    await SoloRoomAutomation.ProceedAfterRoomRewardsAsync(manager);
                 }
             }
-            catch (Exception ex)
+            else
             {
-                log.LogError("REWARD", $"Failed to signal AI ready for next act: {ex.Message}");
+                // Signal AI player is ready to proceed to next act.
+                // In multiplayer, the ActChangeSynchronizer waits for ALL players
+                // to signal ready — without this the game hangs at "waiting for players".
+                try
+                {
+                    if (RunManager.Instance.ActChangeSynchronizer != null)
+                    {
+                        RunManager.Instance.ActionQueueSynchronizer.RequestEnqueue(
+                            Compat.GameCompat.CreateVoteToMoveToNextAct(aiPlayer));
+                        log.Log("REWARD", "AI player voted to proceed to next act");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log.LogError("REWARD", $"Failed to signal AI ready for next act: {ex.Message}");
+                }
             }
         }
         catch (Exception ex)
@@ -272,18 +301,28 @@ public static class MerchantRoomPatch
         if (!manager.IsInitialized || manager.AiPlayer == null) return;
 
         var aiPlayer = manager.AiPlayer!;
-        _ = Task.Run(async () =>
+
+        // Solo climb: buy through the room's own local inventory so the UI stays in sync.
+        if (SoloRunController.IsActive)
         {
-            try
-            {
-                await Task.Delay(2000);
-                await manager.OutOfCombatExecutor.AutoShop(aiPlayer, CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                MainFile.Logger.Error($"Shop error: {ex.Message}");
-            }
-        });
+            Compat.MainThread.Post(() => SoloRoomAutomation.HandleShop(manager, aiPlayer));
+            return;
+        }
+
+        Compat.MainThread.Post(() => _ = RunShopAsync(manager, aiPlayer));
+    }
+
+    private static async Task RunShopAsync(AiTeammateManager manager, Player aiPlayer)
+    {
+        try
+        {
+            await Task.Delay(2000);
+            await manager.OutOfCombatExecutor.AutoShop(aiPlayer, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Error($"Shop error: {ex.Message}");
+        }
     }
 }
 
@@ -295,21 +334,69 @@ public static class MapScreenPatch
     public static void AfterReady()
     {
         var manager = AiTeammateManager.Instance;
-        if (!manager.IsInitialized || manager.AiPlayer == null) return;
+        if (!manager.IsInitialized) return;
+
+        SoloRunController.TryBind(manager);
+        if (manager.AiPlayer == null) return;
 
         var aiPlayer = manager.AiPlayer!;
-        _ = Task.Run(async () =>
+
+        if (SoloRunController.IsActive)
         {
-            try
-            {
-                await Task.Delay(2500);
-                await manager.OutOfCombatExecutor.AutoNavigateMap(aiPlayer, CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                MainFile.Logger.Error($"Map navigation error: {ex.Message}");
-            }
-        });
+            SoloMapNavigator.OnMapOpened();
+            return;
+        }
+
+        Compat.MainThread.Post(() => _ = RequestMapVoteAsync(aiPlayer));
+    }
+
+    /// <summary>
+    /// Multiplayer: let the AI decide its own map vote shortly after the map opens. This used to
+    /// click a node, which votes as the host/local player; only the AI's own slot votes now.
+    /// </summary>
+    private static async Task RequestMapVoteAsync(Player aiPlayer)
+    {
+        try
+        {
+            await Task.Delay(1500);
+            var runState = RunManager.Instance?.DebugOnlyGetState();
+            var synchronizer = RunManager.Instance?.MapSelectionSynchronizer;
+            if (runState == null || synchronizer == null) return;
+
+            AiMapVoter.Request(aiPlayer, synchronizer, runState.MapLocation, fallback: null);
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Error($"Map vote error: {ex.Message}");
+        }
+    }
+}
+
+// Solo climb: the map reopens after every room, so pick a route each time it opens.
+[HarmonyPatch(typeof(NMapScreen), nameof(NMapScreen.Open))]
+public static class MapScreenOpenPatch
+{
+    [HarmonyPostfix]
+    public static void AfterOpen()
+    {
+        SoloMapNavigator.OnMapOpened();
+    }
+}
+
+// Solo climb: re-bind the AI as soon as a run scene exists. Both new runs and loaded saves create
+// NRun after RunManager.Launch() set the local net id, so this is the most reliable place to
+// restore control after "Continue" — a single bind attempt during loading can fire too early.
+[HarmonyPatch(typeof(NRun), nameof(NRun._Ready))]
+public static class RunReadySoloBindPatch
+{
+    [HarmonyPostfix]
+    public static void AfterReady()
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized) return;
+
+        if (!SoloRunController.TryBind(manager))
+            SoloRunController.RequestBindRetry("NRun._Ready");
     }
 }
 
@@ -327,6 +414,13 @@ public static class RestSiteBeginPatch
         var sync = RunManager.Instance?.RestSiteSynchronizer;
         if (sync == null) return;
 
+        // Solo climb: the AI is the local player, so use the normal local-choice path.
+        if (SoloRunController.IsActive)
+        {
+            SoloRoomAutomation.HandleRestSite(sync, aiPlayer, manager);
+            return;
+        }
+
         var options = sync.GetOptionsForPlayer(aiPlayer);
         if (options == null || options.Count == 0) return;
 
@@ -334,7 +428,6 @@ public static class RestSiteBeginPatch
         var creature = aiPlayer.Creature;
         var currentHp = creature.CurrentHp;
         var maxHp = creature.MaxHp;
-        var mainSyncCtx = SynchronizationContext.Current; // capture main-thread context
         MainFile.Logger.Info($"[REST] AI rest options: {string.Join(", ", optionIds)}");
 
         // Pre-compute HP-safe fallback locally (fast, no LLM needed).
@@ -404,17 +497,7 @@ public static class RestSiteBeginPatch
                 manager.SetPendingRestSiteUpgradeIndices(null);
             }
 
-            if (mainSyncCtx != null)
-            {
-                mainSyncCtx.Post(_ =>
-                {
-                    _ = ApplyRestSiteChoiceAsync(sync, aiPlayer, options, applyPick, manager);
-                }, null);
-            }
-            else
-            {
-                _ = ApplyRestSiteChoiceAsync(sync, aiPlayer, options, applyPick, manager);
-            }
+            Compat.MainThread.Post(() => _ = ApplyRestSiteChoiceAsync(sync, aiPlayer, options, applyPick, manager));
         });
     }
 
@@ -705,7 +788,7 @@ public static class FromChooseACardScreenAiPatch
 
         var cardList = cards.ToList();
         var choiceId = RunManager.Instance.PlayerChoiceSynchronizer.ReserveChoiceId(player);
-        await context.SignalPlayerChoiceBegun(PlayerChoiceOptions.None);
+        await Compat.GameCompat.SignalPlayerChoiceBegun(context, player, PlayerChoiceOptions.None);
         try
         {
             CardModel? selected = null;
@@ -1028,7 +1111,7 @@ public static class FromHandAiPatch
             return cards;
 
         var choiceId = RunManager.Instance.PlayerChoiceSynchronizer.ReserveChoiceId(player);
-        await context.SignalPlayerChoiceBegun(PlayerChoiceOptions.CancelPlayCardActions);
+        await Compat.GameCompat.SignalPlayerChoiceBegun(context, player, PlayerChoiceOptions.CancelPlayCardActions);
         try
         {
             var pickCount = CardGridSelectionPatch.ResolveHandSelectionCount(cards.Count, prefs.MinSelect, prefs.MaxSelect);
@@ -1096,7 +1179,7 @@ public static class FromHandForUpgradeAiPatch
             return cards.FirstOrDefault();
 
         var choiceId = RunManager.Instance.PlayerChoiceSynchronizer.ReserveChoiceId(player);
-        await context.SignalPlayerChoiceBegun(PlayerChoiceOptions.CancelPlayCardActions);
+        await Compat.GameCompat.SignalPlayerChoiceBegun(context, player, PlayerChoiceOptions.CancelPlayCardActions);
         try
         {
             var picked = CardGridSelectionPatch.PickCardsByHeuristic(cards, 1, 1, "Upgrade");
@@ -1521,28 +1604,9 @@ public static class DeckCardSelectPatch
     }
 }
 
-// ---- Fix: PeerInputSynchronizer throws for AI players (no peer input state) ----
-// NHandImageCollection.UpdateHandVisibility calls GetScreenType→ForceGetStateForPlayer
-// for every player. AI players have no PeerInputState → InvalidOperationException → hang.
-// Auto-create a default state for AI players instead of throwing.
-[HarmonyPatch(typeof(PeerInputSynchronizer), "ForceGetStateForPlayer")]
-public static class ForceGetStateForPlayerPatch
-{
-    [HarmonyPrefix]
-    public static bool Prefix(ulong playerId, ref object __result, PeerInputSynchronizer __instance)
-    {
-        if (playerId >= 0xA1AA_A000 && playerId <= 0xA1AA_FFFF)
-        {
-            var getOrCreate = AccessTools.Method(typeof(PeerInputSynchronizer), "GetOrCreateStateForPlayer");
-            if (getOrCreate == null)
-                return true;
-
-            __result = getOrCreate.Invoke(__instance, new object[] { playerId })!;
-            return false;
-        }
-        return true;
-    }
-}
+// NOTE: the old PeerInputSynchronizer.ForceGetStateForPlayer patch was removed. That method no
+// longer exists in 0.107.1 or 0.111.0; GetScreenType now goes through GetOrCreateStateForPlayer,
+// so AI players no longer throw when hand visibility refreshes.
 
 // ---- Auto-reconnect AI player when loading a saved multiplayer run ----
 // When the host exits and re-enters a game, the LoadRunLobby waits for all
@@ -1554,9 +1618,6 @@ public static class ForceGetStateForPlayerPatch
 [HarmonyPatch(typeof(NMultiplayerLoadGameScreen), "InitializeAsHost")]
 public static class LoadGameScreenHostPatch
 {
-    private const ulong AiNetIdMin = 0xA1AA_A000;
-    private const ulong AiNetIdMax = 0xA1AA_FFFF;
-
     [HarmonyPostfix]
     public static void AfterInitializeAsHost(NMultiplayerLoadGameScreen __instance)
     {
@@ -1574,28 +1635,10 @@ public static class LoadGameScreenHostPatch
 
             foreach (var p in players)
             {
-                if (p.NetId >= AiNetIdMin && p.NetId <= AiNetIdMax)
+                if (AiIdentity.IsAi(p.NetId))
                 {
-                    if (!lobby.ConnectedPlayerIds.Contains(p.NetId))
-                    {
-                        lobby.ConnectedPlayerIds.Add(p.NetId);
-                        lobby.LobbyListener.PlayerConnected(p.NetId);
-                        MainFile.Logger.Info($"[LOAD] AI player {p.NetId} ({p.CharacterId}) auto-reconnected to loaded lobby");
-                    }
-
-                    // Also mark AI as ready so IsAboutToBeginGame() passes.
-                    // _readyPlayers is private — add via reflection.
-                    try
-                    {
-                        var readyField = AccessTools.Field(typeof(LoadRunLobby), "_readyPlayers");
-                        var readyPlayers = (HashSet<ulong>?)readyField?.GetValue(lobby);
-                        if (readyPlayers != null && readyPlayers.Add(p.NetId))
-                            lobby.LobbyListener.PlayerReadyChanged(p.NetId);
-                    }
-                    catch (Exception ex)
-                    {
-                        MainFile.Logger.Warn($"[LOAD] Failed to mark AI as ready: {ex.Message}");
-                    }
+                    Compat.GameCompat.MarkLoadLobbyPlayerConnected(lobby, p.NetId);
+                    MainFile.Logger.Info($"[LOAD] AI player {p.NetId} ({p.CharacterId}) auto-reconnected to loaded lobby");
                 }
             }
         }
@@ -1618,23 +1661,45 @@ public static class LoadRunPatch
         manager.DetectAndBindAiPlayer();
         if (manager.AiPlayer != null)
             MainFile.Logger.Info($"AI player re-detected after save load: {manager.AiPlayer.Character?.Id.Entry}");
+
+        // The postfix runs before the async load finishes, so the local net id may not exist yet.
+        // Retry in the background; NRun._Ready usually wins the race.
+        if (!SoloRunController.IsActive)
+            SoloRunController.RequestBindRetry("LoadRun");
     }
 }
 
 // ---- Auto-pick relic for AI in treasure rooms ----
-[HarmonyPatch(typeof(TreasureRoomRelicSynchronizer), "BeginRelicPicking")]
+// BeginRelicPicking runs when the room is entered — long before the relic collection screen exists.
+// Picking there awarded the relic while NTreasureRoomRelicCollection._holdersInUse was still empty,
+// so AnimateRelicAwards threw "Sequence contains no matching element" and the chest never finished
+// opening. Vote once the local collection has been initialized instead, and route the vote through
+// the action queue so multiplayer peers apply it too (an OnPicked call stays local to this machine).
+[HarmonyPatch(typeof(NTreasureRoomRelicCollection), nameof(NTreasureRoomRelicCollection.InitializeRelics))]
 public static class TreasureRoomRelicAutoPickPatch
 {
     [HarmonyPostfix]
-    public static void AfterBeginRelicPicking(TreasureRoomRelicSynchronizer __instance)
+    public static void AfterInitializeRelics()
     {
         var manager = AiTeammateManager.Instance;
         if (!manager.IsInitialized || manager.AiPlayer == null) return;
 
-        var relics = __instance.CurrentRelics;
+        // The AI player is simulated by the host; clients must not vote on its behalf.
+        var run = RunManager.Instance;
+        var netType = run?.NetService?.Type;
+        if (netType is not (NetGameType.Singleplayer or NetGameType.Host)) return;
+
+        var sync = run!.TreasureRoomRelicSynchronizer;
+        var relics = sync?.CurrentRelics;
         if (relics == null || relics.Count == 0) return;
 
         var aiPlayer = manager.AiPlayer!;
+
+        // Already voted: singleplayer-with-fake-players pre-votes for non-local players, and a
+        // second InitializeRelics for the same chest must not vote twice.
+        var existingVote = sync!.GetPlayerVote(aiPlayer);
+        if (existingVote != null && existingVote.voteReceived) return;
+
         var index = System.Random.Shared.Next(relics.Count);
         var picked = relics[index];
 
@@ -1643,7 +1708,16 @@ public static class TreasureRoomRelicAutoPickPatch
 
         try
         {
-            __instance.OnPicked(aiPlayer, index);
+            if (LocalContext.NetId.HasValue && LocalContext.NetId.Value == aiPlayer.NetId)
+            {
+                // Solo climb: the AI owns the local player, so use the local-player path.
+                sync.PickRelicLocally(index);
+            }
+            else
+            {
+                // Multiplayer teammate: broadcast the AI's vote so every peer counts it.
+                run.ActionQueueSynchronizer.RequestEnqueue(new PickRelicAction(aiPlayer, index));
+            }
         }
         catch (System.Exception ex)
         {

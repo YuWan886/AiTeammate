@@ -2,10 +2,11 @@
   "id": "AiTeammate",
   "name": "AI 队友",
   "author": "一条鱼丸_",
-  "description": "在多人模式中添加由 AI 操控的队友角色，具备独立人格、团队协作决策、聊天沟通和手牌建议功能。",
-  "version": "v1.1.0",
-  "has_pck": false,
+  "description": "多人模式中由 AI 操控的队友（独立人格、协作决策、聊天、手牌建议），并支持单人「AI 独自爬塔」模式：AI 自动推进整局，你随时可以打断它并对话。设置页面由 RitsuLib 提供。",
+  "version": "v2.1.0",
+  "min_game_version": "0.107.1",
+  "has_pck": true,
   "has_dll": true,
-  "dependencies": [],
-  "affects_gameplay": true
+  "affects_gameplay": true,
+  "dependencies": [ { "id": "STS2-RitsuLib" } ]
 }

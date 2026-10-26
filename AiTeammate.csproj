@@ -1,17 +1,34 @@
-<Project Sdk="Godot.NET.Sdk/4.5.1" InitialTargets="CheckDependencyPaths">
+﻿<Project Sdk="Godot.NET.Sdk/4.5.1" InitialTargets="CheckDependencyPaths">
     <Import Project=".\Sts2PathDiscovery.props"/>
     <PropertyGroup>
         <TargetFramework>net9.0</TargetFramework>
         <ImplicitUsings>true</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <!--
+          The game loads AiTeammate.dll at the mod root (the loader). This project produces the
+          per-version content variant AiTeammate.Content.dll, deployed under lib/<game-version>/.
+          Keep the public namespace as AiTeammate.
+        -->
+        <AssemblyName>AiTeammate.Content</AssemblyName>
         <AppOutputBase>$(MSBuildProjectDirectory)\</AppOutputBase>
         <PathMap>$(AppOutputBase)=.\</PathMap>
         <GodotDisabledSourceGenerators>GodotPluginsInitializer</GodotDisabledSourceGenerators>
+        <NoWarn>$(NoWarn);MSB3270</NoWarn>
     </PropertyGroup>
 
+    <!-- Match a plain development build to the installed game. Variant builds always pass VariantTarget explicitly. -->
+    <PropertyGroup Condition="'$(VariantTarget)' == '' and Exists('$(Sts2Path)/release_info.json')">
+        <InstalledSts2Version>$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(Sts2Path)/release_info.json')), '&quot;version&quot;\s*:\s*&quot;v?([^&quot;]+)&quot;').Groups[1].Value)</InstalledSts2Version>
+    </PropertyGroup>
     <PropertyGroup>
-        <NoWarn>$(NoWarn);MSB3270</NoWarn>
+        <EffectiveVariantTarget Condition="'$(VariantTarget)' != ''">$(VariantTarget)</EffectiveVariantTarget>
+        <EffectiveVariantTarget Condition="'$(EffectiveVariantTarget)' == ''">$(InstalledSts2Version)</EffectiveVariantTarget>
+    </PropertyGroup>
+
+    <!-- 0.111 renamed LobbyPlayer -> StartRunLobbyPlayer and changed several lobby/choice APIs. -->
+    <PropertyGroup Condition="'$(EffectiveVariantTarget)' != '' and '$(EffectiveVariantTarget)' != '0.107.1'">
+        <DefineConstants>$(DefineConstants);STS2_API_0_111_OR_LATER</DefineConstants>
     </PropertyGroup>
 
     <ItemGroup Condition="Exists('$(Sts2DataDir)')">
@@ -25,41 +42,69 @@
         </Reference>
     </ItemGroup>
 
-    <ItemGroup Condition="'$(PublicizeSts)' == 'true'">
-        <Publicize Include="sts2" IncludeVirtualMembers="false" IncludeCompilerGeneratedMembers="false" />
+    <ItemGroup>
+        <Publicize Include="sts2" IncludeVirtualMembers="false" IncludeCompilerGeneratedMembers="false"/>
+    </ItemGroup>
+
+    <!-- Build the game-facing loader (AiTeammate.dll) alongside the content. We do not
+         reference its types; the loader drives content via reflection. -->
+    <ItemGroup>
+        <ProjectReference Include="AiTeammateCode\Loader\AiTeammateCode.Loader.csproj"
+                          ReferenceOutputAssembly="false"/>
     </ItemGroup>
 
     <ItemGroup>
         <PackageReference Include="Krafs.Publicizer" Version="2.3.0" PrivateAssets="All"/>
+        <PackageReference Include="STS2.RitsuLib" Version="0.6.10"/>
+        <PackageReference Include="BSchneppe.StS2.PckPacker" Version="0.1.1" PrivateAssets="All"/>
     </ItemGroup>
 
     <ItemGroup>
-        <Compile Remove="AiTeammate/**" />
-        <Compile Remove="materials/**" />
-        <Compile Remove="shaders/**" />
-        <EmbeddedResource Remove="AiTeammate/**" />
-        <EmbeddedResource Remove="materials/**" />
-        <EmbeddedResource Remove="shaders/**" />
+        <Compile Remove="AiTeammate/**"/>
+        <Compile Remove="materials/**"/>
+        <Compile Remove="shaders/**"/>
+        <Compile Remove="AiTeammateCode/Loader/**"/>
+        <EmbeddedResource Remove="AiTeammate/**"/>
+        <EmbeddedResource Remove="materials/**"/>
+        <EmbeddedResource Remove="shaders/**"/>
+        <EmbeddedResource Remove="AiTeammateCode/Loader/**"/>
+        <None Remove="AiTeammateCode/Loader/**"/>
     </ItemGroup>
 
     <ItemGroup>
         <None Condition="Exists('Directory.Build.props')" Include="Directory.Build.props"/>
-        <None Include=".gitignore" />
-        <None Include="AiTeammate.json" />
+        <None Include=".gitignore"/>
+        <None Include="AiTeammate.json"/>
         <None Include="project.godot"/>
-        <None Include="AiTeammate/**" />
+        <None Include="AiTeammate/**"/>
     </ItemGroup>
 
     <Target Name="CheckDependencyPaths">
         <Error Text="Slay the Spire 2 data not found at path '$(Sts2DataDir)'"
-               Condition="'$(Sts2DataDir)' == '' or !Exists('$(Sts2DataDir)')" />
+               Condition="'$(Sts2DataDir)' == '' or !Exists('$(Sts2DataDir)')"/>
     </Target>
 
+    <!--
+      Deploys one content variant into <Mods>/AiTeammate/lib/<version>/ plus the loader at the mod
+      root. Empty $(VariantTarget) (plain `dotnet build`, the dev loop) auto-detects the installed
+      game version from release_info.json; build-variants.ps1 passes an explicit VariantTarget per
+      snapshot to assemble the full multi-version bundle.
+    -->
     <Target Name="CopyToModsFolderOnBuild" AfterTargets="PostBuildEvent">
-        <Message Text="Copying .dll .pdb and .json to mods folder." Importance="high" />
-        <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/" />
-        <Copy SourceFiles="$(AssemblyName).json" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/" />
-        <Copy SourceFiles="README.md" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/" />
-        <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/" />
+        <Message Text="Deploying AiTeammate content variant + loader to mods folder." Importance="high"/>
+        <Copy SourceFiles="AiTeammate.json" DestinationFolder="$([System.IO.Path]::Combine('$(ModsPath)','$(MSBuildProjectName)'))"/>
+        <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/tools/deploy-mod.ps1&quot; -ContentDll &quot;$(TargetPath)&quot; -LoaderDll &quot;$(MSBuildProjectDirectory)/AiTeammateCode/Loader/bin/$(Configuration)/net9.0/AiTeammate.dll&quot; -ModRoot &quot;$([System.IO.Path]::Combine('$(ModsPath)','$(MSBuildProjectName)'))&quot; -Sts2DataDir &quot;$(Sts2DataDir)&quot; -VariantTarget &quot;$(VariantTarget)&quot;"/>
+    </Target>
+
+    <!--
+      Localization JSON lives in AiTeammate/localization/ and is packed into AiTeammate.pck so the
+      game can resolve res://AiTeammate/localization/<lang>.json. PckPacker packs raw files only,
+      which is enough for JSON (no imported textures are involved).
+    -->
+    <Target Name="CopyQuickPck" AfterTargets="PackPck"
+            Condition="'$(PckPackerEnabled)' != 'false' And Exists('$(PckPackerOutputPath)') And '$(PckPackerSkipped)' != 'true'">
+        <Message Text="Copying quick .pck to mods folder." Importance="high"/>
+        <Copy SourceFiles="$(PckPackerOutputPath)"
+              DestinationFolder="$(ModsPath)$(MSBuildProjectName)"/>
     </Target>
 </Project>

@@ -1,14 +1,17 @@
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Players;
+using MegaCrit.Sts2.Core.GameActions;
+using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using AiTeammate.AiTeammateCode.Decision;
+using AiTeammate.AiTeammateCode.Solo;
 
 namespace AiTeammate.AiTeammateCode.Patches;
 
 [HarmonyPatch(typeof(CombatManager))]
 public static class CombatManagerPatch
 {
-    private static bool _turnStartedSubscribed;
+    private static bool _eventsSubscribed;
 
     [HarmonyPatch(nameof(CombatManager.SetUpCombat))]
     [HarmonyPostfix]
@@ -21,21 +24,26 @@ public static class CombatManagerPatch
         manager.DecisionService.ResetCombatHistory();
         manager.DirectiveManager.ResetCombat();
         manager.ResetExtraPlayerTurnCombatDecisionState();
+        manager.CardHighlighter.ClearAllHighlights();
+        CombatDecisionExecutor.ResetReadyToBeginEnemyTurnSignal();
 
-        // Subscribe to TurnStarted event once per session
-        if (!_turnStartedSubscribed)
+        // Subscribe to combat events once per session
+        if (!_eventsSubscribed)
         {
             CombatManager.Instance.TurnStarted += OnTurnStarted;
             CombatManager.Instance.TurnEnded += OnTurnEnded;
-            _turnStartedSubscribed = true;
+            CombatManager.Instance.CombatWon += OnCombatWon;
+            _eventsSubscribed = true;
         }
+
+        // Solo climb: bind (or release) the local player before combat starts.
+        SoloRunController.TryBind(manager);
 
         // Detect and bind the AI player from the combat state
         if (manager.AiPlayer == null)
         {
             manager.DetectAndBindAiPlayer(state);
-        }
-    }
+        }    }
 
     [HarmonyPatch(nameof(CombatManager.SetReadyToEndTurn))]
     [HarmonyPrefix]
@@ -80,32 +88,17 @@ public static class CombatManagerPatch
         var state = CombatManager.Instance.DebugOnlyGetState();
         if (state?.CurrentSide != CombatSide.Player) return;
 
-        if (player == manager.AiPlayer)
-        {
-            // AI just ended its own turn. Check if all human teammates are dead.
-            // If so, the game may be waiting for the dead player to signal
-            // SetReadyToBeginEnemyTurn — do it on their behalf.
-            bool allHumansDead = state.Players
-                .Where(p => p != manager.AiPlayer)
-                .All(p => !p.Creature.IsAlive);
-            if (allHumansDead)
-            {
-                CombatDecisionExecutor.TrySignalReadyToBeginEnemyTurn(manager.AiPlayer);
-            }
-            return;
-        }
+        if (player == manager.AiPlayer) return;
 
         if (manager.ConsumePendingExtraPlayerTurnCombatDecision())
         {
             TriggerExtraCombatDecision(manager);
-            return;
         }
 
-        // Human player ended turn. Only signal BeginEnemyTurn if the AI has
-        // already ended its own turn.
-        if (!CombatManager.Instance.IsPlayerReadyToEndTurn(manager.AiPlayer)) return;
-
-        CombatDecisionExecutor.TrySignalReadyToBeginEnemyTurn(manager.AiPlayer);
+        // The AI's own ready-to-begin-enemy-turn signal is sent by
+        // CombatTurnTransitionPatch after end-of-turn phase one, never here: signalling straight
+        // from a SetReadyToEndTurn postfix can run AfterAllPlayersReadyToBeginEnemyTurn while
+        // phase one is still in flight (or, in singleplayer, duplicate the game's own transition).
     }
 
     private static async void OnTurnStarted(CombatState state)
@@ -121,6 +114,15 @@ public static class CombatManagerPatch
         if (state.CurrentSide == CombatSide.Player)
         {
             manager.ResetExtraPlayerTurnCombatDecisionState();
+            CombatDecisionExecutor.ResetReadyToBeginEnemyTurnSignal();
+
+            var settings = Settings.AiSettingsStore.Current;
+            if (!manager.IsSoloControlled && settings.EnableSuggestions && settings.AutoSuggestOnTurnStart)
+            {
+                var human = MegaCrit.Sts2.Core.Context.LocalContext.GetMe(state);
+                if (human != null)
+                    _ = manager.OnPlayerTurnStarted(human);
+            }
         }
 
         try
@@ -135,7 +137,16 @@ public static class CombatManagerPatch
 
     private static void OnTurnEnded(CombatState state)
     {
-        // Future: cleanup or state tracking after turn ends
+        AiTeammateManager.Instance.CardHighlighter?.ClearAllHighlights();
+    }
+
+    private static void OnCombatWon(MegaCrit.Sts2.Core.Rooms.CombatRoom room)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || manager.AiPlayer == null)
+            return;
+
+        _ = manager.OnCombatWon();
     }
 
     private static async void TriggerExtraCombatDecision(AiTeammateManager manager)
@@ -148,5 +159,34 @@ public static class CombatManagerPatch
         {
             MainFile.Logger.Error($"Extra AI combat decision error: {ex.Message}");
         }
+    }
+}
+
+/// <summary>
+/// Signals the AI player's <c>ReadyToBeginEnemyTurnAction</c> at the right moment: when the game
+/// enqueues the local player's own ready action, i.e. after end-of-turn phase one finished. The AI
+/// has no network peer, so nothing else ever sends its action and the transition would never start.
+/// Hooking <c>RequestEnqueue</c> (identical signature on 0.107.x and 0.111.x) is deliberate — a
+/// postfix on the async <c>AfterAllPlayersReadyToEndTurn</c> would run when that method first yields,
+/// before phase one is done, which is exactly the race that corrupts the turn.
+/// </summary>
+[HarmonyPatch(typeof(ActionQueueSynchronizer), nameof(ActionQueueSynchronizer.RequestEnqueue))]
+public static class CombatTurnTransitionPatch
+{
+    [HarmonyPrefix]
+    public static void BeforeRequestEnqueue(GameAction action)
+    {
+        if (action is not ReadyToBeginEnemyTurnAction)
+            return;
+
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized)
+            return;
+
+        var aiPlayer = manager.AiPlayer;
+        if (aiPlayer == null)
+            return;
+
+        CombatDecisionExecutor.TrySignalReadyToBeginEnemyTurn(aiPlayer);
     }
 }

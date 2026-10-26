@@ -17,6 +17,7 @@ using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Nodes.Screens.CharacterSelect;
 using MegaCrit.Sts2.Core.Nodes.Screens.MainMenu;
 using MegaCrit.Sts2.Core.Nodes.Vfx.Utilities;
+using AiTeammate.AiTeammateCode.Localization;
 
 namespace AiTeammate.AiTeammateCode.Patches;
 
@@ -59,7 +60,7 @@ public static class CharacterSelectScreenPatch
             return;
 
         var lobby = __instance.Lobby;
-        if (lobby == null || lobby.MaxPlayers <= 1)
+        if (lobby == null || Compat.GameCompat.MaxPlayers(lobby) <= 1)
             return;
 
         var existing = __instance.GetNodeOrNull<Control>(AiContainerName);
@@ -110,7 +111,7 @@ public static class CharacterSelectScreenPatch
         n.Container.AddChild(vbox);
 
         n.AddBtn = new Button();
-        n.AddBtn.Text = "添加AI";
+        n.AddBtn.Text = AiLoc.T("charselect.add_ai", "Add AI");
         n.AddBtn.CustomMinimumSize = new Vector2(180, 36);
         n.AddBtn.Pressed += () => OnAddAiClicked(screen);
         vbox.AddChild(n.AddBtn);
@@ -147,13 +148,14 @@ public static class CharacterSelectScreenPatch
         cardTextVbox.AddChild(n.StatusLabel);
 
         n.RemoveBtn = new Button();
-        n.RemoveBtn.Text = "移除";
+        n.RemoveBtn.Text = AiLoc.T("charselect.remove", "Remove");
         n.RemoveBtn.CustomMinimumSize = new Vector2(72, 52);
         n.RemoveBtn.Pressed += () => OnRemoveAiClicked(screen);
         n.CardRow.AddChild(n.RemoveBtn);
 
         n.HintLabel = new Label();
-        n.HintLabel.Text = "正在编辑 AI 队友：选择角色后点击确认让 AI 准备，点击返回回到玩家角色。";
+        n.HintLabel.Text = AiLoc.T("charselect.hint",
+            "Editing the AI teammate: pick a character, then confirm to ready the AI; press Back to return to your own character.");
         n.HintLabel.Visible = false;
         vbox.AddChild(n.HintLabel);
 
@@ -177,9 +179,14 @@ public static class CharacterSelectScreenPatch
             return;
 
         nodes.Icon.Texture = aiPlayer.Value.character.IconTexture;
-        nodes.NameLabel.Text = $"AI: {aiPlayer.Value.character.Title.GetFormattedText()}";
-        nodes.StatusLabel.Text = aiPlayer.Value.isReady ? "状态：已准备" : "状态：未准备";
-        nodes.CardBtn.TooltipText = nodes.IsEditingAi ? "正在编辑 AI 队友" : "点击编辑 AI 队友角色";
+        nodes.NameLabel.Text = AiLoc.T("charselect.name", "AI: {Name}",
+            ("Name", aiPlayer.Value.character.Title.GetFormattedText()));
+        nodes.StatusLabel.Text = aiPlayer.Value.isReady
+            ? AiLoc.T("charselect.status.ready", "Status: Ready")
+            : AiLoc.T("charselect.status.not_ready", "Status: Not ready");
+        nodes.CardBtn.TooltipText = nodes.IsEditingAi
+            ? AiLoc.T("charselect.tooltip.editing", "Editing the AI teammate")
+            : AiLoc.T("charselect.tooltip.edit", "Click to edit the AI teammate's character");
     }
 
     private static void OnAddAiClicked(NCharacterSelectScreen screen)

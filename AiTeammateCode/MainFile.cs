@@ -1,9 +1,18 @@
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Logging;
 using MegaCrit.Sts2.Core.Modding;
+using STS2RitsuLib;
+using AiTeammate.AiTeammateCode.Compat;
+using AiTeammate.AiTeammateCode.Personality;
+using AiTeammate.AiTeammateCode.Settings;
+using AiTeammate.AiTeammateCode.Suggestion;
 
 namespace AiTeammate.AiTeammateCode;
 
+/// <summary>
+/// Content-variant entry point. The loader (AiTeammate.dll) invokes this after picking the
+/// variant that matches the running game version.
+/// </summary>
 [ModInitializer(nameof(Initialize))]
 public static class MainFile
 {
@@ -12,7 +21,42 @@ public static class MainFile
 
     public static void Initialize()
     {
-        Harmony harmony = new(ModId);
-        harmony.PatchAll();
+        InitializeSettings();
+        InstallPatches();
+    }
+
+    private static void InitializeSettings()
+    {
+        try
+        {
+            using (RitsuLibFramework.BeginModDataRegistration(ModId))
+            {
+                AiSettingsStore.RegisterData();
+                PersonalityStore.RegisterData();
+            }
+
+            // Built-in personality text is localized, so seeding waits until LocManager exists
+            // (NGame ready or the settings page build); mod initialization runs before it.
+            AiSettingsPage.Register();
+            SuggestionHighlightState.Register();
+
+            Logger.Info("设置初始化完成（人格数据将在游戏就绪时载入）");
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[Settings] 初始化失败（Mod 仍会尝试加载，但设置不可用）: {ex}");
+        }
+    }
+
+    private static void InstallPatches()
+    {
+        try
+        {
+            SafePatchInstaller.InstallAll(new Harmony(ModId));
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[Patch] 补丁安装失败: {ex}");
+        }
     }
 }

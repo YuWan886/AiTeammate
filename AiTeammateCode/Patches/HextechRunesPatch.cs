@@ -1,7 +1,9 @@
-using System.Reflection;
+﻿using System.Reflection;
 using Godot;
 using HarmonyLib;
 using AiTeammate.AiTeammateCode.Decision;
+using AiTeammate.AiTeammateCode.Compat;
+using AiTeammate.AiTeammateCode.Solo;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Models;
 
@@ -44,7 +46,7 @@ public static class HextechIsLoopbackHostSessionPatch
             {
                 foreach (var p in runState.Players)
                 {
-                    if (p.NetId >= 0xA1AA_A000 && p.NetId <= 0xA1AA_FFFF)
+                    if (AiIdentity.IsAi(p.NetId))
                     {
                         __result = true;
                         return;
@@ -91,7 +93,7 @@ public static class HextechIsAiPlayerPatch
     {
         if (__result) return;
         if (player == null) return;
-        if (player.NetId >= 0xA1AA_A000 && player.NetId <= 0xA1AA_FFFF)
+        if (AiIdentity.IsAi(player.NetId) || SoloRunController.IsAiControlledPlayer(player))
             __result = true;
     }
 
@@ -136,7 +138,7 @@ public static class HextechTryGetHostPlayerIdPatch
             foreach (var p in runState.Players)
             {
                 // Find the first human player (non-AI NetId)
-                if (p.NetId < 0xA1AA_A000 || p.NetId > 0xA1AA_FFFF)
+                if (!AiIdentity.IsAi(p.NetId))
                 {
                     hostPlayerId = p.NetId;
                     __result = true;

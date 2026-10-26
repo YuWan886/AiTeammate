@@ -5,6 +5,8 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AiTeammate", "AiTeammate.csproj", "{B71A6DC7-9808-4F6B-A715-F31254D16A29}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AiTeammateCode.Loader", "AiTeammateCode\Loader\AiTeammateCode.Loader.csproj", "{8200399C-FBAC-4208-9772-A2744D310E51}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -27,6 +29,18 @@ Global
 		{B71A6DC7-9808-4F6B-A715-F31254D16A29}.Release|x64.Build.0 = Debug|Any CPU
 		{B71A6DC7-9808-4F6B-A715-F31254D16A29}.Release|x86.ActiveCfg = Debug|Any CPU
 		{B71A6DC7-9808-4F6B-A715-F31254D16A29}.Release|x86.Build.0 = Debug|Any CPU
+		{8200399C-FBAC-4208-9772-A2744D310E51}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8200399C-FBAC-4208-9772-A2744D310E51}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8200399C-FBAC-4208-9772-A2744D310E51}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{8200399C-FBAC-4208-9772-A2744D310E51}.Debug|x64.Build.0 = Debug|Any CPU
+		{8200399C-FBAC-4208-9772-A2744D310E51}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{8200399C-FBAC-4208-9772-A2744D310E51}.Debug|x86.Build.0 = Debug|Any CPU
+		{8200399C-FBAC-4208-9772-A2744D310E51}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8200399C-FBAC-4208-9772-A2744D310E51}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8200399C-FBAC-4208-9772-A2744D310E51}.Release|x64.ActiveCfg = Release|Any CPU
+		{8200399C-FBAC-4208-9772-A2744D310E51}.Release|x64.Build.0 = Release|Any CPU
+		{8200399C-FBAC-4208-9772-A2744D310E51}.Release|x86.ActiveCfg = Release|Any CPU
+		{8200399C-FBAC-4208-9772-A2744D310E51}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

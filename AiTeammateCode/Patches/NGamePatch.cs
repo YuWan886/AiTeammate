@@ -12,6 +12,9 @@ using MegaCrit.Sts2.Core.Nodes.Rooms;
 using MegaCrit.Sts2.Core.Nodes.Vfx;
 using MegaCrit.Sts2.Core.Nodes.Vfx.Utilities;
 using MegaCrit.Sts2.Core.Runs;
+using AiTeammate.AiTeammateCode.Solo;
+using AiTeammate.AiTeammateCode.Localization;
+using AiTeammate.AiTeammateCode.Personality;
 
 namespace AiTeammate.AiTeammateCode.Patches;
 
@@ -31,6 +34,7 @@ public static class NGamePatch
     private static LineEdit? _inputField;
     private static ScrollContainer? _scrollContainer;
     private static Button? _minimizedButton;
+    private static Button? _pauseButton;
     private static bool _chatMinimized;
     private static Action<ChatMessage>? _currentHandler;
     private static readonly DragState _panelDragState = new();
@@ -52,14 +56,22 @@ public static class NGamePatch
         AfterGameReady(game);
     }
 
-    /// <summary>聊天面板仅在多人模式且有 AI 队友时显示。</summary>
+    /// <summary>聊天面板仅在多人模式有 AI 队友、或单人爬塔由 AI 接管时显示。</summary>
     private static bool ShouldShowChatPanel()
     {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized)
+            return false;
+
+        // Solo climb: the local player is AI-controlled, so the chat panel is the only way to talk.
+        SoloRunController.TryBind(manager);
+        if (manager.IsSoloControlled)
+            return true;
+
         var netType = RunManager.Instance?.NetService?.Type;
         if (netType == null || netType == NetGameType.Singleplayer)
             return false;
 
-        var manager = AiTeammateManager.Instance;
         if (manager.AiPlayer == null)
         {
             manager.DetectAndBindAiPlayer();
@@ -73,9 +85,18 @@ public static class NGamePatch
     [HarmonyPostfix]
     public static void AfterGameReady(NGame __instance)
     {
+        Compat.MainThread.Capture();
+
         var manager = AiTeammateManager.Instance;
         if (!manager.IsInitialized)
             manager.Initialize();
+
+        // The content cache needs ModelDb, which only exists once the game is ready (an early
+        // Initialize from the settings page cannot build it).
+        manager.CacheService?.EnsureLoaded();
+
+        // Locale is finalized by now; refresh built-in personalities when the language changed.
+        PersonalityStore.EnsureSeeded();
 
         if (!ShouldShowChatPanel())
         {
@@ -165,7 +186,7 @@ public static class NGamePatch
         dragArea.AddThemeStyleboxOverride("panel", dragStyleBox);
 
         var titleLabel = new Label();
-        titleLabel.Text = "AI 队友";
+        titleLabel.Text = AiLoc.T("chat.title", "AI Teammate");
         titleLabel.HorizontalAlignment = HorizontalAlignment.Left;
         titleLabel.AddThemeColorOverride("font_color", new Color(0.7f, 1f, 0.7f));
         dragArea.AddChild(titleLabel);
@@ -176,9 +197,18 @@ public static class NGamePatch
         var minBtn = new Button();
         minBtn.Text = "─";
         minBtn.CustomMinimumSize = new Vector2(24, 22);
-        minBtn.TooltipText = "最小化";
+        minBtn.TooltipText = AiLoc.T("chat.minimize", "Minimize");
         minBtn.Pressed += MinimizeChatPanel;
         titleBar.AddChild(minBtn);
+
+        var pauseBtn = new Button();
+        pauseBtn.Text = "⏸";
+        pauseBtn.CustomMinimumSize = new Vector2(24, 22);
+        pauseBtn.TooltipText = AiLoc.T("chat.pause", "Pause AI");
+        pauseBtn.Visible = false;
+        pauseBtn.Pressed += () => AiFlowControl.ToggleManualPause();
+        titleBar.AddChild(pauseBtn);
+        _pauseButton = pauseBtn;
 
         mainVbox.AddChild(titleBar);
 
@@ -199,13 +229,13 @@ public static class NGamePatch
         mainVbox.AddChild(inputHbox);
 
         _inputField = new LineEdit();
-        _inputField.PlaceholderText = "输入消息...";
+        _inputField.PlaceholderText = AiLoc.T("chat.placeholder", "Type a message...");
         _inputField.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
         _inputField.CustomMinimumSize = new Vector2(0, 22);
         inputHbox.AddChild(_inputField);
 
         var sendButton = new Button();
-        sendButton.Text = "发送";
+        sendButton.Text = AiLoc.T("chat.send", "Send");
         sendButton.CustomMinimumSize = new Vector2(48, 22);
         inputHbox.AddChild(sendButton);
 
@@ -213,8 +243,8 @@ public static class NGamePatch
         _minimizedButton.SetAnchorsAndOffsetsPreset(Control.LayoutPreset.TopLeft);
         _minimizedButton.Position = initialPosition;
         _minimizedButton.Size = new Vector2(120, 30);
-        _minimizedButton.Text = "AI 队友";
-        _minimizedButton.TooltipText = "拖动位置 / 点击展开";
+        _minimizedButton.Text = AiLoc.T("chat.title", "AI Teammate");
+        _minimizedButton.TooltipText = AiLoc.T("chat.drag_hint", "Drag to move / click to expand");
         _minimizedButton.Visible = false;
         _minimizedButton.MouseFilter = Control.MouseFilterEnum.Stop;
         WireDrag(_minimizedButton, _minimizedButton, _buttonDragState);
@@ -234,11 +264,46 @@ public static class NGamePatch
                 return;
 
             _inputField?.Clear();
-            _ = manager.ChatManager.HandlePlayerMessage("玩家", trimmed, System.Threading.CancellationToken.None);
+            _ = manager.ChatManager.HandlePlayerMessage(AiLoc.T("chat.player_sender", "Player"), trimmed, System.Threading.CancellationToken.None);
         }
 
         sendButton.Pressed += () => OnSend(_inputField?.Text ?? "");
         _inputField.TextSubmitted += OnSend;
+
+        UpdateSoloChatControls();
+    }
+
+    /// <summary>Hides the chat panel (solo mode released / run over). 隐藏聊天面板。</summary>
+    public static void HideChatPanel()
+    {
+        if (_chatRoot != null && GodotObject.IsInstanceValid(_chatRoot))
+            _chatRoot.Visible = false;
+        if (_minimizedButton != null && GodotObject.IsInstanceValid(_minimizedButton))
+            _minimizedButton.Visible = false;
+    }
+
+    /// <summary>Shows/hides the solo-climb pause button and updates its state. 更新暂停按钮。</summary>
+    public static void UpdateSoloChatControls()
+    {
+        var manager = AiTeammateManager.Instance;
+        var solo = manager.IsInitialized && manager.IsSoloControlled;
+
+        if (_pauseButton != null && GodotObject.IsInstanceValid(_pauseButton))
+        {
+            var paused = AiFlowControl.IsPaused;
+            _pauseButton.Visible = solo;
+            _pauseButton.Text = paused ? "▶" : "⏸";
+            _pauseButton.TooltipText = paused
+                ? AiLoc.T("chat.resume", "Resume AI")
+                : AiLoc.T("chat.pause", "Pause AI");
+            _pauseButton.AddThemeColorOverride("font_color",
+                paused ? new Color(1f, 0.75f, 0.3f) : new Color(0.7f, 1f, 0.7f));
+        }
+
+        if (_inputField != null && GodotObject.IsInstanceValid(_inputField))
+            _inputField.PlaceholderText = solo
+                ? AiLoc.T("chat.placeholder.solo", "Talk to the AI (this interrupts it)...")
+                : AiLoc.T("chat.placeholder", "Type a message...");
     }
 
     private static void WireDrag(Control handle, Control target, DragState state)
@@ -384,6 +449,9 @@ public static class NGamePatch
 
     private static void ShowBubbleChat(ChatMessage message)
     {
+        if (!Settings.AiSettingsStore.Current.EnableSpeechBubble)
+            return;
+
         var speaker = ResolveSpeaker(message);
         if (speaker == null || string.IsNullOrWhiteSpace(message.Content))
             return;
@@ -475,25 +543,35 @@ public static class NGamePatch
         if (string.IsNullOrWhiteSpace(text))
             return null;
 
-        if (text.Contains('？') || text.Contains('?') || text.Contains("吗") || text.Contains("怎么"))
+        var lower = text.ToLowerInvariant();
+
+        if (text.Contains('？') || text.Contains('?') || text.Contains("吗") || text.Contains("怎么")
+            || lower.Contains("how") || lower.Contains("what") || lower.Contains("why"))
             return ReactionType.QuestionMark;
 
-        if (text.Contains("危险") || text.Contains("小心") || text.Contains("快") || text.Contains("注意"))
+        if (text.Contains("危险") || text.Contains("小心") || text.Contains("快") || text.Contains("注意")
+            || lower.Contains("danger") || lower.Contains("careful") || lower.Contains("watch out"))
             return ReactionType.Exclamation;
 
-        if (text.Contains("糟") || text.Contains("完了") || text.Contains("死") || text.Contains("撑不住"))
+        if (text.Contains("糟") || text.Contains("完了") || text.Contains("死") || text.Contains("撑不住")
+            || lower.Contains("damn") || lower.Contains("dying") || lower.Contains("can't"))
             return ReactionType.SadSlime;
 
-        if (text.Contains("不行") || text.Contains("别") || text.Contains("算了"))
+        if (text.Contains("不行") || text.Contains("别") || text.Contains("算了")
+            || lower.Contains("don't") || lower.Contains("stop") || lower.Contains("never mind"))
             return ReactionType.ThumbDown;
 
-        if (text.Contains("好") || text.Contains("稳") || text.Contains("漂亮") || text.Contains("赞"))
+        if (text.Contains("好") || text.Contains("稳") || text.Contains("漂亮") || text.Contains("赞")
+            || lower.Contains("nice") || lower.Contains("good") || lower.Contains("great")
+            || lower.Contains("well played") || lower.Contains("gg"))
             return ReactionType.ThumbUp;
 
-        if (text.Contains("谢谢") || text.Contains("爱") || text.Contains("喜欢"))
+        if (text.Contains("谢谢") || text.Contains("爱") || text.Contains("喜欢")
+            || lower.Contains("thanks") || lower.Contains("thank you") || lower.Contains("love"))
             return ReactionType.Heart;
 
-        if (text.Contains("哈哈") || text.Contains("好耶") || text.Contains("赢"))
+        if (text.Contains("哈哈") || text.Contains("好耶") || text.Contains("赢")
+            || lower.Contains("haha") || lower.Contains("lol") || lower.Contains("let's go"))
             return ReactionType.HappyCultist;
 
         return null;

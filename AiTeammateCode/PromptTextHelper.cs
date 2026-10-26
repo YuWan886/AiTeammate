@@ -3,6 +3,8 @@ using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Localization;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Localization.DynamicVars;
+using AiTeammate.AiTeammateCode.Compat;
+using AiTeammate.AiTeammateCode.Localization;
 
 namespace AiTeammate.AiTeammateCode;
 
@@ -23,23 +25,55 @@ internal static class PromptTextHelper
     {
         if (loc == null) return fallback;
 
-        var raw = TryGet(() => loc.GetRawText());
-        if (!ShouldAttemptFormatting(loc, raw))
-            return PickBestText(raw, null, fallback: fallback);
+        // GetFormattedText() goes through LocManager.SmartFormat, which is not safe to run from a
+        // worker thread: its shared object pool is corrupted when the UI formats at the same time.
+        return OnMainThread(() =>
+        {
+            var raw = TryGet(() => loc.GetRawText());
+            if (!ShouldAttemptFormatting(loc, raw))
+                return PickBestText(raw, null, fallback: fallback);
 
-        var formatted = TryGet(() => loc.GetFormattedText());
-        return PickBestText(formatted, raw, fallback);
+            var formatted = TryGet(() => loc.GetFormattedText());
+            return PickBestText(formatted, raw, fallback);
+        }, fallback);
     }
 
     public static string ResolveCardDescription(CardModel? card, PileType pile = PileType.Hand, string fallback = "")
     {
         if (card == null) return fallback;
 
-        var pileDesc = TryGet(() => card.GetDescriptionForPile(pile));
-        var offlineFormatted = TryGet(() => FormatCardDescriptionOffline(card, card.IsUpgraded));
-        var raw = TryGet(() => card.Description?.GetRawText());
-        var rawWithVars = TryGet(() => ApplyVariableFallbacks(card, card.IsUpgraded));
-        return PickBestText(pileDesc, offlineFormatted, rawWithVars, raw, fallback);
+        return OnMainThread(() =>
+        {
+            var pileDesc = TryGet(() => card.GetDescriptionForPile(pile));
+            var offlineFormatted = TryGet(() => FormatCardDescriptionOffline(card, card.IsUpgraded));
+            var raw = TryGet(() => card.Description?.GetRawText());
+            var rawWithVars = TryGet(() => ApplyVariableFallbacks(card, card.IsUpgraded));
+            return PickBestText(pileDesc, offlineFormatted, rawWithVars, raw, fallback);
+        }, fallback);
+    }
+
+    /// <summary>
+    /// Main-thread-safe <see cref="CardModel.GetDescriptionForPile"/>. Same SmartFormat hazard as
+    /// <see cref="ResolveLocString"/>; returns an empty string when the text is unavailable.
+    /// </summary>
+    public static string GetCardDescriptionText(CardModel? card, PileType pile = PileType.Hand)
+    {
+        if (card == null) return "";
+
+        return OnMainThread(() => card.GetDescriptionForPile(pile) ?? "", "");
+    }
+
+    private static string OnMainThread(Func<string> getter, string fallback)
+    {
+        try
+        {
+            return MainThread.Invoke(getter) ?? fallback;
+        }
+        catch
+        {
+            // Main thread busy/not available, or the game text threw: keep the prompt building.
+            return fallback;
+        }
     }
 
     public static string CleanText(string? text)
@@ -119,7 +153,7 @@ internal static class PromptTextHelper
         description.Add("IsTargeting", false);
         description.Add("TargetType", card.TargetType.ToString());
         description.Add("energyPrefix", "");
-        description.Add("singleStarIcon", "辉星");
+        description.Add("singleStarIcon", AiLoc.Pick("辉星", "Star"));
 
         foreach (var variable in description.Variables)
         {
@@ -140,7 +174,7 @@ internal static class PromptTextHelper
         description.Add("IsTargeting", false);
         description.Add("TargetType", card.TargetType.ToString());
         description.Add("energyPrefix", "");
-        description.Add("singleStarIcon", "辉星");
+        description.Add("singleStarIcon", AiLoc.Pick("辉星", "Star"));
 
         var raw = description.GetRawText();
         var result = PlaceholderTokenRegex.Replace(raw, match =>

@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using MegaCrit.Sts2.Core.Models;
 
 namespace AiTeammate.AiTeammateCode.Cache;
@@ -38,19 +38,6 @@ public class ContentQueryService
         if (_cache.Full == null) return null;
         _cache.Full.Potions.TryGetValue(potionId, out var entry);
         return entry;
-    }
-
-    public List<CardIndexEntry> SearchCards(string keyword)
-    {
-        if (_cache.Index == null) return new();
-        return _cache.Index.Cards.Values
-            .Where(c => c.Name.Contains(keyword, System.StringComparison.OrdinalIgnoreCase)
-                     || c.OneLiner.Contains(keyword, System.StringComparison.OrdinalIgnoreCase)
-                     || c.Pool.Contains(keyword, System.StringComparison.OrdinalIgnoreCase)
-                     || c.Character.Contains(keyword, System.StringComparison.OrdinalIgnoreCase)
-                     || c.Tags.Any(tag => tag.Contains(keyword, System.StringComparison.OrdinalIgnoreCase))
-                     || c.Keywords.Any(tag => tag.Contains(keyword, System.StringComparison.OrdinalIgnoreCase)))
-            .ToList();
     }
 
     public string LookupAndFormatCard(string cardId, bool isUpgraded = false)

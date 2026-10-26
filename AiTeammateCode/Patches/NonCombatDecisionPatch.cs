@@ -8,6 +8,8 @@ using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Events;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
 using MegaCrit.Sts2.Core.Runs;
+using AiTeammate.AiTeammateCode.Solo;
+using AiTeammate.AiTeammateCode.Decision;
 
 namespace AiTeammate.AiTeammateCode.Patches;
 
@@ -50,6 +52,7 @@ public static class EventBeginLogPatch
         var manager = AiTeammateManager.Instance;
         if (!manager.IsInitialized) return;
 
+        SoloRunController.TryBind(manager);
         if (manager.AiPlayer == null)
         {
             try { manager.DetectAndBindAiPlayer(); }
@@ -71,8 +74,15 @@ public static class EventBeginLogPatch
             MainFile.Logger.Info($"[事件] {canonicalEvent.Id}: {options.Count}个选项");
 
             // Non-shared event: AI decides immediately (each player's event is independent)
-            if (!eventSync.IsShared)
+            // Solo climb: the AI *is* the local player, so it must drive shared events too.
+            if (!eventSync.IsShared || SoloRunController.IsActive)
             {
+                if (SoloRunController.IsActive && AiFlowControl.IsPaused)
+                {
+                    MainFile.Logger.Info("[Solo] event paused by player; will decide on resume");
+                    return;
+                }
+
                 if (options.Count == 1)
                 {
                     EventAutoChoicePatch.AutoResolveSingleOption(manager.AiPlayer, eventSync, reason: "初始页单选自动继续");
@@ -95,10 +105,16 @@ public static class EventBeginLogPatch
 [HarmonyPatch(typeof(EventSynchronizer), "ChooseLocalOption")]
 public static class EventAutoChoicePatch
 {
+    private static int _decisionInFlight;
+
     public static void AutoResolveSingleOption(Player aiPlayer, EventSynchronizer eventSync, int resumeDepth = 0, string reason = "单选自动继续")
     {
         var manager = AiTeammateManager.Instance;
         if (!manager.IsInitialized) return;
+
+        var solo = SoloRunController.IsActive;
+        if (solo && AiFlowControl.IsPaused)
+            return;
 
         try
         {
@@ -109,8 +125,16 @@ public static class EventAutoChoicePatch
             if (options == null || options.Count != 1) return;
 
             var title = options[0].Title.SafeText(aiEvent);
-            var method = AccessTools.Method(typeof(EventSynchronizer), "ChooseOptionForEvent");
-            method?.Invoke(eventSync, new object[] { aiPlayer, 0 });
+            if (solo)
+            {
+                // Solo: the AI is the local player — use the same path as the event UI.
+                eventSync.ChooseLocalOption(0);
+            }
+            else
+            {
+                var method = AccessTools.Method(typeof(EventSynchronizer), "ChooseOptionForEvent");
+                method?.Invoke(eventSync, new object[] { aiPlayer, 0 });
+            }
 
             MainFile.Logger.Info($"AI auto-resolving single-option event page: {title}");
             manager.AiLog.Log("AI_ACTION", $"事件继续: {title} | {reason}");
@@ -133,12 +157,20 @@ public static class EventAutoChoicePatch
     {
         var manager = AiTeammateManager.Instance;
         if (!manager.IsInitialized) return;
-        var mainSyncCtx = SynchronizationContext.Current; // capture main thread context
+
+        // One decision per event at a time; a resume nudge must not stack a second choice.
+        if (Interlocked.CompareExchange(ref _decisionInFlight, 1, 0) != 0)
+            return;
 
         _ = Task.Run(async () =>
         {
+            var handedOff = false;
             try
             {
+                // Solo climb: wait out an interruption before spending an LLM call.
+                if (SoloRunController.IsActive)
+                    await AiFlowControl.WaitWhilePausedAsync();
+
                 var (choice, reason) = await manager.DecisionService.DecideEventAsync(
                     aiPlayer, optionDescs, CancellationToken.None);
 
@@ -152,39 +184,57 @@ public static class EventAutoChoicePatch
                 MainFile.Logger.Info($"AI event choice {finalChoice} for {aiPlayer.NetId}: {finalReason}");
 
                 // Apply on main thread to avoid race with event state changes
-                if (mainSyncCtx != null)
+                Compat.MainThread.Post(() =>
                 {
-                    mainSyncCtx.Post(_ =>
+                    try
                     {
-                        try
+                        var aiEvent = eventSync.GetEventForPlayer(aiPlayer);
+                        if (aiEvent.IsFinished) return;
+                        var options = aiEvent.CurrentOptions;
+                        if (options == null || options.Count == 0) return;
+                        var safeChoice = finalChoice >= options.Count ? 0 : finalChoice;
+
+                        // Capture title BEFORE calling ChooseOptionForEvent (it may modify the options list)
+                        var title = options[safeChoice].Title.SafeText(aiEvent);
+
+                        if (SoloRunController.IsActive)
                         {
-                            var aiEvent = eventSync.GetEventForPlayer(aiPlayer);
-                            if (aiEvent.IsFinished) return;
-                            var options = aiEvent.CurrentOptions;
-                            if (options == null || options.Count == 0) return;
-                            var safeChoice = finalChoice >= options.Count ? 0 : finalChoice;
-
-                            // Capture title BEFORE calling ChooseOptionForEvent (it may modify the options list)
-                            var title = options[safeChoice].Title.SafeText(aiEvent);
-
+                            // Local-player path handles both shared and non-shared events.
+                            eventSync.ChooseLocalOption(safeChoice);
+                        }
+                        else
+                        {
                             var method = AccessTools.Method(typeof(EventSynchronizer), "ChooseOptionForEvent");
                             method?.Invoke(eventSync, new object[] { aiPlayer, safeChoice });
-
-                            manager.AiLog.LogEvent("事件选择", $"选择选项 {safeChoice} [{title}] | {finalReason}");
-                            manager.AiLog.Log("AI_ACTION", $"事件: 选择选项 {safeChoice} [{title}] | NetId={aiPlayer.NetId}");
-
-                            ContinueEventResolution(eventSync, aiPlayer, manager, resumeDepth);
                         }
-                        catch (System.Exception ex)
-                        {
-                            MainFile.Logger.Warn($"Event apply failed: {ex.Message}");
-                        }
-                    }, null);
-                }
+
+                        manager.AiLog.LogEvent("事件选择", $"选择选项 {safeChoice} [{title}] | {finalReason}");
+                        manager.AiLog.Log("AI_ACTION", $"事件: 选择选项 {safeChoice} [{title}] | NetId={aiPlayer.NetId}");
+
+                        // Release the in-flight guard before chaining the next page, otherwise the
+                        // next DecideAndApplyAsync call would be rejected as a duplicate.
+                        Interlocked.Exchange(ref _decisionInFlight, 0);
+                        ContinueEventResolution(eventSync, aiPlayer, manager, resumeDepth);
+                    }
+                    catch (System.Exception ex)
+                    {
+                        MainFile.Logger.Warn($"Event apply failed: {ex.Message}");
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(ref _decisionInFlight, 0);
+                    }
+                });
+                handedOff = true;
             }
             catch (System.Exception ex)
             {
                 MainFile.Logger.Warn($"AI event async decision failed: {ex.Message}");
+            }
+            finally
+            {
+                if (!handedOff)
+                    Interlocked.Exchange(ref _decisionInFlight, 0);
             }
         });
     }
@@ -194,6 +244,9 @@ public static class EventAutoChoicePatch
     {
         var manager = AiTeammateManager.Instance;
         if (!manager.IsInitialized || manager.AiPlayer == null) return;
+
+        // Solo: the AI is the local player; this postfix (human choice → AI follows) does not apply.
+        if (SoloRunController.IsActive) return;
 
         var eventSync = RunManager.Instance?.EventSynchronizer;
         if (eventSync == null) return;
@@ -230,6 +283,38 @@ public static class EventAutoChoicePatch
         }
     }
 
+    /// <summary>Re-runs an unfinished event decision after the human lets the AI continue (solo).</summary>
+    public static void Nudge(Player aiPlayer, EventSynchronizer eventSync)
+    {
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized || !SoloRunController.IsActive || AiFlowControl.IsPaused)
+            return;
+
+        try
+        {
+            var aiEvent = eventSync.GetEventForPlayer(aiPlayer);
+            if (aiEvent.IsFinished)
+                return;
+
+            var options = aiEvent.CurrentOptions;
+            if (options == null || options.Count == 0)
+                return;
+
+            if (options.Count == 1)
+            {
+                AutoResolveSingleOption(aiPlayer, eventSync, 0, "恢复后单选继续");
+                return;
+            }
+
+            var descs = options.Select(o => EventTextHelper.DescribeOption(aiEvent, o)).ToList();
+            DecideAndApplyAsync(aiPlayer, eventSync, descs);
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[Solo] event nudge failed: {ex.Message}");
+        }
+    }
+
     /// <summary>
     /// Continues resolving event pages after an option has been chosen.
     /// - Single-option pages: auto-select and continue immediately (up to 5 in a row).
@@ -240,9 +325,10 @@ public static class EventAutoChoicePatch
     /// <param name="resumeDepth">Tracks recursion depth for multi-page events. Capped at 10 to prevent infinite loops.</param>
     private static void ContinueEventResolution(EventSynchronizer eventSync, Player aiPlayer, AiTeammateManager manager, int resumeDepth)
     {
-        // For shared events, the AI follows the human player.
-        // Do NOT auto-resolve or make independent decisions — AfterLocalChoice handles voting.
-        if (eventSync.IsShared)
+        // In multiplayer shared events the AI follows the human player. In solo the AI *is* the
+        // local player, so it keeps driving the event itself.
+        var solo = SoloRunController.IsActive;
+        if (eventSync.IsShared && !solo)
             return;
 
         const int maxResumeDepth = 10;
@@ -278,7 +364,7 @@ public static class EventAutoChoicePatch
                 // For shared events, do NOT make independent decisions on multi-option pages.
                 // The AI follows the human player; AfterLocalChoice will be triggered
                 // when the human picks, and the AI votes the same.
-                if (eventSync.IsShared)
+                if (eventSync.IsShared && !solo)
                     return;
 
                 // Non-shared event with multiple options: trigger async AI decision for this page.
@@ -307,13 +393,16 @@ public static class TheArchitectWinRunAiReadyPatch
         var manager = AiTeammateManager.Instance;
         if (!manager.IsInitialized || manager.AiPlayer == null) return;
 
+        // Solo: the game already treats the local player as the human and signals ready itself.
+        if (SoloRunController.IsActive) return;
+
         var aiPlayer = manager.AiPlayer;
         if (__instance.Owner?.NetId != aiPlayer.NetId) return;
 
         try
         {
             RunManager.Instance.ActionQueueSynchronizer.RequestEnqueue(
-                new VoteToMoveToNextActAction(aiPlayer));
+                Compat.GameCompat.CreateVoteToMoveToNextAct(aiPlayer));
             manager.AiLog.Log("AI_ACTION", "建筑师事件完成，AI已投票进入下一幕");
         }
         catch (Exception ex)
@@ -333,6 +422,9 @@ public static class MapAutoVotePatch
     {
         var manager = AiTeammateManager.Instance;
         if (!manager.IsInitialized) return;
+
+        // Solo: the local player votes for itself; no follower vote needed.
+        if (SoloRunController.IsActive) return;
 
         if (manager.AiPlayer == null)
             manager.DetectAndBindAiPlayer();
@@ -364,17 +456,8 @@ public static class MapAutoVotePatch
             return;
         }
 
-        try
-        {
-            __instance.PlayerVotedForMapCoord(manager.AiPlayer, source, destination);
-            MainFile.Logger.Info($"AI auto-voted for map coord ({destination.Value.coord.col},{destination.Value.coord.row})");
-            manager.AiLog.LogEvent("地图投票", $"({destination.Value.coord.col},{destination.Value.coord.row}) | NetId={manager.AiPlayer.NetId}");
-        }
-        catch (System.Exception ex)
-        {
-            MainFile.Logger.Warn($"Map auto-vote failed: {ex.Message}");
-            // Don't spam the error log — this is a known transient issue
-            // when the AI player slot is out of sync after a map change
-        }
+        // Let the AI decide independently; the human's vote is only the fallback so the host never
+        // waits forever when the LLM call fails or times out.
+        AiMapVoter.Request(manager.AiPlayer, __instance, source, destination?.coord);
     }
 }

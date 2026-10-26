@@ -27,46 +27,47 @@ public sealed class ConversationContextManager
 
     public string BuildCombatContext(Player aiPlayer, ContextBuilder contextBuilder)
     {
+        // Snapshot the shared history under the lock, then format outside it: building the card /
+        // enemy text marshals to the main thread, and holding this lock while waiting on the main
+        // thread would stall it on the next RecordCombatDecision call.
+        string recentCombat;
         lock (_sync)
         {
-            var recentCombat = FormatSection("最近关键回合", _recentCombatSummaries, 4);
-
-            var sb = new StringBuilder();
-            // [局势理解] 已由 BuildContextPrelude → BuildRunPrelude 提供，此处不再重复
-            // [跨回合摘要] 已移除 — 非战斗房间不需要，战斗房间由 [战斗记忆] 提供
-
-            if (!string.IsNullOrWhiteSpace(recentCombat))
-            {
-                sb.AppendLine("[战斗记忆]");
-                sb.AppendLine(recentCombat);
-                sb.AppendLine();
-            }
-
-            sb.AppendLine("[当前关键状态]");
-            sb.AppendLine(contextBuilder.BuildCombatEssentials(aiPlayer));
-
-            return sb.ToString().TrimEnd();
+            recentCombat = FormatSection("最近关键回合", _recentCombatSummaries, 4);
         }
+
+        var sb = new StringBuilder();
+        // [局势理解] 已由 BuildContextPrelude → BuildRunPrelude 提供，此处不再重复
+        // [跨回合摘要] 已移除 — 非战斗房间不需要，战斗房间由 [战斗记忆] 提供
+
+        if (!string.IsNullOrWhiteSpace(recentCombat))
+        {
+            sb.AppendLine("[战斗记忆]");
+            sb.AppendLine(recentCombat);
+            sb.AppendLine();
+        }
+
+        sb.AppendLine("[当前关键状态]");
+        sb.AppendLine(contextBuilder.BuildCombatEssentials(aiPlayer));
+
+        return sb.ToString().TrimEnd();
     }
 
     public string BuildRunPrelude(Player aiPlayer, ContextBuilder contextBuilder)
     {
-        lock (_sync)
+        var strategic = contextBuilder.BuildRunStrategicSummary(aiPlayer);
+
+        var sb = new StringBuilder();
+        if (!string.IsNullOrWhiteSpace(strategic))
         {
-            var strategic = contextBuilder.BuildRunStrategicSummary(aiPlayer);
-
-            var sb = new StringBuilder();
-            if (!string.IsNullOrWhiteSpace(strategic))
-            {
-                sb.AppendLine("[局势理解]");
-                sb.AppendLine(strategic);
-            }
-
-            // [最近战斗摘要] 仅在战斗房间有意义，非战斗房间已移除；
-            // 战斗房间由 BuildCombatContext 中的 [战斗记忆] 提供。
-
-            return sb.ToString().TrimEnd();
+            sb.AppendLine("[局势理解]");
+            sb.AppendLine(strategic);
         }
+
+        // [最近战斗摘要] 仅在战斗房间有意义，非战斗房间已移除；
+        // 战斗房间由 BuildCombatContext 中的 [战斗记忆] 提供。
+
+        return sb.ToString().TrimEnd();
     }
 
     public void RecordCombatDecision(Player aiPlayer, ContextBuilder contextBuilder, DecisionResult result)

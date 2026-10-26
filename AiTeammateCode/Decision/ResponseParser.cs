@@ -140,6 +140,8 @@ public static class ResponseParser
                     result.DeferredActions.Add(ParseAction(action));
             }
 
+            ParseToolCalls(root, result.ToolCalls);
+
             return result;
         }
         catch (JsonException)
@@ -147,6 +149,120 @@ public static class ResponseParser
             return DecisionResult.Fallback();
         }
     }
+
+    /// <summary>
+    /// Extracts tool calls from a raw response. Returns an empty list when the response has none or
+    /// is not valid JSON, so callers can use this as a cheap "did the model ask for a tool?" check.
+    /// </summary>
+    public static List<ToolCall> ExtractToolCalls(string content)
+    {
+        var calls = new List<ToolCall>();
+        try
+        {
+            using var doc = JsonDocument.Parse(ExtractJson(content));
+            ParseToolCalls(doc.RootElement, calls);
+        }
+        catch (JsonException)
+        {
+            // Not JSON: no tools to run.
+        }
+
+        return calls;
+    }
+
+    /// <summary>
+    /// Reads <c>tool_calls</c> (array) or <c>tool_call</c> (single object/string). Also accepts a bare
+    /// string entry, so a sloppy model can emit <c>{"tool_calls":["read_pile"]}</c>.
+    /// </summary>
+    private static void ParseToolCalls(JsonElement root, List<ToolCall> sink)
+    {
+        if (root.TryGetProperty("tool_calls", out var calls))
+        {
+            if (calls.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var call in calls.EnumerateArray())
+                {
+                    if (ParseToolCall(call) is { } parsed)
+                        sink.Add(parsed);
+                }
+            }
+            else if (ParseToolCall(calls) is { } single)
+            {
+                sink.Add(single);
+            }
+
+            return;
+        }
+
+        if (root.TryGetProperty("tool_call", out var toolCall) && ParseToolCall(toolCall) is { } one)
+            sink.Add(one);
+    }
+
+    private static ToolCall? ParseToolCall(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.String)
+        {
+            var bareName = element.GetString()?.Trim() ?? "";
+            return bareName.Length > 0 ? new ToolCall { Name = bareName } : null;
+        }
+
+        if (element.ValueKind != JsonValueKind.Object)
+            return null;
+
+        var name = GetStringProperty(element, "name");
+        if (string.IsNullOrWhiteSpace(name))
+            name = GetStringProperty(element, "tool");
+        if (string.IsNullOrWhiteSpace(name))
+            return null;
+
+        var call = new ToolCall { Name = name.Trim() };
+
+        if (element.TryGetProperty("args", out var args) || element.TryGetProperty("arguments", out args))
+            FillToolArgs(call, args);
+
+        return call;
+    }
+
+    private static void FillToolArgs(ToolCall call, JsonElement args)
+    {
+        if (args.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var prop in args.EnumerateObject())
+                call.Args[prop.Name] = ArgValue(prop.Value);
+            return;
+        }
+
+        if (args.ValueKind != JsonValueKind.String)
+            return;
+
+        // Some models serialize the argument object as a JSON string.
+        var raw = args.GetString() ?? "";
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                call.Args["input"] = raw;
+                return;
+            }
+
+            foreach (var prop in doc.RootElement.EnumerateObject())
+                call.Args[prop.Name] = ArgValue(prop.Value);
+        }
+        catch (JsonException)
+        {
+            call.Args["input"] = raw;
+        }
+    }
+
+    private static string ArgValue(JsonElement value) => value.ValueKind switch
+    {
+        JsonValueKind.String => value.GetString() ?? "",
+        JsonValueKind.Number => value.GetRawText(),
+        JsonValueKind.True => "true",
+        JsonValueKind.False => "false",
+        _ => ""
+    };
 
     private static DecisionAction ParseAction(JsonElement action)
     {

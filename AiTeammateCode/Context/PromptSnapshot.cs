@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 
 namespace AiTeammate.AiTeammateCode.Context;
 
@@ -22,8 +22,6 @@ public sealed class PromptSnapshot
 {
     private readonly List<PromptFact> _facts = new();
 
-    public IReadOnlyList<PromptFact> Facts => _facts;
-
     public void Add(string key, string label, string value, bool essential = true)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -32,34 +30,9 @@ public sealed class PromptSnapshot
         _facts.Add(new PromptFact(key, label, value.Trim(), essential));
     }
 
-    public string RenderAll(int maxFacts = int.MaxValue)
-    {
-        return RenderInternal(_facts.Take(maxFacts));
-    }
-
     public string RenderEssentials(int maxFacts = int.MaxValue)
     {
         return RenderInternal(_facts.Where(f => f.Essential).Take(maxFacts));
-    }
-
-    public string RenderDelta(PromptSnapshot? previous, int maxChanges = 8)
-    {
-        if (previous == null)
-            return RenderAll(maxChanges);
-
-        var previousMap = previous.Facts.ToDictionary(f => f.Key, f => f.Value);
-        var changes = new List<PromptFact>();
-
-        foreach (var fact in _facts)
-        {
-            if (!previousMap.TryGetValue(fact.Key, out var oldValue) || !string.Equals(oldValue, fact.Value, StringComparison.Ordinal))
-                changes.Add(fact);
-        }
-
-        if (changes.Count == 0)
-            return "- 关键状态无明显变化";
-
-        return RenderInternal(changes.Take(maxChanges), bulletPrefix: "- ");
     }
 
     private static string RenderInternal(IEnumerable<PromptFact> facts, string bulletPrefix = "")

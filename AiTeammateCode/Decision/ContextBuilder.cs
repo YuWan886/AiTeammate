@@ -1,10 +1,11 @@
-using System.Text;
+﻿using System.Text;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Entities.RestSite;
 using MegaCrit.Sts2.Core.Localization;
+using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.MonsterMoves.Intents;
 using MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine;
@@ -14,21 +15,21 @@ using AiTeammate.AiTeammateCode;
 using AiTeammate.AiTeammateCode.Cache;
 using AiTeammate.AiTeammateCode.Chat;
 using AiTeammate.AiTeammateCode.Context;
+using AiTeammate.AiTeammateCode.Settings;
 
 namespace AiTeammate.AiTeammateCode.Decision;
 
 public class ContextBuilder
 {
+    private const int MaxInlinePileEntries = 40;
+    private const int MaxToolPileEntries = 80;
+    private const int MaxDetailedPileEntries = 30;
+
     private readonly ContentQueryService _query;
 
     public ContextBuilder(ContentQueryService query)
     {
         _query = query;
-    }
-
-    public string BuildCombatSnapshot(Player aiPlayer)
-    {
-        return BuildCombatPromptSnapshot(aiPlayer).RenderAll();
     }
 
     public PromptSnapshot BuildCombatPromptSnapshot(Player aiPlayer)
@@ -120,9 +121,12 @@ public class ContextBuilder
             sb.AppendLine($"威胁: {threat}");
 
         // 牌堆
-        var piles = BuildPileSummary(aiPlayer);
+        var piles = BuildPileDetail(aiPlayer);
         if (!string.IsNullOrWhiteSpace(piles))
-            sb.AppendLine($"牌堆: {piles}");
+        {
+            sb.AppendLine("牌堆:");
+            sb.AppendLine(piles);
+        }
 
         return sb.ToString().TrimEnd();
     }
@@ -202,6 +206,9 @@ public class ContextBuilder
             {
                 sb.AppendLine("  手牌: 空");
             }
+
+            // Contents are intentionally not inlined for teammates; the AI can ask via read_pile.
+            sb.AppendLine($"  牌堆: {FormatPileCounts(combat)}");
         }
 
         // 药水详情
@@ -272,6 +279,9 @@ public class ContextBuilder
         if (powers != null && powers.Any())
             sb.Append($" | 状态:{string.Join(" ", powers.Select(FormatPowerBrief))}");
 
+        if (combat != null)
+            sb.Append($" | 牌堆:{FormatPileCounts(combat)}");
+
         if (includeHand && combat != null)
         {
             var hand = BuildHandSummary(combat.Hand.Cards.ToList());
@@ -286,13 +296,13 @@ public class ContextBuilder
     {
         try
         {
-            var desc = card.GetDescriptionForPile(PileType.Hand);
+            var desc = PromptTextHelper.GetCardDescriptionText(card, PileType.Hand);
             if (string.IsNullOrWhiteSpace(desc)) return "";
 
             // Strip BBCode tags
             desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\[.*?\]", "");
 
-            // Extract key numbers for common effects
+            // Extract key numbers for common effects (Chinese + English game text)
             var parts = new List<string>();
             foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(desc, @"造成(\d+)点伤害"))
                 parts.Add($"伤{m.Groups[1].Value}");
@@ -300,16 +310,22 @@ public class ContextBuilder
                 parts.Add($"甲{m.Groups[1].Value}");
             foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(desc, @"给予(\d+)层"))
                 parts.Add($"层{m.Groups[1].Value}");
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(desc, @"[Dd]eal (\d+) damage"))
+                parts.Add($"伤{m.Groups[1].Value}");
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(desc, @"[Gg]ain (\d+) (?:[Bb]lock)"))
+                parts.Add($"甲{m.Groups[1].Value}");
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(desc, @"[Aa]pply (\d+)"))
+                parts.Add($"层{m.Groups[1].Value}");
 
             // If no specific numbers found, check for keywords
             if (parts.Count == 0)
             {
-                if (desc.Contains("易伤")) parts.Add("易伤");
-                if (desc.Contains("虚弱")) parts.Add("虚弱");
-                if (desc.Contains("力量")) parts.Add("力量");
-                if (desc.Contains("AOE") || desc.Contains("所有敌人")) parts.Add("AOE");
-                if (desc.Contains("抽牌") || desc.Contains("抽")) parts.Add("抽");
-                if (desc.Contains("辉星")) parts.Add("星");
+                if (desc.Contains("易伤") || desc.Contains("Vulnerable")) parts.Add("易伤");
+                if (desc.Contains("虚弱") || desc.Contains("Weak")) parts.Add("虚弱");
+                if (desc.Contains("力量") || desc.Contains("Strength")) parts.Add("力量");
+                if (desc.Contains("AOE") || desc.Contains("所有敌人") || desc.Contains("ALL enemies")) parts.Add("AOE");
+                if (desc.Contains("抽牌") || desc.Contains("抽") || desc.Contains("Draw")) parts.Add("抽");
+                if (desc.Contains("辉星") || desc.Contains("Star")) parts.Add("星");
             }
 
             return parts.Count > 0 ? $":{string.Join("/", parts.Take(3))}" : "";
@@ -331,7 +347,7 @@ public class ContextBuilder
             var title = card.Title ?? card.Id.Entry;
             try
             {
-                var desc = card.GetDescriptionForPile(PileType.Hand);
+                var desc = PromptTextHelper.GetCardDescriptionText(card, PileType.Hand);
                 if (string.IsNullOrWhiteSpace(desc))
                     continue;
 
@@ -435,29 +451,6 @@ public class ContextBuilder
         return string.Join(",", parts);
     }
 
-    [Obsolete] private void AppendPlayerState(StringBuilder sb, string label, Player player)
-    {
-        var combat = player.PlayerCombatState;
-        var creature = player.Creature;
-
-        sb.AppendLine();
-        sb.AppendLine(label);
-        sb.AppendLine($"角色：{GetCharacterName(player)} | 血量 {creature.CurrentHp}/{creature.MaxHp} | 能量 {combat?.Energy}/{combat?.MaxEnergy} | 格挡 {creature.Block}");
-
-        var powers = creature.Powers;
-        if (powers != null && powers.Any())
-            sb.AppendLine($"状态：{string.Join(" | ", powers.Select(p => $"{p.Id.Entry}({p.Amount})"))}");
-
-        if (combat != null)
-        {
-            var handCards = combat.Hand.Cards.ToList();
-            if (handCards.Count > 0)
-                sb.AppendLine($"手牌({handCards.Count}张)：{string.Join(" | ", handCards.Select(c => FormatCardBrief(c)))}");
-            else
-                sb.AppendLine("手牌：空");
-        }
-    }
-
     private string FormatCardBrief(CardModel card)
     {
         var name = card.Title ?? card.Id.Entry;
@@ -467,98 +460,12 @@ public class ContextBuilder
         return $"{name}({cost}费) {oneLiner}";
     }
 
-    private string FormatIntent(MoveState move)
-    {
-        var parts = new List<string>();
-        var state = CombatManager.Instance.DebugOnlyGetState();
-        foreach (var intent in move.Intents)
-        {
-            if (intent is AttackIntent atk)
-            {
-                try
-                {
-                    var firstEnemy = state?.Enemies.FirstOrDefault(e => e.IsAlive);
-                    if (firstEnemy != null)
-                    {
-                        int dmg = atk.GetSingleDamage(
-                            state?.Players.Select(p => p.Creature) ?? Enumerable.Empty<Creature>(),
-                            firstEnemy);
-                        parts.Add($"攻击×{dmg}");
-                    }
-                    else
-                    {
-                        parts.Add("攻击");
-                    }
-                }
-                catch
-                {
-                    parts.Add("攻击");
-                }
-            }
-            else
-            {
-                parts.Add(intent.IntentType.ToString());
-            }
-        }
-        return $"{move.Id}({string.Join(", ", parts)})";
-    }
-
     private static string GetCharacterName(Player player)
     {
         return player.Character?.Id.Entry ?? "Unknown";
     }
 
-    private void AppendCoordinationHints(StringBuilder sb, Player teammate)
-    {
-        var combat = teammate.PlayerCombatState;
-        if (combat == null) return;
-
-        var hand = combat.Hand.Cards.ToList();
-        if (hand.Count == 0) return;
-
-        // Find coordination cards in teammate's hand
-        var debuffCards = new List<string>();
-        var buffCards = new List<string>();
-        var aoeCards = new List<string>();
-
-        foreach (var card in hand)
-        {
-            var title = card.Title ?? card.Id.Entry;
-            // Detect coordination cards by effect keywords in title
-            if (title.Contains("痛击") || title.Contains("上勾") || title.Contains("震荡")
-                || title.Contains("破甲") || title.Contains("易伤") || title.Contains("撕裂"))
-                debuffCards.Add(title);
-            else if (title.Contains("力量") || title.Contains("强化") || title.Contains("战吼"))
-                buffCards.Add(title);
-            else if (title.Contains("旋风") || title.Contains("横扫") || title.Contains("全力"))
-                aoeCards.Add(title);
-
-            // Also check card description for Vulnerable-related keywords
-            try
-            {
-                var desc = card.GetDescriptionForPile(PileType.Hand);
-                if (desc?.Contains("易伤") == true && !debuffCards.Contains(title))
-                    debuffCards.Add(title);
-            }
-            catch { }
-        }
-
-        if (debuffCards.Count > 0 || buffCards.Count > 0)
-        {
-            sb.Append("  [协同提示] ");
-            if (debuffCards.Count > 0)
-                sb.Append($"队友手中有易伤/破甲牌: {string.Join(", ", debuffCards)}。你应该等队友先上易伤再打攻击牌！");
-            if (buffCards.Count > 0)
-                sb.Append($"队友有增益牌: {string.Join(", ", buffCards)}。");
-            if (aoeCards.Count > 0)
-                sb.Append($"队友有AOE: {string.Join(", ", aoeCards)}。");
-            sb.AppendLine();
-        }
-    }
-
-    // ---- Public helpers for DecisionService ----
-
-    public CardIndexEntry? GetCardBrief(string cardId) => _query.GetCardBrief(cardId);
+        // ---- Public helpers for DecisionService ----
 
     public string EnrichContext(string text) => _query.EnrichContext(text);
 
@@ -625,6 +532,578 @@ public class ContextBuilder
         return exhaustCount > 0
             ? $"抽牌堆:{drawCount}张 弃牌堆:{discardCount}张 消耗堆:{exhaustCount}张"
             : $"抽牌堆:{drawCount}张 弃牌堆:{discardCount}张";
+    }
+
+    /// <summary>
+    /// Draw / discard / exhaust pile contents for combat prompts. Identical cards are merged with ×N
+    /// and the draw pile order is deliberately omitted — a human cannot see it either. Falls back to
+    /// the pile counts when <see cref="AiSettings.EnablePileDetail"/> is off (small-context models).
+    /// </summary>
+    public string BuildPileDetail(Player aiPlayer)
+    {
+        if (!AiSettingsStore.Current.EnablePileDetail)
+            return BuildPileSummary(aiPlayer);
+
+        var combat = aiPlayer.PlayerCombatState;
+        if (combat == null)
+            return "";
+
+        var lines = new List<string>
+        {
+            FormatPile("抽牌堆", combat.DrawPile.Cards, PileType.Draw,
+                MaxInlinePileEntries, fullDetail: false, unknownOrder: true),
+            FormatPile("弃牌堆", combat.DiscardPile.Cards, PileType.Discard,
+                MaxInlinePileEntries, fullDetail: false, unknownOrder: false)
+        };
+        if (combat.ExhaustPile.Cards.Count > 0)
+        {
+            lines.Add(FormatPile("消耗堆", combat.ExhaustPile.Cards, PileType.Exhaust,
+                MaxInlinePileEntries, fullDetail: false, unknownOrder: false));
+        }
+
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    /// <summary>
+    /// Contents of one pile, used by the <c>read_pile</c> tool. Never exposes the draw-pile order.
+    /// Pass <paramref name="target"/> to read a teammate's pile in multiplayer.
+    /// </summary>
+    /// <param name="aiPlayer">The AI player (prompt owner). 发起查询的 AI。</param>
+    /// <param name="pile">hand / draw / discard / exhaust / deck</param>
+    /// <param name="fullDetail">Also include each card's description (main-thread formatting).</param>
+    /// <param name="target">Whose pile to read; null = the AI's own. 要查看的玩家。</param>
+    public string BuildPileContents(Player aiPlayer, string pile, bool fullDetail, Player? target = null)
+    {
+        var owner = target ?? aiPlayer;
+        var combat = owner.PlayerCombatState;
+        var key = (pile ?? "").Trim().ToLowerInvariant();
+
+        IEnumerable<CardModel> cards;
+        PileType pileType;
+        string label;
+        var unknownOrder = false;
+
+        switch (key)
+        {
+            case "hand":
+                if (combat == null) return $"{GetPlayerDisplayName(owner)}: 不在战斗中";
+                cards = combat.Hand.Cards;
+                pileType = PileType.Hand;
+                label = "手牌";
+                break;
+            case "draw":
+                if (combat == null) return $"{GetPlayerDisplayName(owner)}: 不在战斗中";
+                cards = combat.DrawPile.Cards;
+                pileType = PileType.Draw;
+                label = "抽牌堆";
+                unknownOrder = true;
+                break;
+            case "discard":
+                if (combat == null) return $"{GetPlayerDisplayName(owner)}: 不在战斗中";
+                cards = combat.DiscardPile.Cards;
+                pileType = PileType.Discard;
+                label = "弃牌堆";
+                break;
+            case "exhaust":
+                if (combat == null) return $"{GetPlayerDisplayName(owner)}: 不在战斗中";
+                cards = combat.ExhaustPile.Cards;
+                pileType = PileType.Exhaust;
+                label = "消耗堆";
+                break;
+            case "deck":
+                cards = owner.Deck?.Cards ?? Enumerable.Empty<CardModel>();
+                pileType = PileType.Deck;
+                label = "主牌组";
+                break;
+            default:
+                return $"未知牌堆 \"{pile}\"。可用: hand, draw, discard, exhaust, deck";
+        }
+
+        var maxEntries = fullDetail ? MaxDetailedPileEntries : MaxToolPileEntries;
+        var prefix = ReferenceEquals(owner, aiPlayer) ? "" : $"{GetPlayerDisplayName(owner)}的";
+        return FormatPile(prefix + label, cards, pileType, maxEntries, fullDetail, unknownOrder);
+    }
+
+    /// <summary>
+    /// Resolves a player for the read_pile / card_info tools. Accepts self aliases, display name,
+    /// character id, NetId, a 1-based index, or a unique partial name. Returns null when ambiguous.
+    /// </summary>
+    public static Player? ResolvePlayer(Player requester, string query, out IReadOnlyList<Player> candidates)
+    {
+        IReadOnlyList<Player> players;
+        var state = CombatManager.Instance.DebugOnlyGetState();
+        if (state != null)
+            players = state.Players;
+        else
+            players = requester.RunState?.Players ?? Array.Empty<Player>();
+
+        candidates = players;
+
+        var q = (query ?? "").Trim();
+        if (q.Length == 0)
+            return requester;
+
+        if (q is "self" or "me" or "自己" or "我" or "本地玩家")
+            return requester;
+
+        foreach (var player in players)
+        {
+            if (MatchesPlayer(player, q))
+                return player;
+        }
+
+        if (int.TryParse(q, out var index) && index >= 1 && index <= players.Count)
+            return players[index - 1];
+
+        var loose = players.Where(player => LooseMatchesPlayer(player, q)).ToList();
+        return loose.Count == 1 ? loose[0] : null;
+    }
+
+    /// <summary>Comma-separated player list for tool error messages. 工具报错时列出可查看的玩家。</summary>
+    public static string DescribePlayers(IReadOnlyList<Player> players) =>
+        string.Join("、", players.Select(p => $"{GetPlayerDisplayName(p)}({GetCharacterName(p)})"));
+
+    private static bool MatchesPlayer(Player player, string query)
+    {
+        return string.Equals(GetPlayerDisplayName(player), query, StringComparison.OrdinalIgnoreCase)
+               || string.Equals(GetCharacterName(player), query, StringComparison.OrdinalIgnoreCase)
+               || string.Equals(player.Character?.Id.Entry, query, StringComparison.OrdinalIgnoreCase)
+               || string.Equals(player.NetId.ToString(), query, StringComparison.Ordinal)
+               || string.Equals((player.NetId & 0xFFFF).ToString(), query, StringComparison.Ordinal)
+               || string.Equals(player.NetId.ToString("X"), query, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool LooseMatchesPlayer(Player player, string query)
+    {
+        if (query.Length < 2)
+            return false;
+
+        return GetPlayerDisplayName(player).Contains(query, StringComparison.OrdinalIgnoreCase)
+               || GetCharacterName(player).Contains(query, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Pile counts only (teammates' pile contents stay behind the read_pile tool).</summary>
+    private static string FormatPileCounts(PlayerCombatState combat)
+    {
+        var exhaust = combat.ExhaustPile.Cards.Count;
+        return exhaust > 0
+            ? $"抽牌堆{combat.DrawPile.Cards.Count}张 弃牌堆{combat.DiscardPile.Cards.Count}张 消耗堆{exhaust}张"
+            : $"抽牌堆{combat.DrawPile.Cards.Count}张 弃牌堆{combat.DiscardPile.Cards.Count}张";
+    }
+
+    // ---- Read-only tool views (also used by prompt builders) ----
+
+    /// <summary>Full status of one player: HP, gold, powers, hand, pile counts, potions, relics.</summary>
+    public string DescribePlayer(Player target)
+    {
+        var creature = target.Creature;
+        var combat = target.PlayerCombatState;
+        var sb = new StringBuilder();
+        sb.Append($"{GetPlayerDisplayName(target)} - {GetCharacterName(target)}");
+
+        if (creature != null)
+        {
+            var pct = creature.MaxHp > 0 ? creature.CurrentHp * 100 / creature.MaxHp : 0;
+            sb.Append($" | HP{creature.CurrentHp}/{creature.MaxHp}({pct}%) 格挡{creature.Block}");
+        }
+
+        if (combat != null)
+        {
+            var stars = combat.Stars > 0 ? $" 辉星{combat.Stars}" : "";
+            sb.Append($" 能量{combat.Energy}/{combat.MaxEnergy}{stars} 第{combat.TurnNumber}回合");
+        }
+
+        sb.Append($" | 金币{target.Gold}");
+
+        var powers = creature?.Powers;
+        if (powers != null && powers.Any())
+        {
+            sb.AppendLine();
+            sb.Append($"状态: {string.Join(" | ", powers.Select(FormatPowerBrief))}");
+        }
+
+        if (combat != null)
+        {
+            var hand = combat.Hand.Cards.Select(card => card.Title ?? card.Id.Entry).ToList();
+            var handText = hand.Count > 0 ? string.Join(", ", hand) : "空";
+            sb.AppendLine();
+            sb.Append($"手牌({hand.Count}): {handText}");
+            sb.AppendLine();
+            sb.Append($"牌堆: {FormatPileCounts(combat)}");
+        }
+
+        var potions = target.Potions?.ToList() ?? new List<PotionModel>();
+        var relics = target.Relics?.ToList() ?? new List<RelicModel>();
+        sb.AppendLine();
+        sb.Append($"药水{potions.Count}/{target.MaxPotionCount} 遗物{relics.Count}");
+
+        return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>Every relic of one player with counters and effect text.</summary>
+    public string DescribeRelics(Player target)
+    {
+        var relics = target.Relics?.ToList() ?? new List<RelicModel>();
+        var who = GetPlayerDisplayName(target);
+        if (relics.Count == 0)
+            return $"{who}: 没有遗物";
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"{who} 的遗物({relics.Count}):");
+        foreach (var relic in relics)
+        {
+            try
+            {
+                var name = SafeLocText(relic.Title);
+                var markers = new StringBuilder();
+                if (relic.StackCount > 1)
+                    markers.Append($"×{relic.StackCount}");
+                if (relic.ShowCounter)
+                    markers.Append($"[{relic.DisplayAmount}]");
+
+                var desc = PromptTextHelper.CleanText(SafeLocText(relic.DynamicDescription));
+                if (string.IsNullOrWhiteSpace(desc))
+                    desc = _query.GetRelicFull(relic.CanonicalInstance.Id.Entry)?.Description ?? "";
+                desc = PromptTextHelper.Truncate(PromptTextHelper.CleanText(desc), 160);
+
+                sb.AppendLine(string.IsNullOrWhiteSpace(desc)
+                    ? $"- {name}{markers}"
+                    : $"- {name}{markers}: {desc}");
+            }
+            catch
+            {
+                sb.AppendLine($"- {relic.Id.Entry}");
+            }
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>Every potion of one player with effect text.</summary>
+    public string DescribePotions(Player target)
+    {
+        var potions = target.Potions?.ToList() ?? new List<PotionModel>();
+        var who = GetPlayerDisplayName(target);
+        var slots = $"{potions.Count}/{target.MaxPotionCount}";
+        if (potions.Count == 0)
+            return $"{who}: 没有药水（槽位 {slots}）";
+
+        var sb = new StringBuilder($"{who} 的药水({slots}):");
+        foreach (var potion in potions)
+        {
+            var name = SafeLocText(potion.Title);
+            var desc = PromptTextHelper.CleanText(SafeLocText(potion.DynamicDescription));
+            desc = PromptTextHelper.Truncate(desc, 160);
+            sb.AppendLine(string.IsNullOrWhiteSpace(desc) ? $"- {name}" : $"- {name}: {desc}");
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>Run overview: act/floor/ascension, every player's HP and gold, current node, visit counts.</summary>
+    public string DescribeRun(Player aiPlayer)
+    {
+        var runState = aiPlayer.RunState;
+        if (runState == null)
+            return "当前没有进行中的对局";
+
+        var sb = new StringBuilder();
+        var ascension = runState.AscensionLevel > 0 ? $" 进阶{runState.AscensionLevel}" : "";
+        sb.AppendLine($"第{runState.CurrentActIndex + 1}幕 第{runState.TotalFloor}层{ascension} | 金币{aiPlayer.Gold}");
+
+        foreach (var player in runState.Players)
+        {
+            var creature = player.Creature;
+            var hp = creature != null ? $"HP{creature.CurrentHp}/{creature.MaxHp}" : "HP?";
+            var who = ReferenceEquals(player, aiPlayer) ? "你" : GetPlayerDisplayName(player);
+            var inCombat = player.PlayerCombatState != null ? " [战斗中]" : "";
+            sb.AppendLine($"{who}({GetCharacterName(player)}) {hp} 金币{player.Gold}{inCombat}");
+        }
+
+        if (runState.CurrentMapPoint is { } current)
+            sb.AppendLine($"当前位置: {DescribeMapPoint(current)}");
+
+        var visited = runState.MapPointHistory
+            .SelectMany(rows => rows)
+            .GroupBy(entry => entry.MapPointType)
+            .OrderByDescending(group => group.Count())
+            .Select(group => $"{MapPointTypeLabel(group.Key)}×{group.Count()}");
+        var visitedText = string.Join(" ", visited);
+        if (!string.IsNullOrWhiteSpace(visitedText))
+            sb.AppendLine($"已访问节点: {visitedText}");
+
+        var strategy = BuildRunStrategyLabel(aiPlayer);
+        if (!string.IsNullOrWhiteSpace(strategy))
+            sb.AppendLine($"构筑判断: {strategy}");
+
+        return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>Whole act map: current node, reachable nodes and the row-by-row edge graph.</summary>
+    public string DescribeMap(Player aiPlayer)
+    {
+        var runState = aiPlayer.RunState;
+        if (runState?.Map == null)
+            return "地图不可用";
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"第{runState.CurrentActIndex + 1}幕地图 | 已访问{GetVisitedMapCoords().Count}个节点");
+
+        var current = runState.CurrentMapPoint;
+        sb.AppendLine(current != null ? $"当前位置: {DescribeMapPoint(current)}" : "当前位置: 起点（尚未进入地图）");
+
+        var travelable = GetTravelableMapPoints(aiPlayer);
+        if (travelable.Count > 0)
+            sb.AppendLine($"可前往: {string.Join("、", travelable.Select(DescribeMapPoint))}");
+
+        sb.AppendLine(runState.Map.SecondBossMapPoint is { } secondBoss
+            ? $"Boss: {DescribeMapPoint(runState.Map.BossMapPoint)} | 第二Boss: {DescribeMapPoint(secondBoss)}"
+            : $"Boss: {DescribeMapPoint(runState.Map.BossMapPoint)}");
+
+        var visited = new HashSet<MapCoord>(GetVisitedMapCoords());
+        sb.AppendLine("路线图（行: 节点[类型] -> 后续节点坐标）:");
+        foreach (var row in runState.Map.GetAllMapPoints()
+                     .GroupBy(point => point.coord.row)
+                     .OrderBy(group => group.Key))
+        {
+            var parts = row
+                .OrderBy(point => point.coord.col)
+                .Select(point =>
+                {
+                    var mark = visited.Contains(point.coord) ? "√" : "";
+                    var children = point.Children.Count > 0
+                        ? "->" + string.Join(",", point.Children
+                            .OrderBy(child => child.coord.col)
+                            .Select(child => $"({child.coord.col},{child.coord.row})"))
+                        : "";
+                    return $"({point.coord.col},{point.coord.row}){mark}{MapPointTypeLabel(point.PointType)}{children}";
+                });
+
+            sb.Append($"第{row.Key}行: {string.Join(" ", parts)}");
+            if (sb.Length > 3200)
+            {
+                sb.Append(" …");
+                break;
+            }
+            sb.AppendLine();
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>Deck composition stats instead of the full card list.</summary>
+    public string DescribeDeckStats(Player target)
+    {
+        var deck = target.Deck?.Cards;
+        var who = GetPlayerDisplayName(target);
+        if (deck == null || deck.Count == 0)
+            return $"{who}: 牌组为空";
+
+        var descriptions = deck
+            .Select(card => PromptTextHelper.CleanText(
+                PromptTextHelper.ResolveCardDescription(card, PileType.Hand, card.Id.Entry)))
+            .ToList();
+
+        var averageCost = deck.Average(card => (double)(card.EnergyCost?.Canonical ?? 0));
+        var upgraded = deck.Count(card => card.IsUpgraded);
+
+        var types = deck
+            .GroupBy(card => card.Type)
+            .OrderBy(group => (int)group.Key)
+            .Select(group => $"{CardTypeTag(group.Key)}×{group.Count()}");
+        var rarities = deck
+            .GroupBy(card => card.Rarity)
+            .OrderBy(group => (int)group.Key)
+            .Select(group => $"{RarityLabel(group.Key)}×{group.Count()}");
+
+        (string Label, string[] Keys)[] keywords =
+        [
+            ("抽牌", ["抽", "Draw"]),
+            ("消耗", ["消耗", "Exhaust"]),
+            ("格挡", ["格挡", "Block"]),
+            ("力量", ["力量", "Strength"]),
+            ("易伤", ["易伤", "Vulnerable"]),
+            ("中毒", ["中毒", "Poison"]),
+            ("辉星", ["辉星", "Star"])
+        ];
+        var keywordCounts = keywords
+            .Select(keyword => (keyword.Label,
+                Count: descriptions.Count(desc => ContainsAny(desc, keyword.Keys))))
+            .Where(pair => pair.Count > 0)
+            .Select(pair => $"{pair.Label}×{pair.Count}");
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"{who} 牌组({deck.Count}张): {string.Join(" ", types)}");
+        sb.AppendLine($"平均费用{averageCost:F1} | 已升级{upgraded}张 | {string.Join(" ", rarities)}");
+        var keywordText = string.Join(" ", keywordCounts);
+        if (!string.IsNullOrWhiteSpace(keywordText))
+            sb.Append($"关键词: {keywordText}");
+
+        return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>
+    /// Nodes reachable from the current position, mirroring <c>NMapScreen</c>: start nodes before the
+    /// first move, the boss after the last normal row, and the second boss after the first boss.
+    /// </summary>
+    public static IReadOnlyList<MapPoint> GetTravelableMapPoints(Player aiPlayer)
+    {
+        var runState = RunManager.Instance?.DebugOnlyGetState();
+        var map = runState?.Map;
+        if (runState == null || map == null)
+            return Array.Empty<MapPoint>();
+
+        if (runState.VisitedMapCoords.Count == 0)
+            return SortPoints(map.startMapPoints);
+
+        if (runState.CurrentMapPoint is not { } current)
+            return Array.Empty<MapPoint>();
+
+        if (map.SecondBossMapPoint is { } secondBoss && current.coord == map.BossMapPoint.coord)
+            return new[] { secondBoss };
+
+        if (current.coord.row == map.GetRowCount() - 1)
+            return new[] { map.BossMapPoint };
+
+        return SortPoints(MapTravel.GetTravelablePointsFrom(runState, current));
+    }
+
+    private static IReadOnlyList<MapPoint> SortPoints(IEnumerable<MapPoint> points) =>
+        points
+            .OrderBy(point => point.coord.row)
+            .ThenBy(point => point.coord.col)
+            .ToList();
+
+    /// <summary>Coords visited in the current act (only available on the concrete RunState).</summary>
+    private static IReadOnlyList<MapCoord> GetVisitedMapCoords()
+    {
+        return RunManager.Instance?.DebugOnlyGetState()?.VisitedMapCoords ?? Array.Empty<MapCoord>();
+    }
+
+    /// <summary>Map node label used by prompts, tools and the solo navigator.</summary>
+    public static string DescribeMapPoint(MapPoint point) =>
+        $"{MapPointTypeLabel(point.PointType)}(第{point.coord.row}行,第{point.coord.col}列)";
+
+    public static string MapPointTypeLabel(MapPointType type) => type switch
+    {
+        MapPointType.Monster => "战斗",
+        MapPointType.Elite => "精英",
+        MapPointType.RestSite => "篝火",
+        MapPointType.Shop => "商店",
+        MapPointType.Treasure => "宝箱",
+        MapPointType.Ancient => "远古",
+        MapPointType.Boss => "Boss",
+        _ => "未知"
+    };
+
+    private static string RarityLabel(CardRarity rarity) => rarity switch
+    {
+        CardRarity.None => "无",
+        CardRarity.Basic => "基础",
+        CardRarity.Common => "普通",
+        CardRarity.Uncommon => "罕见",
+        CardRarity.Rare => "稀有",
+        CardRarity.Ancient => "远古",
+        CardRarity.Event => "事件",
+        CardRarity.Token => "衍生",
+        CardRarity.Status => "状态",
+        CardRarity.Curse => "诅咒",
+        CardRarity.Quest => "任务",
+        _ => rarity.ToString()
+    };
+
+    private static bool ContainsAny(string text, string[] keys) =>
+        !string.IsNullOrEmpty(text) && keys.Any(key => text.Contains(key, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>All cards the AI can currently see (piles + master deck), for card lookups.</summary>
+    public static IEnumerable<CardModel> EnumerateVisibleCards(Player aiPlayer)
+    {
+        var combat = aiPlayer.PlayerCombatState;
+        if (combat != null)
+        {
+            foreach (var card in combat.Hand.Cards) yield return card;
+            foreach (var card in combat.DrawPile.Cards) yield return card;
+            foreach (var card in combat.DiscardPile.Cards) yield return card;
+            foreach (var card in combat.ExhaustPile.Cards) yield return card;
+        }
+
+        if (aiPlayer.Deck?.Cards is { } deck)
+        {
+            foreach (var card in deck) yield return card;
+        }
+    }
+
+    private static string FormatPile(string label, IEnumerable<CardModel>? cards, PileType pileType,
+        int maxEntries, bool fullDetail, bool unknownOrder)
+    {
+        var list = cards?.Where(c => c != null).ToList() ?? new List<CardModel>();
+        if (list.Count == 0)
+            return $"{label}: 空";
+
+        var groups = list
+            .GroupBy(c => (c.Id.Entry, c.IsUpgraded, c.Title))
+            .Select(g => (Card: g.First(), Count: g.Count()))
+            .OrderBy(g => (int)g.Card.Type)
+            .ThenBy(g => g.Card.EnergyCost?.Canonical ?? 0)
+            .ThenBy(g => g.Card.Title ?? g.Card.Id.Entry, StringComparer.Ordinal)
+            .ToList();
+
+        var sb = new StringBuilder();
+        sb.Append($"{label}({list.Count}张{(unknownOrder ? "，顺序未知" : "")}): ");
+
+        var shown = 0;
+        foreach (var (card, count) in groups)
+        {
+            if (shown >= maxEntries)
+                break;
+            if (shown > 0)
+                sb.Append(", ");
+            sb.Append(FormatPileCard(card, count, fullDetail, pileType));
+            shown++;
+        }
+        if (groups.Count > shown)
+            sb.Append($", …另{groups.Count - shown}种未列出");
+
+        return sb.ToString();
+    }
+
+    public static string CardTypeTag(CardType type) => type switch
+    {
+        CardType.Attack => "攻",
+        CardType.Skill => "技",
+        CardType.Power => "能",
+        CardType.Status => "状",
+        CardType.Curse => "咒",
+        CardType.Quest => "任",
+        _ => ""
+    };
+
+    /// <summary>Compact cost text such as <c>1费</c>, <c>2费1星</c>, <c>X费</c>. 费用简述。</summary>
+    public static string FormatCostCompact(CardModel card)
+    {
+        var energyCost = card.EnergyCost;
+        var costStr = energyCost is { CostsX: true } ? "X费" : $"{energyCost?.Canonical ?? 0}费";
+        if (card.HasStarCostX)
+            return costStr + "X星";
+
+        var starCost = Math.Max(0, card.GetStarCostWithModifiers());
+        return starCost > 0 ? $"{costStr}{starCost}星" : costStr;
+    }
+
+    private static string FormatPileCard(CardModel card, int count, bool fullDetail, PileType pileType)
+    {
+        var name = card.Title ?? card.Id.Entry;
+        var costStr = FormatCostCompact(card);
+        var typeTag = CardTypeTag(card.Type);
+        var countStr = count > 1 ? $"×{count}" : "";
+
+        if (!fullDetail)
+            return $"{name}{countStr}({costStr}{typeTag})";
+
+        var desc = PromptTextHelper.CleanText(PromptTextHelper.GetCardDescriptionText(card, pileType));
+        return string.IsNullOrWhiteSpace(desc)
+            ? $"{name}{countStr}({costStr}{typeTag})"
+            : $"{name}{countStr}({costStr}{typeTag}): {desc}";
     }
 
     private bool HasVulnerable(Creature creature)
@@ -751,6 +1230,14 @@ public class ContextBuilder
                 sb.AppendLine("[手牌详细资料]");
                 sb.AppendLine(handKnowledge);
             }
+
+            var piles = BuildPileDetail(player);
+            if (!string.IsNullOrWhiteSpace(piles))
+            {
+                sb.AppendLine();
+                sb.AppendLine("[牌堆]");
+                sb.AppendLine(piles);
+            }
         }
 
         return sb.ToString();
@@ -773,6 +1260,8 @@ public class ContextBuilder
         }
         sb.AppendLine("-1=跳过");
 
+        AppendDeckList(sb, aiPlayer);
+
         return sb.ToString();
     }
 
@@ -781,6 +1270,14 @@ public class ContextBuilder
         var sb = new StringBuilder();
         sb.AppendLine("[地图导航]");
         AppendPlayerBrief(sb, aiPlayer);
+
+        var map = DescribeMap(aiPlayer);
+        if (!string.IsNullOrWhiteSpace(map))
+        {
+            sb.AppendLine();
+            sb.AppendLine(map);
+        }
+
         return sb.ToString();
     }
 
@@ -946,7 +1443,24 @@ public class ContextBuilder
             sb.AppendLine(potionKnowledge);
         }
 
+        AppendDeckList(sb, aiPlayer);
+
         return sb.ToString();
+    }
+
+    /// <summary>Full (deduplicated) master deck, for decisions that depend on deck composition.</summary>
+    private static void AppendDeckList(StringBuilder sb, Player aiPlayer)
+    {
+        if (!AiSettingsStore.Current.EnablePileDetail)
+            return;
+
+        var deck = aiPlayer.Deck?.Cards;
+        if (deck == null || deck.Count == 0)
+            return;
+
+        sb.AppendLine();
+        sb.AppendLine("[当前牌组]");
+        sb.AppendLine(FormatPile("主牌组", deck, PileType.Deck, MaxToolPileEntries, fullDetail: false, unknownOrder: false));
     }
 
     public string BuildEventContext(Player aiPlayer, List<string> optionDescs)
@@ -1093,7 +1607,11 @@ public class ContextBuilder
 
         var sb = new StringBuilder();
         if (runState != null)
-            sb.AppendLine($"第{runState.CurrentActIndex + 1}幕 第{runState.TotalFloor}层 | {stage} | {hpLabel}".Trim(' ', '|'));
+        {
+            // Ascension changes enemy HP/damage and elite density, so the LLM should know it is playing one.
+            var ascension = runState.AscensionLevel > 0 ? $" | 进阶{runState.AscensionLevel}" : "";
+            sb.AppendLine($"第{runState.CurrentActIndex + 1}幕 第{runState.TotalFloor}层{ascension} | {stage} | {hpLabel}".Trim(' ', '|'));
+        }
 
         if (!string.IsNullOrWhiteSpace(strategy))
             sb.AppendLine($"构筑判断: {strategy}");
