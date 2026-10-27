@@ -1,4 +1,4 @@
-using Godot;
+﻿using Godot;
 using STS2RitsuLib;
 using STS2RitsuLib.Settings;
 using STS2RitsuLib.Ui.Toast;
@@ -9,6 +9,7 @@ using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Personality;
 using AiTeammate.AiTeammateCode.Solo;
 using AiTeammate.AiTeammateCode.Localization;
+using AiTeammate.AiTeammateCode.Live;
 
 namespace AiTeammate.AiTeammateCode.Settings;
 
@@ -34,6 +35,10 @@ public static class AiSettingsPage
     private static ModSettingsValueBinding<AiSettings, int> B(Func<AiSettings, int> get, Action<AiSettings, int> set) =>
         new(MainFile.ModId, AiSettingsStore.DataKey, SaveScope.Global, get, set);
 
+    private static ModSettingsValueBinding<AiSettings, DanmakuDirection> B(
+        Func<AiSettings, DanmakuDirection> get, Action<AiSettings, DanmakuDirection> set) =>
+        new(MainFile.ModId, AiSettingsStore.DataKey, SaveScope.Global, get, set);
+
     private static readonly ModSettingsValueBinding<AiSettings, string> ActiveBackend =
         B(s => s.ActiveBackend, (s, v) => s.ActiveBackend = v);
 
@@ -45,6 +50,8 @@ public static class AiSettingsPage
             (s, v) => { if (!string.IsNullOrEmpty(v)) s.DeepSeekApiKey = v; });
     private static readonly ModSettingsValueBinding<AiSettings, string> DeepSeekModel =
         B(s => s.DeepSeekModel, (s, v) => s.DeepSeekModel = v);
+    private static readonly ModSettingsValueBinding<AiSettings, string> DeepSeekModelPick =
+        B(s => s.DeepSeekModel, (s, v) => s.DeepSeekModel = v);
     private static readonly ModSettingsValueBinding<AiSettings, string> DeepSeekBaseUrl =
         B(s => s.DeepSeekBaseUrl, (s, v) => s.DeepSeekBaseUrl = v);
 
@@ -53,10 +60,14 @@ public static class AiSettingsPage
             (s, v) => { if (!string.IsNullOrEmpty(v)) s.OpenAiApiKey = v; });
     private static readonly ModSettingsValueBinding<AiSettings, string> OpenAiModel =
         B(s => s.OpenAiModel, (s, v) => s.OpenAiModel = v);
+    private static readonly ModSettingsValueBinding<AiSettings, string> OpenAiModelPick =
+        B(s => s.OpenAiModel, (s, v) => s.OpenAiModel = v);
     private static readonly ModSettingsValueBinding<AiSettings, string> OpenAiBaseUrl =
         B(s => s.OpenAiBaseUrl, (s, v) => s.OpenAiBaseUrl = v);
 
     private static readonly ModSettingsValueBinding<AiSettings, string> OllamaModel =
+        B(s => s.OllamaModel, (s, v) => s.OllamaModel = v);
+    private static readonly ModSettingsValueBinding<AiSettings, string> OllamaModelPick =
         B(s => s.OllamaModel, (s, v) => s.OllamaModel = v);
     private static readonly ModSettingsValueBinding<AiSettings, string> OllamaBaseUrl =
         B(s => s.OllamaBaseUrl, (s, v) => s.OllamaBaseUrl = v);
@@ -77,6 +88,46 @@ public static class AiSettingsPage
         B(s => s.EnableReadTools, (s, v) => s.EnableReadTools = v);
     private static readonly ModSettingsValueBinding<AiSettings, bool> EnableOutOfCombatReadTools =
         B(s => s.EnableOutOfCombatReadTools, (s, v) => s.EnableOutOfCombatReadTools = v);
+    private static readonly ModSettingsValueBinding<AiSettings, bool> EnableScreenshotTool =
+        B(s => s.EnableScreenshotTool, (s, v) => s.EnableScreenshotTool = v);
+
+    // ---- Bilibili live danmaku bindings ----
+
+    private static readonly ModSettingsValueBinding<AiSettings, bool> EnableBilibiliDanmaku =
+        B(s => s.EnableBilibiliDanmaku, (s, v) => s.EnableBilibiliDanmaku = v);
+    private static readonly ModSettingsValueBinding<AiSettings, string> BilibiliRoomId =
+        B(s => s.BilibiliRoomId, (s, v) => s.BilibiliRoomId = v);
+    private static readonly ModSettingsValueBinding<AiSettings, int> DanmakuMaxChars =
+        B(s => s.DanmakuMaxChars, (s, v) => s.DanmakuMaxChars = v);
+    private static readonly ModSettingsValueBinding<AiSettings, DanmakuDirection> DanmakuMoveDirection =
+        B(s => s.DanmakuMoveDirection, (s, v) => s.DanmakuMoveDirection = v);
+    private static readonly ModSettingsValueBinding<AiSettings, int> DanmakuSpeed =
+        B(s => s.DanmakuSpeed, (s, v) => s.DanmakuSpeed = v);
+    private static readonly ModSettingsValueBinding<AiSettings, int> DanmakuFontSize =
+        B(s => s.DanmakuFontSize, (s, v) => s.DanmakuFontSize = v);
+    private static readonly ModSettingsValueBinding<AiSettings, int> DanmakuOpacity =
+        B(s => s.DanmakuOpacity, (s, v) => s.DanmakuOpacity = v);
+    private static readonly ModSettingsValueBinding<AiSettings, bool> DanmakuShowAvatar =
+        B(s => s.DanmakuShowAvatar, (s, v) => s.DanmakuShowAvatar = v);
+    private static readonly ModSettingsValueBinding<AiSettings, bool> DanmakuHostOnly =
+        B(s => s.DanmakuHostOnly, (s, v) => s.DanmakuHostOnly = v);
+    private static readonly ModSettingsValueBinding<AiSettings, int> DanmakuAreaPercent =
+        B(s => s.DanmakuAreaPercent, (s, v) => s.DanmakuAreaPercent = v);
+
+    // Cookies are write-only in the UI, like the API keys.
+    private static readonly ModSettingsValueBinding<AiSettings, string> BilibiliSessData =
+        B(_ => "",
+            (s, v) => { if (!string.IsNullOrEmpty(v)) s.BilibiliSessData = v; });
+    private static readonly ModSettingsValueBinding<AiSettings, string> BilibiliBiliJct =
+        B(_ => "",
+            (s, v) => { if (!string.IsNullOrEmpty(v)) s.BilibiliBiliJct = v; });
+
+    private static readonly ModSettingsValueBinding<AiSettings, bool> EnableDanmakuAiChat =
+        B(s => s.EnableDanmakuAiChat, (s, v) => s.EnableDanmakuAiChat = v);
+    private static readonly ModSettingsValueBinding<AiSettings, int> DanmakuAiChatCooldownMs =
+        B(s => s.DanmakuAiChatCooldownMs, (s, v) => s.DanmakuAiChatCooldownMs = v);
+    private static readonly ModSettingsValueBinding<AiSettings, int> DanmakuAiChatBatchSize =
+        B(s => s.DanmakuAiChatBatchSize, (s, v) => s.DanmakuAiChatBatchSize = v);
 
     private static readonly ModSettingsValueBinding<AiSettings, string> ActivePersonality =
         B(s => s.ActivePersonalityId, (s, v) => s.ActivePersonalityId = v);
@@ -169,6 +220,13 @@ public static class AiSettingsPage
                 .AddString("deepseek_model", S("settings.backend.deepseek_model", "DeepSeek model"), DeepSeekModel,
                     description: S("settings.backend.deepseek_model.desc", "For example, deepseek-v4-flash."))
                     .WithEntryVisibleWhen("deepseek_model", () => IsBackend("DeepSeek"))
+                .AddDynamicChoice("deepseek_model_pick", S("settings.backend.deepseek_model.pick", "DeepSeek model list"),
+                    DeepSeekModelPick,
+                    () => BuildModelOptions("DeepSeek", AiSettingsStore.Current.DeepSeekModel),
+                    description: S("settings.backend.model_pick.desc",
+                        "Models reported by the endpoint. Pick one to write it into the model field above; “Fetch models” refreshes this list."),
+                    presentation: ModSettingsChoicePresentation.Dropdown)
+                    .WithEntryVisibleWhen("deepseek_model_pick", () => IsBackend("DeepSeek"))
                 .AddString("deepseek_base_url", S("settings.backend.deepseek_url", "DeepSeek Base URL"), DeepSeekBaseUrl)
                     .WithEntryVisibleWhen("deepseek_base_url", () => IsBackend("DeepSeek"))
                 .AddButton("deepseek_api_key_clear", S("settings.backend.deepseek_key.clear", "Clear DeepSeek key"),
@@ -183,6 +241,13 @@ public static class AiSettingsPage
                     .WithEntryVisibleWhen("openai_api_key", () => IsBackend("OpenAI"))
                 .AddString("openai_model", S("settings.backend.openai_model", "OpenAI model"), OpenAiModel)
                     .WithEntryVisibleWhen("openai_model", () => IsBackend("OpenAI"))
+                .AddDynamicChoice("openai_model_pick", S("settings.backend.openai_model.pick", "OpenAI model list"),
+                    OpenAiModelPick,
+                    () => BuildModelOptions("OpenAI", AiSettingsStore.Current.OpenAiModel),
+                    description: S("settings.backend.model_pick.desc",
+                        "Models reported by the endpoint. Pick one to write it into the model field above; “Fetch models” refreshes this list."),
+                    presentation: ModSettingsChoicePresentation.Dropdown)
+                    .WithEntryVisibleWhen("openai_model_pick", () => IsBackend("OpenAI"))
                 .AddString("openai_base_url", S("settings.backend.openai_url", "OpenAI Base URL"), OpenAiBaseUrl)
                     .WithEntryVisibleWhen("openai_base_url", () => IsBackend("OpenAI"))
                 .AddButton("openai_api_key_clear", S("settings.backend.openai_key.clear", "Clear OpenAI key"),
@@ -192,10 +257,22 @@ public static class AiSettingsPage
                     .WithEntryVisibleWhen("openai_api_key_clear", () => IsBackend("OpenAI"))
                 .AddString("ollama_model", S("settings.backend.ollama_model", "Ollama model"), OllamaModel)
                     .WithEntryVisibleWhen("ollama_model", () => IsBackend("Ollama"))
+                .AddDynamicChoice("ollama_model_pick", S("settings.backend.ollama_model.pick", "Ollama model list"),
+                    OllamaModelPick,
+                    () => BuildModelOptions("Ollama", AiSettingsStore.Current.OllamaModel),
+                    description: S("settings.backend.model_pick.desc",
+                        "Models reported by the endpoint. Pick one to write it into the model field above; “Fetch models” refreshes this list."),
+                    presentation: ModSettingsChoicePresentation.Dropdown)
+                    .WithEntryVisibleWhen("ollama_model_pick", () => IsBackend("Ollama"))
                 .AddString("ollama_base_url", S("settings.backend.ollama_url", "Ollama Base URL"), OllamaBaseUrl)
                     .WithEntryVisibleWhen("ollama_base_url", () => IsBackend("Ollama"))
                 .AddToggle("thinking", S("settings.backend.thinking", "Enable model thinking"), EnableModelThinking,
                     description: S("settings.backend.thinking.desc", "The model produces more reasoning, at the cost of slower responses and higher usage."))
+                .AddButton("fetch_models", S("settings.backend.fetch.label", "Available models"),
+                    S("settings.backend.fetch.button", "Fetch models"), FetchModels,
+                    ModSettingsButtonTone.Normal,
+                    S("settings.backend.fetch.desc",
+                        "Asks the active backend which models it serves (GET /models, or Ollama /api/tags) and fills the model list above."))
                 .AddButton("test_connection", S("settings.backend.test.label", "Test connection"),
                     S("settings.backend.test.button", "Test backend"), TestConnection,
                     ModSettingsButtonTone.Accent,
@@ -222,6 +299,12 @@ public static class AiSettingsPage
                     EnableOutOfCombatReadTools,
                     description: S("settings.decision.read_tools_out_of_combat.desc",
                         "Allow up to two extra requests for map / reward / shop / rest / event decisions so the AI can inspect the map, relics, potions and deck on demand."))
+                .AddToggle("screenshot_tool", S("settings.decision.screenshot", "Let the AI see the game screen"),
+                    EnableScreenshotTool,
+                    description: S("settings.decision.screenshot.desc",
+                        "Adds a screenshot tool to decisions. The current frame is attached to the follow-up request as an image; only vision-capable models can use it, and it costs extra tokens."))
+                .AddParagraph("screenshot_model_hint", ModSettingsText.Dynamic(() => DescribeActiveModelVision()))
+                    .WithEntryVisibleWhen("screenshot_model_hint", () => AiSettingsStore.Current.EnableScreenshotTool)
             )
             .AddSection("personality", section => section
                 .WithTitle(S("settings.section.personality", "Personality"))
@@ -271,6 +354,93 @@ public static class AiSettingsPage
                 .AddIntSlider("max_suggestions", S("settings.suggestions.max", "Max suggestions per turn"), MaxSuggestionsPerTurn,
                     1, 10, 1)
                     .WithEntryVisibleWhen("max_suggestions", () => AiSettingsStore.Current.EnableSuggestions)
+            )
+            .AddSection("live", section => section
+                .WithTitle(S("settings.section.live", "Bilibili Live Danmaku"))
+                .AddToggle("live_enabled", S("settings.live.enabled", "Show live-room danmaku"), EnableBilibiliDanmaku,
+                    description: S("settings.live.enabled.desc",
+                        "Connects to the room and scrolls its danmaku across the game screen. Receiving danmaku needs no Bilibili login; sending (and AI replies) does."))
+                .AddParagraph("live_status",
+                    ModSettingsText.Dynamic(() => AiLoc.T("settings.live.status", "Connection: {Status}",
+                        ("Status", LiveDanmakuService.CurrentStatus))))
+                    .WithEntryVisibleWhen("live_status", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddParagraph("live_login_status",
+                    ModSettingsText.Dynamic(() => AiLoc.T("settings.live.login_status", "Bilibili account: {Status}",
+                        ("Status", LiveDanmakuService.CurrentLogin))))
+                    .WithEntryVisibleWhen("live_login_status", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddString("live_room", S("settings.live.room", "Live room id or URL"), BilibiliRoomId,
+                    placeholder: ModSettingsText.Literal("21452505"),
+                    description: S("settings.live.room.desc", "The number after live.bilibili.com/, or paste the whole room URL."))
+                    .WithEntryVisibleWhen("live_room", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddButton("live_reconnect", S("settings.live.reconnect.label", "Connection"),
+                    S("settings.live.reconnect.button", "Reconnect"), ReconnectLiveDanmaku,
+                    ModSettingsButtonTone.Normal,
+                    S("settings.live.reconnect.desc",
+                        "Reconnects now. Room id and cookie changes are also picked up automatically within a second."))
+                    .WithEntryVisibleWhen("live_reconnect", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddIntSlider("live_max_chars", S("settings.live.max_chars", "Max characters per danmaku"),
+                    DanmakuMaxChars, 5, 200, 5,
+                    description: S("settings.live.max_chars.desc", "Longer lines are trimmed with an ellipsis before they are drawn."))
+                    .WithEntryVisibleWhen("live_max_chars", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddEnumChoice("live_direction", S("settings.live.direction", "Scroll direction"),
+                    DanmakuMoveDirection,
+                    value => value == DanmakuDirection.LeftToRight
+                        ? S("settings.live.direction.ltr", "Left to right")
+                        : S("settings.live.direction.rtl", "Right to left"),
+                    description: S("settings.live.direction.desc",
+                        "Video danmaku usually move right to left. This mod defaults to left to right; change it here if you prefer the classic direction."),
+                    presentation: ModSettingsChoicePresentation.Dropdown)
+                    .WithEntryVisibleWhen("live_direction", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddIntSlider("live_speed", S("settings.live.speed", "Scroll speed (px/s at 1080p)"),
+                    DanmakuSpeed, 40, 800, 10,
+                    description: S("settings.live.speed.desc", "Scales with the viewport height."))
+                    .WithEntryVisibleWhen("live_speed", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddIntSlider("live_font", S("settings.live.font", "Font size"), DanmakuFontSize, 10, 48, 1)
+                    .WithEntryVisibleWhen("live_font", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddIntSlider("live_opacity", S("settings.live.opacity", "Text opacity (%)"), DanmakuOpacity, 20, 100, 5)
+                    .WithEntryVisibleWhen("live_opacity", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddIntSlider("live_area", S("settings.live.area", "Vertical area used (%)"), DanmakuAreaPercent, 10, 100, 5,
+                    description: S("settings.live.area.desc", "Percentage of the screen height the danmaku lanes may occupy, starting near the top."))
+                    .WithEntryVisibleWhen("live_area", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddToggle("live_avatar", S("settings.live.avatar", "Show sender avatars"), DanmakuShowAvatar)
+                    .WithEntryVisibleWhen("live_avatar", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddToggle("live_host_only", S("settings.live.host_only", "Only on the host's screen"), DanmakuHostOnly,
+                    description: S("settings.live.host_only.desc",
+                        "When off, every multiplayer client fetches and shows the same room independently."))
+                    .WithEntryVisibleWhen("live_host_only", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddString("live_sessdata", S("settings.live.sessdata", "Bilibili SESSDATA cookie"), BilibiliSessData,
+                    placeholder: CookiePlaceholder(s => s.BilibiliSessData),
+                    description: S("settings.live.sessdata.desc",
+                        "Optional. Needed only to send danmaku and let the AI chat with viewers. The saved value is never shown."))
+                    .WithEntryVisibleWhen("live_sessdata", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddString("live_bili_jct", S("settings.live.bili_jct", "Bilibili bili_jct cookie"), BilibiliBiliJct,
+                    placeholder: CookiePlaceholder(s => s.BilibiliBiliJct),
+                    description: S("settings.live.bili_jct.desc",
+                        "Optional. The CSRF token from the same browser session; required together with SESSDATA."))
+                    .WithEntryVisibleWhen("live_bili_jct", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddButton("live_verify_login", S("settings.live.verify.label", "Verify Bilibili login"),
+                    S("settings.live.verify.button", "Verify"), VerifyLiveLogin,
+                    ModSettingsButtonTone.Accent,
+                    S("settings.live.verify.desc", "Checks the pasted cookies against Bilibili and shows the account name."))
+                    .WithEntryVisibleWhen("live_verify_login", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddButton("live_clear_login", S("settings.live.clear_login.label", "Clear Bilibili login"),
+                    S("settings.live.clear_login.button", "Clear"), ClearBilibiliLogin,
+                    ModSettingsButtonTone.Danger,
+                    S("settings.live.clear_login.desc", "Removes SESSDATA and bili_jct from this PC."))
+                    .WithEntryVisibleWhen("live_clear_login", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddToggle("live_ai_chat", S("settings.live.ai_chat", "Let the AI reply to live danmaku"),
+                    EnableDanmakuAiChat,
+                    description: S("settings.live.ai_chat.desc",
+                        "Requires a logged-in Bilibili account. The AI reads recent viewer danmaku and sends one short reply, respecting the cooldown below."))
+                    .WithEntryVisibleWhen("live_ai_chat", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
+                .AddIntSlider("live_ai_cooldown", S("settings.live.ai_cooldown", "AI reply cooldown (ms)"),
+                    DanmakuAiChatCooldownMs, 5000, 300000, 1000)
+                    .WithEntryVisibleWhen("live_ai_cooldown",
+                        () => AiSettingsStore.Current.EnableBilibiliDanmaku && AiSettingsStore.Current.EnableDanmakuAiChat)
+                .AddIntSlider("live_ai_batch", S("settings.live.ai_batch", "Danmaku per AI reply"),
+                    DanmakuAiChatBatchSize, 1, 20, 1)
+                    .WithEntryVisibleWhen("live_ai_batch",
+                        () => AiSettingsStore.Current.EnableBilibiliDanmaku && AiSettingsStore.Current.EnableDanmakuAiChat)
             )
             .AddSection("solo", section => section
                 .WithTitle(S("settings.section.solo", "Solo Climb"))
@@ -385,6 +555,125 @@ public static class AiSettingsPage
             });
         });
     }
+
+    /// <summary>Model drop-down options: the fetched list, always including the currently typed model.</summary>
+    private static IReadOnlyList<ModSettingsChoiceOption<string>> BuildModelOptions(string backend, string current)
+    {
+        var models = ModelCatalog.Get(backend).ToList();
+        if (!string.IsNullOrWhiteSpace(current) && !models.Contains(current, StringComparer.Ordinal))
+            models.Insert(0, current);
+        if (models.Count == 0)
+            models.Add("");
+
+        return models
+            .Select(model => new ModSettingsChoiceOption<string>(model,
+                ModSettingsText.Literal(string.IsNullOrEmpty(model)
+                    ? AiLoc.T("settings.backend.model_pick.empty", "No models fetched yet")
+                    : model)))
+            .ToList();
+    }
+
+    private static string ActiveModelName()
+    {
+        var settings = AiSettingsStore.Current;
+        return settings.ActiveBackend switch
+        {
+            "OpenAI" => settings.OpenAiModel,
+            "Ollama" => settings.OllamaModel,
+            _ => settings.DeepSeekModel
+        };
+    }
+
+    /// <summary>Heuristic hint (never a hard block): is the active model likely to accept images?</summary>
+    private static string DescribeActiveModelVision()
+    {
+        var model = ActiveModelName();
+        if (string.IsNullOrWhiteSpace(model))
+            return AiLoc.T("settings.decision.screenshot.model_missing",
+                "No model is configured for the active backend.");
+
+        return ModelCatalog.LooksVisionCapable(model)
+            ? AiLoc.T("settings.decision.screenshot.model_ok",
+                "Active model {Model} looks vision-capable.", ("Model", model))
+            : AiLoc.T("settings.decision.screenshot.model_warn",
+                "Active model {Model} does not look like a vision model; the screenshot tool will likely fail.",
+                ("Model", model));
+    }
+
+    private static void FetchModels(IModSettingsUiActionHost host)
+    {
+        var backend = AiSettingsStore.Current.ActiveBackend;
+        RitsuToastService.ShowInfo(AiLoc.T("toast.models_fetching", "Fetching the model list from {Backend}…",
+            ("Backend", backend)));
+
+        _ = Task.Run(async () =>
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            var result = await ModelCatalog.RefreshAsync(backend, cts.Token);
+            MainThread.Post(() =>
+            {
+                if (result.IsSuccess)
+                {
+                    RitsuToastService.ShowInfo(AiLoc.T("toast.models_fetched",
+                        "{Count} models fetched for {Backend}.", ("Count", result.Models.Count.ToString()),
+                        ("Backend", backend)));
+                    RequestRefresh(host);
+                }
+                else
+                {
+                    RitsuToastService.ShowError(AiLoc.T("toast.models_fetch_failed",
+                        "Could not fetch models: {Message}", ("Message", result.ErrorMessage)));
+                }
+            });
+        });
+    }
+
+    private static void ReconnectLiveDanmaku(IModSettingsUiActionHost host)
+    {
+        LiveDanmakuService.RequestReconnect();
+        RitsuToastService.ShowInfo(AiLoc.T("toast.live_reconnecting", "Reconnecting to the live room…"));
+        RequestRefresh(host);
+    }
+
+    private static void VerifyLiveLogin(IModSettingsUiActionHost host)
+    {
+        RitsuToastService.ShowInfo(AiLoc.T("toast.live_verifying", "Checking Bilibili login…"));
+        _ = Task.Run(async () =>
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            var (success, message) = await LiveDanmakuService.VerifyLoginAsync(cts.Token);
+            MainThread.Post(() =>
+            {
+                if (success)
+                    RitsuToastService.ShowInfo(message);
+                else
+                    RitsuToastService.ShowError(message);
+                RequestRefresh(host);
+            });
+        });
+    }
+
+    private static void ClearBilibiliLogin(IModSettingsUiActionHost host)
+    {
+        AiSettingsStore.Current.BilibiliSessData = "";
+        AiSettingsStore.Current.BilibiliBiliJct = "";
+        AiSettingsStore.Save();
+        LiveDanmakuService.RequestReconnect();
+        RequestRefresh(host);
+        RitsuToastService.ShowInfo(AiLoc.T("toast.live_login_cleared", "Bilibili login removed."));
+    }
+
+    private static void RequestRefresh(IModSettingsUiActionHost host)
+    {
+        try { host.RequestRefresh(); }
+        catch { /* the settings page may already be closed */ }
+    }
+
+    /// <summary>Placeholder for a write-only cookie field, mirroring the API-key hint.</summary>
+    private static ModSettingsText CookiePlaceholder(Func<AiSettings, string> read) =>
+        ModSettingsText.Dynamic(() => string.IsNullOrEmpty(read(AiSettingsStore.Current))
+            ? AiLoc.T("settings.live.cookie.empty", "Not set")
+            : AiLoc.T("settings.live.cookie.saved", "Saved — type a new value to replace it"));
 
     /// <summary>
     /// Placeholder for an API key field. The field never displays the saved key, so the placeholder

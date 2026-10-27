@@ -197,6 +197,19 @@ public static class RewardsSetOfferPatch
                         {
                             log.Log("REWARD", $"Card {result.cardAdded.Id} added to deck");
 
+                            // CardPileCmd.Add only raises CardAddFinished when the card has an on-table
+                            // node/tween. The vanilla reward screen provides one; our suppressed flow does
+                            // not, so the top-bar deck counter (_countLabel) would keep the old number
+                            // forever while the deck view (ContentsChanged) already shows the new card.
+                            try
+                            {
+                                PileType.Deck.GetPile(result.cardAdded.Owner).InvokeCardAddFinished();
+                            }
+                            catch (Exception refreshEx)
+                            {
+                                log.Log("REWARD", $"Deck counter refresh failed: {refreshEx.Message}");
+                            }
+
                             // Only sync if combat is fully over. During combat-to-reward
                             // transitions, the combat state may not be cleaned up yet,
                             // and syncing cards during combat is rejected by the game.

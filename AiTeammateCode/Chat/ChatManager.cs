@@ -279,6 +279,11 @@ public class ChatManager
         sb.AppendLine(AiLoc.T("prompt.chat.rule.3", "3. For \"focus that enemy next turn / hit that target first\", use focus_target and name the target."));
         sb.AppendLine(AiLoc.T("prompt.chat.rule.4", "4. Set accepted=true only when you're willing to try; set accepted=false if you lack resources, it isn't worth it, or it's too dangerous."));
         sb.AppendLine(AiLoc.T("prompt.chat.rule.5", "5. The reply must read like a real teammate typing, not a scripted explanation."));
+        if (AiSettingsStore.Current.EnableScreenshotTool)
+        {
+            sb.AppendLine(AiLoc.T("prompt.chat.screenshot_tool",
+                "If you genuinely need to see the current screen before answering, return only {\"tool_calls\":[{\"name\":\"screenshot\"}]}; the system will attach a captured frame to your next message, then you must return the final chat JSON."));
+        }
         return sb.ToString();
     }
 
@@ -323,6 +328,8 @@ public class ChatManager
         if (!response.IsSuccess)
             return new InteractiveChatResult { Reply = AiLoc.T("chat.reply.thinking", "(Thinking...)") };
 
+        response = await TryRunChatScreenshotAsync(response, userPrompt, ct);
+
         var parsed = TryParseInteractiveChatResponse(response.Content);
         if (parsed != null)
             return parsed;
@@ -345,6 +352,69 @@ public class ChatManager
         {
             Reply = fallbackResponse.IsSuccess ? fallbackResponse.Content.Trim() : AiLoc.T("chat.reply.received", "(Got it.)")
         };
+    }
+
+    /// <summary>
+    /// Chat variant of the vision tool: when the model asks for a screenshot instead of answering,
+    /// capture the frame and re-ask with the image attached. One extra round only.
+    /// </summary>
+    private async Task<AiResponse> TryRunChatScreenshotAsync(
+        AiResponse first, string userPrompt, CancellationToken ct)
+    {
+        if (!AiSettingsStore.Current.EnableScreenshotTool)
+            return first;
+
+        var calls = ResponseParser.ExtractToolCalls(first.Content);
+        if (calls.Count == 0 || !calls.Any(call => call.Name.Trim().ToLowerInvariant()
+                is "screenshot" or "capture_screen" or "see_screen"))
+            return first;
+
+        // A response that already contains a usable reply wins over the tool call.
+        var early = TryParseInteractiveChatResponse(first.Content);
+        if (early != null && (!string.IsNullOrWhiteSpace(early.Reply) || early.Directives.Count > 0))
+            return first;
+
+        ScreenshotTool.Result shot;
+        try
+        {
+            shot = Compat.MainThread.Invoke(ScreenshotTool.Capture);
+        }
+        catch (Exception ex)
+        {
+            shot = new ScreenshotTool.Result { IsSuccess = false, Error = ex.Message };
+        }
+
+        var toolText = shot.IsSuccess
+            ? AiLoc.T("prompt.chat.screenshot_ok", "Captured the current screen ({Width}×{Height}); the image is attached to this message.",
+                ("Width", shot.Width.ToString()), ("Height", shot.Height.ToString()))
+            : AiLoc.T("prompt.chat.screenshot_failed", "Screenshot failed: {Message}", ("Message", shot.Error));
+
+        var history = BuildHistory();
+        history.Add(new AiMessage { Role = "user", Content = userPrompt });
+        history.Add(new AiMessage { Role = "assistant", Content = first.Content });
+
+        var request = new AiRequest
+        {
+            SystemPrompt = _promptBuilder.BuildSystemPrompt(requireJson: true, chatMode: true),
+            UserPrompt = AiLoc.T("prompt.chat.screenshot_followup",
+                "Tool result: {Result}\n\nReturn the final chat JSON (reply / directives) now. Do not call another tool.",
+                ("Result", toolText)),
+            Type = AiRequestType.Chat,
+            MaxTokens = 1024,
+            Temperature = 0.7f,
+            EnableJsonMode = true,
+            FrequencyPenalty = 0.3f,
+            PresencePenalty = 0.2f,
+            ConversationHistory = history,
+            UserImageDataUrl = shot.IsSuccess ? shot.DataUrl : null
+        };
+
+        using var timeoutCts = new CancellationTokenSource(
+            Math.Clamp(AiSettingsStore.Current.ChatTimeoutMs, 2000, 30000));
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+        var followUp = await _backend.SendAsync(request, linkedCts.Token);
+        return followUp.IsSuccess ? followUp : first;
     }
 
     private InteractiveChatResult? TryParseInteractiveChatResponse(string rawContent)

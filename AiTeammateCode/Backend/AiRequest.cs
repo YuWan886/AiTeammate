@@ -20,6 +20,13 @@ public class AiRequest
     /// <summary>多轮对话历史（user/assistant 交替）。DeepSeek 无状态 API 每次需携带完整历史。</summary>
     public List<AiMessage> ConversationHistory { get; set; } = new();
 
+    /// <summary>
+    /// Optional image attached to the final user message as a data URL
+    /// (<c>data:image/jpeg;base64,...</c>). Used by the screenshot tool; only vision models accept it.
+    /// 随最后一条 user 消息附带的图像（截图工具用），仅视觉模型支持。
+    /// </summary>
+    public string? UserImageDataUrl { get; set; }
+
     // === DeepSeek 专属优化参数 ===
 
     /// <summary>是否启用 JSON Output 模式（response_format: json_object）。

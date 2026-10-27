@@ -37,7 +37,7 @@ public class OpenAiBackend : IAiBackend
             foreach (var msg in request.ConversationHistory)
                 messages.Add(new { role = msg.Role, content = msg.Content });
 
-            messages.Add(new { role = "user", content = request.UserPrompt });
+            messages.Add(BuildUserMessage(request.UserPrompt, request.UserImageDataUrl));
 
             object? responseFormat = null;
             if (request.EnableJsonMode)
@@ -127,6 +127,23 @@ public class OpenAiBackend : IAiBackend
         };
         var response = await SendAsync(request, ct);
         return response.IsSuccess;
+    }
+
+    public Task<ModelListResult> ListModelsAsync(CancellationToken ct) =>
+        ModelListClient.FetchOpenAiCompatibleAsync(_baseUrl, _apiKey, ct);
+
+    /// <summary>Builds the final user message, using OpenAI's multi-part content when an image is attached.</summary>
+    private static object BuildUserMessage(string text, string? imageDataUrl)
+    {
+        if (string.IsNullOrWhiteSpace(imageDataUrl))
+            return new { role = "user", content = text };
+
+        var parts = new List<object>
+        {
+            new { type = "text", text },
+            new { type = "image_url", image_url = new { url = imageDataUrl } }
+        };
+        return new { role = "user", content = parts };
     }
 
     public void Dispose() => _client.Dispose();

@@ -45,6 +45,7 @@ public static class SoloRunController
     private static CancellationTokenSource? _loopCts;
     private static bool _runEventHookInstalled;
     private static Rng _fallbackRng = new((uint)DateTime.UtcNow.Ticks);
+    private static string _lastBlockReason = "";
 
     /// <summary>Settings toggle. 单人爬塔模式开关。</summary>
     public static bool IsModeEnabled => AiSettingsStore.Current.EnableSoloClimb;
@@ -174,16 +175,60 @@ public static class SoloRunController
     }
 
     /// <summary>
+    /// Drives <see cref="TryBind"/> once per second while solo mode is enabled and a singleplayer
+    /// run is in progress. Loaded saves can reach a playable state through hooks that fire before
+    /// the local player exists; this watchdog guarantees the AI eventually takes over.
+    /// 读档后兜底：只要单人模式开着且不在 AI 控制下，就持续重试。
+    /// </summary>
+    public static void SuperviseTick()
+    {
+        if (!IsModeEnabled)
+            return;
+
+        var manager = AiTeammateManager.Instance;
+        if (!manager.IsInitialized)
+            return;
+
+        var run = RunManager.Instance;
+        if (run?.DebugOnlyGetState() == null)
+            return;
+
+        // Multiplayer teammate runs never hand control to the AI.
+        if (run.NetService?.Type != NetGameType.Singleplayer)
+            return;
+
+        if (IsActive && manager.IsSoloControlled && manager.AiPlayer != null
+            && run.DebugOnlyGetState()!.Players.Contains(manager.AiPlayer))
+            return;
+
+        TryBind(manager);
+    }
+
+    /// <summary>Logs why a bind attempt was refused, once per distinct reason.</summary>
+    private static void LogBindBlocked(string reason)
+    {
+        if (_lastBlockReason == reason)
+            return;
+
+        _lastBlockReason = reason;
+        MainFile.Logger.Info($"[Solo] bind blocked: {reason}");
+    }
+
+    /// <summary>
     /// Binds the local player to AI control when solo mode is on, and releases it when the mode is
     /// switched off or the run ends. Safe to call from any patch. 绑定/释放单人模式控制权。
     /// </summary>
     public static bool TryBind(AiTeammateManager manager)
     {
         if (!manager.IsInitialized)
+        {
+            LogBindBlocked("manager not initialized");
             return false;
+        }
 
         if (!IsModeEnabled)
         {
+            _lastBlockReason = "";
             if (IsBound)
                 Release(manager);
             return false;
@@ -191,19 +236,32 @@ public static class SoloRunController
 
         var run = RunManager.Instance;
         var netService = run?.NetService;
-        if (run == null || netService == null || netService.Type != NetGameType.Singleplayer)
+        if (run == null || netService == null)
+        {
+            LogBindBlocked("run manager not ready");
             return false;
+        }
+
+        if (netService.Type != NetGameType.Singleplayer)
+        {
+            LogBindBlocked($"net type is {netService.Type}");
+            return false;
+        }
 
         var state = run.DebugOnlyGetState();
         if (state == null)
         {
+            LogBindBlocked("run state not available yet");
             if (IsBound)
                 Release(manager);
             return false;
         }
 
         if (IsActive && manager.AiPlayer != null && state.Players.Contains(manager.AiPlayer))
+        {
+            _lastBlockReason = "";
             return true;
+        }
 
         if (IsBound)
         {
@@ -213,7 +271,10 @@ public static class SoloRunController
 
         // Never hijack a multiplayer teammate binding.
         if (manager.AiPlayer != null && !manager.IsSoloControlled)
+        {
+            LogBindBlocked($"player already bound as teammate ({manager.AiPlayer.Character?.Id.Entry})");
             return false;
+        }
 
         var netId = LocalContext.NetId;
         var me = netId.HasValue ? state.GetPlayer(netId.Value) : null;
@@ -221,10 +282,11 @@ public static class SoloRunController
         {
             // Happens while a save is still loading: RunManager.Launch() has not set the local net
             // id yet (or the saved players are not deserialized). RequestBindRetry covers it.
-            MainFile.Logger.Info($"[Solo] bind deferred: local player not available yet " +
-                                 $"(netId={(netId.HasValue ? netId.Value.ToString() : "unset")}, players={state.Players.Count})");
+            LogBindBlocked($"local player not in run state (netId={(netId.HasValue ? netId.Value.ToString() : "unset")}, players={state.Players.Count})");
             return false;
         }
+
+        _lastBlockReason = "";
 
         lock (Sync)
         {

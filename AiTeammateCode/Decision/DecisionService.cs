@@ -56,7 +56,8 @@ public class DecisionService
         int maxTokens, float temp,
         List<AiMessage>? history = null,
         CancellationToken ct = default,
-        int? timeoutOverrideMs = null)
+        int? timeoutOverrideMs = null,
+        string? imageDataUrl = null)
     {
         var settings = AiSettingsStore.Current;
         var timeoutMs = Math.Clamp(timeoutOverrideMs ?? settings.DecisionTimeoutMs, 5000, 120000);
@@ -72,7 +73,8 @@ public class DecisionService
             EnableJsonMode = true,       // DeepSeek JSON Output
             TopP = 0.9f,                 // DeepSeek 推荐与低温配合使用
             FrequencyPenalty = 0.1f,     // 轻微抑制重复
-            ConversationHistory = history ?? new List<AiMessage>()
+            ConversationHistory = history ?? new List<AiMessage>(),
+            UserImageDataUrl = imageDataUrl
         }, linkedCts.Token);
     }
 
@@ -85,7 +87,8 @@ public class DecisionService
         int maxTokens, float temp,
         List<AiMessage>? history = null,
         CancellationToken ct = default,
-        int? timeoutOverrideMs = null)
+        int? timeoutOverrideMs = null,
+        string? imageDataUrl = null)
     {
         int maxAttempts = Math.Clamp(AiSettingsStore.Current.NonCombatRetryCount, 0, 5) + 1; // 首次尝试 + 重试次数
         AiResponse? lastResponse = null;
@@ -99,7 +102,8 @@ public class DecisionService
                 MainFile.Logger.Info($"[DecisionService] 非战斗决策重试 ({attempt}/{maxAttempts - 1})");
             }
 
-            lastResponse = await SendDecisionAsync(systemPrompt, userPrompt, maxTokens, temp, history, ct, timeoutOverrideMs);
+            lastResponse = await SendDecisionAsync(
+                systemPrompt, userPrompt, maxTokens, temp, history, ct, timeoutOverrideMs, imageDataUrl);
 
             if (lastResponse.IsSuccess)
                 return lastResponse;
@@ -135,14 +139,18 @@ public class DecisionService
     {
         var history = new List<AiMessage>();
         var prompt = firstPrompt;
+        string? followUpImage = null;
 
         for (var round = 0; ; round++)
         {
+            var imageForThisRequest = followUpImage;
+            followUpImage = null;
+
             var response = retryOnFailure
                 ? await SendNonCombatDecisionWithRetryAsync(systemPrompt, prompt, maxTokens, temp, history, ct,
-                    round > 0 ? toolRoundTimeoutMs : null)
+                    round > 0 ? toolRoundTimeoutMs : null, imageForThisRequest)
                 : await SendDecisionAsync(systemPrompt, prompt, maxTokens, temp, history, ct,
-                    round > 0 ? toolRoundTimeoutMs : null);
+                    round > 0 ? toolRoundTimeoutMs : null, imageForThisRequest);
 
             if (!response.IsSuccess)
                 return response;
@@ -164,13 +172,14 @@ public class DecisionService
             if (SoloRunController.IsActive && AiFlowControl.IsPaused)
                 return response;
 
-            var toolOutput = MainThread.Invoke(() => _tools.Execute(aiPlayer, calls));
-            LogToolCalls(calls, toolOutput);
+            var toolResult = MainThread.Invoke(() => _tools.Execute(aiPlayer, calls));
+            LogToolCalls(calls, toolResult.Text);
 
             history.Add(new AiMessage { Role = "user", Content = prompt });
             history.Add(new AiMessage { Role = "assistant", Content = response.Content });
-            prompt = "工具结果：\n" + toolOutput +
+            prompt = "工具结果：\n" + toolResult.Text +
                      "\n\n请基于上面的工具结果，直接输出最终决策 JSON；不要再次调用工具。";
+            followUpImage = toolResult.ImageDataUrl;
         }
     }
 
@@ -198,7 +207,9 @@ public class DecisionService
 
     /// <summary>Out-of-combat decisions get two tool rounds; 0 disables tools for this call.</summary>
     private static int OutOfCombatToolRounds =>
-        AiSettingsStore.Current.EnableOutOfCombatReadTools ? MaxOutOfCombatToolRounds : 0;
+        AiSettingsStore.Current.EnableOutOfCombatReadTools || AiSettingsStore.Current.EnableScreenshotTool
+            ? MaxOutOfCombatToolRounds
+            : 0;
 
     private const int MaxOutOfCombatToolRounds = 2;
     private const int MaxOutOfCombatToolTimeoutMs = 15000;
@@ -219,7 +230,7 @@ public class DecisionService
     public async Task<DecisionResult> DecideCombatAsync(Player aiPlayer, CancellationToken ct)
     {
         var systemPrompt = BuildSystemPrompt(includeTeamPrinciples: true);
-        var allowTools = AiSettingsStore.Current.EnableReadTools;
+        var allowTools = AiSettingsStore.Current.EnableReadTools || AiSettingsStore.Current.EnableScreenshotTool;
 
         // The prompt reads live combat state and formats card descriptions through the game's
         // localization formatter, which is main-thread-only (shared SmartFormat pools). Build it in a
@@ -353,7 +364,7 @@ public class DecisionService
         sb.AppendLine(context);
         sb.AppendLine(instruction);
 
-        if (AiSettingsStore.Current.EnableOutOfCombatReadTools)
+        if (AiSettingsStore.Current.EnableOutOfCombatReadTools || AiSettingsStore.Current.EnableScreenshotTool)
             AppendToolInstructions(sb, combat: false);
 
         return sb.ToString();
@@ -362,20 +373,23 @@ public class DecisionService
     /// <summary>Advertises the read-only tools and their call format at the end of a prompt.</summary>
     private static void AppendToolInstructions(StringBuilder sb, bool combat)
     {
+        var includeScreenshot = AiSettingsStore.Current.EnableScreenshotTool;
         sb.AppendLine();
         if (combat)
         {
             sb.AppendLine("【只读工具（可选）】如果上面的信息不足，你可以先只返回工具调用，不要返回 actions：");
             sb.AppendLine("{\"thinking\":\"为什么要查\",\"tool_calls\":[{\"name\":\"read_relics\"}]}");
-            sb.AppendLine(AiToolRunner.DescribeCombatTools());
+            sb.AppendLine(AiToolRunner.DescribeCombatTools(includeScreenshot));
             sb.AppendLine("规则：每次决策最多一轮工具调用；系统会把工具结果发回给你，之后必须直接输出最终决策 JSON，不要再次调用工具。抽牌堆顺序无法获得。");
             sb.AppendLine("多人模式下队友行只给出牌堆张数；需要队友的具体牌时传 player（队友名或角色名），例如 {\"pile\":\"draw\",\"player\":\"队友名\"}。");
+            if (includeScreenshot)
+                sb.AppendLine("如果你调用了 screenshot，系统会截取当前游戏画面并把图像附在工具结果之后；请结合画面判断，但不要依赖画面读取抽牌堆顺序。");
         }
         else
         {
             sb.AppendLine("【只读工具（可选）】如果上面的信息不足，你可以先只返回工具调用，不要返回决策字段：");
             sb.AppendLine("{\"thinking\":\"为什么要查\",\"tool_calls\":[{\"name\":\"read_map\"}]}");
-            sb.AppendLine(AiToolRunner.DescribeOutOfCombatTools());
+            sb.AppendLine(AiToolRunner.DescribeOutOfCombatTools(includeScreenshot));
             sb.AppendLine("规则：本决策最多两轮工具调用；收到工具结果后必须直接输出最终决策 JSON，不要再次调用工具。");
         }
     }

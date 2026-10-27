@@ -3,6 +3,7 @@ using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Models;
 using AiTeammate.AiTeammateCode.Cache;
+using AiTeammate.AiTeammateCode.Settings;
 
 namespace AiTeammate.AiTeammateCode.Decision;
 
@@ -14,6 +15,18 @@ public sealed class ToolCall
     public Dictionary<string, string> Args { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     public string Get(string key) => Args.TryGetValue(key, out var value) ? value : "";
+}
+
+/// <summary>
+/// Output of one tool round: text for the model plus an optional image attached to the follow-up
+/// request (only the screenshot tool produces one). 一次工具调用的结果。
+/// </summary>
+public sealed class ToolExecutionResult
+{
+    public string Text { get; init; } = "";
+
+    /// <summary>JPEG data URL of the captured frame, when the model asked for a screenshot.</summary>
+    public string? ImageDataUrl { get; init; }
 }
 
 /// <summary>
@@ -37,17 +50,18 @@ public sealed class AiToolRunner
     }
 
     /// <summary>Tool manifest for combat decision prompts.</summary>
-    public static string DescribeCombatTools() =>
+    public static string DescribeCombatTools(bool includeScreenshot = false) =>
         "- read_pile: args {\"pile\":\"hand|draw|discard|exhaust|deck\", \"detail\":\"brief|full\", \"player\":\"可选，队友名或角色名；省略=自己\"}；返回该玩家该牌堆的全部牌（brief=牌名/费用/类型，full=附带完整描述）。抽牌堆始终不给顺序。\n" +
         "- card_info: args {\"name\":\"卡名\", \"player\":\"可选\"}；返回该卡牌的完整描述（含升级版信息）。\n" +
         "- read_relics: args {\"player\":\"可选\"}；返回该玩家全部遗物、层数/计数器与完整效果。\n" +
         "- read_potions: args {\"player\":\"可选\"}；返回该玩家全部药水与完整效果、槽位占用。\n" +
         "- read_player: args {\"player\":\"可选\"}；返回血量/格挡/能量/辉星/金币/状态/手牌/牌堆张数/药水与遗物数量。\n" +
         "- read_run: args {}；返回幕/层/进阶、所有玩家血量与金币、已访问节点统计、构筑判断。\n" +
+        (includeScreenshot ? DescribeScreenshotTool() + "\n" : "") +
         "多人模式下可直接查看队友，例如 {\"name\":\"read_relics\",\"args\":{\"player\":\"队友名\"}}。";
 
     /// <summary>Tool manifest for out-of-combat decision prompts.</summary>
-    public static string DescribeOutOfCombatTools() =>
+    public static string DescribeOutOfCombatTools(bool includeScreenshot = false) =>
         "- read_map: args {}；返回整幕地图：当前节点、可前往节点、逐行路线与节点类型。\n" +
         "- read_run: args {}；返回幕/层/进阶、所有玩家血量与金币、已访问节点统计、构筑判断。\n" +
         "- read_player: args {\"player\":\"可选\"}；返回血量/金币/状态/手牌/药水与遗物数量。\n" +
@@ -55,18 +69,32 @@ public sealed class AiToolRunner
         "- read_potions: args {\"player\":\"可选\"}；返回全部药水与完整效果。\n" +
         "- read_pile: args {\"pile\":\"deck|hand\", \"detail\":\"brief|full\", \"player\":\"可选\"}；返回主牌组或手牌内容。\n" +
         "- deck_stats: args {\"player\":\"可选\"}；返回牌组统计（类型/稀有度/平均费用/升级数/关键词）。\n" +
-        "- card_info: args {\"name\":\"卡名\", \"player\":\"可选\"}；返回单卡完整描述。";
+        "- card_info: args {\"name\":\"卡名\", \"player\":\"可选\"}；返回单卡完整描述。\n" +
+        (includeScreenshot ? DescribeScreenshotTool() : "");
 
-    /// <summary>Executes the calls and returns text to feed back to the model.</summary>
-    public string Execute(Player aiPlayer, IReadOnlyList<ToolCall> calls)
+    /// <summary>Manifest line for the vision tool; only advertised when the setting is on.</summary>
+    public static string DescribeScreenshotTool() =>
+        "- screenshot: args {}；截取当前游戏画面并以图像形式附在下一条消息里。只有支持图像输入的模型才能使用；如果你的模型不支持视觉，不要调用。";
+
+    /// <summary>Executes the calls and returns text plus an optional screenshot for the model.</summary>
+    public ToolExecutionResult Execute(Player aiPlayer, IReadOnlyList<ToolCall> calls)
     {
         var sb = new StringBuilder();
+        string? imageDataUrl = null;
+
         foreach (var call in calls.Take(MaxCallsPerRequest))
         {
             string output;
             try
             {
-                output = Invoke(aiPlayer, call);
+                if (IsScreenshot(call.Name))
+                {
+                    output = ExecuteScreenshot(ref imageDataUrl);
+                }
+                else
+                {
+                    output = Invoke(aiPlayer, call);
+                }
             }
             catch (Exception ex)
             {
@@ -80,10 +108,29 @@ public sealed class AiToolRunner
         }
 
         var text = sb.ToString().TrimEnd();
-        if (text.Length <= MaxResultChars)
-            return text;
+        if (text.Length > MaxResultChars)
+            text = text[..MaxResultChars] + "\n…（结果过长已截断）";
 
-        return text[..MaxResultChars] + "\n…（结果过长已截断）";
+        return new ToolExecutionResult { Text = text, ImageDataUrl = imageDataUrl };
+    }
+
+    private static bool IsScreenshot(string name) =>
+        name.Trim().ToLowerInvariant() is "screenshot" or "capture_screen" or "see_screen";
+
+    private static string ExecuteScreenshot(ref string? imageDataUrl)
+    {
+        if (!AiSettingsStore.Current.EnableScreenshotTool)
+            return "截图工具未启用：请在设置中打开“允许 AI 查看游戏画面”，并使用支持图像输入的模型。";
+
+        if (imageDataUrl != null)
+            return "本轮已经截取过一张画面，不会重复附加图像；请直接基于已有截图判断。";
+
+        var shot = ScreenshotTool.Capture();
+        if (!shot.IsSuccess)
+            return shot.Error;
+
+        imageDataUrl = shot.DataUrl;
+        return $"已截取当前游戏画面（{shot.Width}×{shot.Height}），图像已附在下一条消息中。";
     }
 
     private string Invoke(Player aiPlayer, ToolCall call)
@@ -160,7 +207,8 @@ public sealed class AiToolRunner
             }
 
             default:
-                return $"未知工具 \"{call.Name}\"。可用: read_pile, card_info, read_relics, read_potions, read_player, read_run, read_map, deck_stats";
+                return $"未知工具 \"{call.Name}\"。可用: read_pile, card_info, read_relics, read_potions, read_player, read_run, read_map, deck_stats"
+                       + (AiSettingsStore.Current.EnableScreenshotTool ? ", screenshot" : "");
         }
     }
 

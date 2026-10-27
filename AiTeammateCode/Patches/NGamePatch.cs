@@ -15,6 +15,7 @@ using MegaCrit.Sts2.Core.Runs;
 using AiTeammate.AiTeammateCode.Solo;
 using AiTeammate.AiTeammateCode.Localization;
 using AiTeammate.AiTeammateCode.Personality;
+using AiTeammate.AiTeammateCode.Live;
 
 namespace AiTeammate.AiTeammateCode.Patches;
 
@@ -97,6 +98,27 @@ public static class NGamePatch
 
         // Locale is finalized by now; refresh built-in personalities when the language changed.
         PersonalityStore.EnsureSeeded();
+
+        // Live-danmaku overlay is independent of the AI-teammate chat panel; it lives on the game
+        // root so it survives every room screen and manages its own visibility from settings.
+        try
+        {
+            LiveDanmakuService.EnsureAttached(__instance);
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"创建直播弹幕服务失败: {ex.Message}");
+        }
+
+        // Solo climb watchdog: rebinds the AI if a loaded save comes up before the bind hooks ran.
+        try
+        {
+            SoloSupervisor.EnsureAttached(__instance);
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"创建单人爬塔看门狗失败: {ex.Message}");
+        }
 
         if (!ShouldShowChatPanel())
         {

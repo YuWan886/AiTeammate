@@ -99,7 +99,7 @@ public class DeepSeekBackend : IAiBackend
                 userPrompt += "\n\n请以 JSON 格式返回结果。";
             }
 
-            messages.Add(new { role = "user", content = userPrompt });
+            messages.Add(BuildUserMessage(userPrompt, request.UserImageDataUrl));
 
             // === JSON Output 模式 ===
             object? responseFormat = null;
@@ -211,6 +211,9 @@ public class DeepSeekBackend : IAiBackend
         return response.IsSuccess;
     }
 
+    public Task<ModelListResult> ListModelsAsync(CancellationToken ct) =>
+        ModelListClient.FetchOpenAiCompatibleAsync(_baseUrl, _apiKey, ct);
+
     // === 辅助方法 ===
 
     /// <summary>
@@ -235,6 +238,20 @@ public class DeepSeekBackend : IAiBackend
     private static bool SupportsThinkingToggle(string model)
     {
         return model.Contains("deepseek", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Builds the final user message; images use the OpenAI-compatible multi-part form.</summary>
+    private static object BuildUserMessage(string text, string? imageDataUrl)
+    {
+        if (string.IsNullOrWhiteSpace(imageDataUrl))
+            return new { role = "user", content = text };
+
+        var parts = new List<object>
+        {
+            new { type = "text", text },
+            new { type = "image_url", image_url = new { url = imageDataUrl } }
+        };
+        return new { role = "user", content = parts };
     }
 
     public void Dispose() => _client.Dispose();
