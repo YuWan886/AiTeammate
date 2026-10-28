@@ -125,7 +125,10 @@ public static class SoloRunController
             return;
 
         var manager = AiTeammateManager.Instance;
-        if (!manager.IsInitialized || (IsBound && manager.IsSoloControlled))
+        if (!manager.TryInitialize())
+            return;
+
+        if (IsBound && manager.IsSoloControlled)
             return;
 
         // Multiplayer teammate runs never hand control to the AI; only singleplayer can be bound.
@@ -186,7 +189,7 @@ public static class SoloRunController
             return;
 
         var manager = AiTeammateManager.Instance;
-        if (!manager.IsInitialized)
+        if (!manager.TryInitialize())
             return;
 
         var run = RunManager.Instance;
@@ -220,7 +223,7 @@ public static class SoloRunController
     /// </summary>
     public static bool TryBind(AiTeammateManager manager)
     {
-        if (!manager.IsInitialized)
+        if (!manager.TryInitialize())
         {
             LogBindBlocked("manager not initialized");
             return false;
@@ -644,6 +647,94 @@ public static class SoloRunController
     // ---- New run ---------------------------------------------------------------------------
 
     public static bool CanStartNewRun => RunManager.Instance?.DebugOnlyGetState() == null;
+
+    public static int MaxAscensionLevel
+    {
+        get
+        {
+            try { return MegaCrit.Sts2.Core.Entities.Ascension.AscensionManager.maxAscensionAllowed; }
+            catch { return 0; }
+        }
+    }
+
+    /// <summary>Character choices for the external agent, without the synthetic "random" entry.</summary>
+    public static IReadOnlyList<(string Id, string Name)> GetCharacterChoices()
+    {
+        var list = new List<(string, string)>();
+        try
+        {
+            foreach (var character in AiTeammateManager.Instance.GetAiCharacterOptions())
+                list.Add((character.Id.Entry, PromptTextHelper.ResolveLocString(character.Title, character.Id.Entry)));
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[Solo] character list failed: {ex.Message}");
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    /// Starts a brand-new singleplayer run for the external agent. Solo climb is forced off so the
+    /// built-in driver never competes with dsh for the same player.
+    /// </summary>
+    public static (bool Ok, string Message) StartAgentRun(string characterId, int ascensionLevel, string? seed)
+    {
+        var game = NGame.Instance;
+        if (game == null)
+            return (false, "The game isn't ready yet.");
+        if (!CanStartNewRun)
+            return (false, "A run is already in progress; finish or abandon it first.");
+
+        try
+        {
+            var manager = AiTeammateManager.Instance;
+            if (!manager.IsInitialized)
+                manager.Initialize();
+
+            var choices = manager.GetAiCharacterOptions();
+            CharacterModel? character = null;
+            if (!string.IsNullOrWhiteSpace(characterId))
+            {
+                character = choices.FirstOrDefault(c =>
+                                string.Equals(c.Id.Entry, characterId, StringComparison.OrdinalIgnoreCase))
+                            ?? choices.FirstOrDefault(c =>
+                                c.Id.Entry.Contains(characterId, StringComparison.OrdinalIgnoreCase));
+            }
+
+            character ??= choices.Count == 0 ? null : choices[System.Random.Shared.Next(choices.Count)];
+            if (character == null)
+                return (false, "No available character was found.");
+
+            var ascension = Math.Clamp(ascensionLevel, 0, MaxAscensionLevel);
+            seed = string.IsNullOrWhiteSpace(seed)
+                ? Guid.NewGuid().ToString("N")[..10]
+                : seed.Trim();
+
+            var unlockState = SaveManager.Instance.GenerateUnlockStateFromProgress();
+            var rng = new Rng((uint)StringHelper.GetDeterministicHashCode(seed), "act_selection");
+            var acts = ActModel.GetRandomList(rng, unlockState, isMultiplayer: false).ToList();
+            if (acts.Count == 0)
+                return (false, "No acts are available.");
+
+            if (AiSettingsStore.Current.EnableSoloClimb)
+            {
+                AiSettingsStore.Current.EnableSoloClimb = false;
+                AiSettingsStore.Save();
+            }
+
+            var characterName = PromptTextHelper.ResolveLocString(character.Title, character.Id.Entry);
+            MainFile.Logger.Info($"[Agent] starting run for dsh: char={character.Id.Entry} seed={seed} " +
+                                 $"acts={acts.Count} ascension={ascension}");
+            _ = RunAndLogAsync(game, character, seed, acts, unlockState, ascension);
+            return (true, $"Starting a run with {characterName} (ascension {ascension}, seed {seed}).");
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Error($"[Agent] start run failed: {ex}");
+            return (false, "Failed to start: " + ex.Message);
+        }
+    }
 
     /// <summary>Starts a brand-new singleplayer run that the AI will immediately take over.</summary>
     public static Task<(bool Ok, string Message)> StartNewSoloRunAsync()

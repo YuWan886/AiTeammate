@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Multiplayer;
@@ -6,6 +6,7 @@ using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Characters;
 using MegaCrit.Sts2.Core.Multiplayer.Game.Lobby;
+using AiTeammate.AiTeammateCode.Agent;
 using AiTeammate.AiTeammateCode.Backend;
 using AiTeammate.AiTeammateCode.Cache;
 using AiTeammate.AiTeammateCode.Compat;
@@ -61,6 +62,11 @@ public class AiTeammateManager
 
     public void Initialize()
     {
+        // Idempotent: the bootstrap, NGame._Ready (other game versions) and the settings page can all
+        // reach this during startup; re-running it would throw away chat history and the AI binding.
+        if (IsInitialized)
+            return;
+
         // Backend instances are rebuilt on demand from the live RitsuLib settings.
         BackendManager = new BackendManager();
         BackendManager.SyncFromSettings();
@@ -113,6 +119,27 @@ public class AiTeammateManager
         {
             MainFile.Logger.Warn($"[HextechRunes] 集成初始化失败: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Initializes once and never throws, so a caller can retry later instead of leaving the mod dead.
+    /// 安全初始化：失败时不抛异常，允许之后重试。
+    /// </summary>
+    public bool TryInitialize()
+    {
+        if (IsInitialized)
+            return true;
+
+        try
+        {
+            Initialize();
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[Init] AI 队友运行时初始化失败，稍后重试: {ex.Message}");
+        }
+
+        return IsInitialized;
     }
 
     public void OnAiPlayerJoined(Player aiPlayer)
@@ -440,11 +467,12 @@ public class AiTeammateManager
         {
             ct.ThrowIfCancellationRequested();
 
-            // === Hard safety timeout: 45s for entire turn processing ===
-            // This is a last-resort safety net. The LLM call has its own 15s timeout,
-            // card execution should take <5s. 45s gives ample headroom but prevents
-            // permanent deadlocks from network or game-state hangs.
-            using var hardTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+            // === Hard safety timeout for the entire turn processing ===
+            // Without an external brain this is a last-resort deadlock net: the LLM call has its own
+            // timeout and card execution takes <5s. When dsh is driving the AI, a turn legitimately
+            // takes minutes (the agent has to read the prompt and answer), so the net widens.
+            using var hardTimeoutCts = new CancellationTokenSource(
+                TimeSpan.FromSeconds(AgentDecisionBroker.Enabled ? 330 : 45));
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, hardTimeoutCts.Token);
             var effectiveCt = linkedCts.Token;
 

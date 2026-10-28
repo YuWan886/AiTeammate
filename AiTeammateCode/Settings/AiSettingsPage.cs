@@ -3,6 +3,7 @@ using STS2RitsuLib;
 using STS2RitsuLib.Settings;
 using STS2RitsuLib.Ui.Toast;
 using STS2RitsuLib.Utils.Persistence;
+using AiTeammate.AiTeammateCode.Agent;
 using AiTeammate.AiTeammateCode.Backend;
 using AiTeammate.AiTeammateCode.Cache;
 using AiTeammate.AiTeammateCode.Compat;
@@ -162,6 +163,17 @@ public static class AiSettingsPage
         B(s => s.SoloCharacterId, (s, v) => s.SoloCharacterId = v);
     private static readonly ModSettingsValueBinding<AiSettings, int> SoloAscension =
         B(s => s.SoloAscensionLevel, (s, v) => s.SoloAscensionLevel = v);
+
+    // ---- External agent bridge (dsh) ----
+
+    private static readonly ModSettingsValueBinding<AiSettings, bool> EnableAgentBridge =
+        B(s => s.EnableAgentBridge, (s, v) => s.EnableAgentBridge = v);
+    private static readonly ModSettingsValueBinding<AiSettings, int> AgentBridgePort =
+        B(s => s.AgentBridgePort, (s, v) => s.AgentBridgePort = v);
+    private static readonly ModSettingsValueBinding<AiSettings, string> AgentBridgeToken =
+        B(s => s.AgentBridgeToken, (s, v) => s.AgentBridgeToken = v);
+    private static readonly ModSettingsValueBinding<AiSettings, bool> AgentBridgeAllowActions =
+        B(s => s.AgentBridgeAllowActions, (s, v) => s.AgentBridgeAllowActions = v);
 
     private static readonly ModSettingsValueBinding<AiSettings, bool> AutoRefreshCache =
         B(s => s.AutoRefreshCache, (s, v) => s.AutoRefreshCache = v);
@@ -465,6 +477,32 @@ public static class AiSettingsPage
                     ModSettingsButtonTone.Normal,
                     S("settings.solo.pause.desc", "Pause or resume the AI's automation now (also available from the chat panel)."))
             )
+            .AddSection("agent", section => section
+                .WithTitle(S("settings.section.agent", "External Agent (dsh)"))
+                .AddToggle("agent_bridge", S("settings.agent.enabled", "Enable external agent bridge"), EnableAgentBridge,
+                    description: S("settings.agent.enabled.desc",
+                        "Opens a localhost-only port that the dsh plugin connects to. The external agent can read the game and, if allowed below, play it."))
+                .AddIntSlider("agent_port", S("settings.agent.port", "Bridge port"), AgentBridgePort,
+                    1024, 65535, 1,
+                    description: S("settings.agent.port.desc",
+                        "Must match the port in the dsh plugin config (default 26333)."))
+                .AddString("agent_token", S("settings.agent.token", "Access token"), AgentBridgeToken,
+                    description: S("settings.agent.token.desc",
+                        "Optional. When set, the dsh plugin must send the same token. Leave empty to allow any local process."))
+                .AddToggle("agent_actions", S("settings.agent.actions", "Allow the external agent to play"), AgentBridgeAllowActions,
+                    description: S("settings.agent.actions.desc",
+                        "Turn off to expose read-only tools. Actions are singleplayer-only and are refused while \"AI climbs alone\" is active."))
+                .AddParagraph("agent_status", ModSettingsText.Dynamic(DescribeAgentBridgeStatus))
+                .AddButton("agent_restart", S("settings.agent.restart.label", "Bridge"),
+                    S("settings.agent.restart.button", "Restart"), RestartAgentBridge,
+                    ModSettingsButtonTone.Normal,
+                    S("settings.agent.restart.desc", "Apply the port/token changes immediately and rebind the bridge."))
+                .AddButton("agent_copy", S("settings.agent.copy.label", "dsh plugin"),
+                    S("settings.agent.copy.button", "Copy install command"), CopyAgentInstallCommand,
+                    ModSettingsButtonTone.Accent,
+                    S("settings.agent.copy.desc",
+                        "Copies the command that installs the bundled dsh plugin into your web profile."))
+            )
             .AddSection("maintenance", section => section
                 .WithTitle(S("settings.section.maintenance", "Maintenance"))
                 .AddToggle("auto_cache", S("settings.maintenance.auto_cache", "Auto-refresh content cache"), AutoRefreshCache,
@@ -487,6 +525,66 @@ public static class AiSettingsPage
 
     private static bool IsBackend(string name) =>
         string.Equals(AiSettingsStore.Current.ActiveBackend, name, StringComparison.Ordinal);
+
+    // ---- External agent bridge ------------------------------------------------
+
+    private static string DescribeAgentBridgeStatus()
+    {
+        try
+        {
+            if (!AiSettingsStore.Current.EnableAgentBridge)
+                return AiLoc.T("settings.agent.status.off", "Off.");
+
+            if (AgentBridgeService.IsRunning)
+            {
+                var port = AgentBridgeService.Port.ToString();
+                var clients = AgentBridgeService.ConnectedClients;
+                return clients > 0
+                    ? AiLoc.T("settings.agent.status.connected",
+                        "Running on 127.0.0.1:{Port} — {Count} dsh client(s) connected.",
+                        ("Port", port), ("Count", clients.ToString()))
+                    : AiLoc.T("settings.agent.status.running",
+                        "Running on 127.0.0.1:{Port} — no dsh client connected yet.", ("Port", port));
+            }
+
+            var error = AgentBridgeService.LastError;
+            return string.IsNullOrWhiteSpace(error)
+                ? AiLoc.T("settings.agent.status.starting", "Starting…")
+                : AiLoc.T("settings.agent.status.error", "Not running: {Message}", ("Message", error));
+        }
+        catch (Exception ex)
+        {
+            return ex.Message;
+        }
+    }
+
+    private static void RestartAgentBridge(IModSettingsUiActionHost host)
+    {
+        try
+        {
+            AgentBridgeService.Restart();
+            RitsuToastService.ShowInfo(DescribeAgentBridgeStatus());
+        }
+        catch (Exception ex)
+        {
+            RitsuToastService.ShowError(ex.Message);
+        }
+    }
+
+    private static void CopyAgentInstallCommand(IModSettingsUiActionHost host)
+    {
+        try
+        {
+            const string command = "dsh plugin --profile web add -w dsh-sts2";
+            DisplayServer.ClipboardSet(command);
+            RitsuToastService.ShowInfo(AiLoc.T("toast.agent_command_copied",
+                "Install command copied to the clipboard."));
+        }
+        catch (Exception ex)
+        {
+            RitsuToastService.ShowError(ex.Message);
+        }
+    }
 
     private static IReadOnlyList<ModSettingsChoiceOption<string>> BuildPersonalityOptions()
     {

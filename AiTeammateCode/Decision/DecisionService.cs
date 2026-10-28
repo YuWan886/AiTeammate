@@ -2,6 +2,7 @@ using System.Text;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Models;
 using AiTeammate.AiTeammateCode;
+using AiTeammate.AiTeammateCode.Agent;
 using AiTeammate.AiTeammateCode.Backend;
 using AiTeammate.AiTeammateCode.Cache;
 using AiTeammate.AiTeammateCode.Compat;
@@ -135,8 +136,18 @@ public class DecisionService
         int toolRoundTimeoutMs,
         Func<System.Text.Json.JsonElement, bool> hasAnswer,
         bool retryOnFailure,
-        CancellationToken ct)
+        CancellationToken ct,
+        string kind = "decision")
     {
+        // dsh takeover: an attached external agent answers this decision instead of the LLM backend.
+        // The parked call resumes as soon as sts2_decide arrives, or falls back on timeout/disconnect.
+        if (AgentDecisionBroker.Enabled)
+        {
+            var external = await AgentDecisionBroker.RequestAsync(aiPlayer, kind, systemPrompt, firstPrompt, ct);
+            if (!string.IsNullOrWhiteSpace(external))
+                return new AiResponse { Content = external, IsSuccess = true };
+        }
+
         var history = new List<AiMessage>();
         var prompt = firstPrompt;
         string? followUpImage = null;
@@ -247,7 +258,8 @@ public class DecisionService
         var toolTimeoutMs = Math.Min(AiSettingsStore.Current.DecisionTimeoutMs, MaxToolRoundTimeoutMs);
 
         var response = await RequestWithToolsAsync(aiPlayer, systemPrompt, firstPrompt, 1024, 0.3f,
-            allowTools ? MaxToolRounds : 0, toolTimeoutMs, HasCombatActions, retryOnFailure: false, ct);
+            allowTools ? MaxToolRounds : 0, toolTimeoutMs, HasCombatActions, retryOnFailure: false, ct,
+            kind: "combat");
 
         if (!response.IsSuccess)
             return DecisionResult.Fallback();
@@ -404,7 +416,8 @@ public class DecisionService
         var userPrompt = BuildTaskPrompt(aiPlayer, context, "请以 JSON 格式返回选牌决策：{\"choice\":0~2选一张, \"reason\":\"理由\"} 或 {\"choice\":-1, \"reason\":\"跳过理由\"}");
 
         var response = await RequestWithToolsAsync(aiPlayer, systemPrompt, userPrompt, 256, 0.4f,
-            OutOfCombatToolRounds, MaxOutOfCombatToolTimeoutMs, HasChoiceKey, retryOnFailure: true, ct);
+            OutOfCombatToolRounds, MaxOutOfCombatToolTimeoutMs, HasChoiceKey, retryOnFailure: true, ct,
+            kind: "card_reward");
 
         if (!response.IsSuccess) return (0, "AI不可用，默认选第一张");
 
@@ -446,7 +459,8 @@ public class DecisionService
             "请以 JSON 格式返回选路决策：{\"choice\": 目标索引, \"reason\": \"简短理由\"}");
 
         var response = await RequestWithToolsAsync(aiPlayer, systemPrompt, userPrompt, 256, 0.4f,
-            OutOfCombatToolRounds, MaxOutOfCombatToolTimeoutMs, HasChoiceKey, retryOnFailure: true, ct);
+            OutOfCombatToolRounds, MaxOutOfCombatToolTimeoutMs, HasChoiceKey, retryOnFailure: true, ct,
+            kind: "map");
         if (!response.IsSuccess)
             return (-1, "AI不可用");
 
@@ -483,7 +497,8 @@ public class DecisionService
 
         var response = await RequestWithToolsAsync(aiPlayer, systemPrompt,
             BuildTaskPrompt(aiPlayer, context, instruction.ToString().TrimEnd()), 256, 0.3f,
-            OutOfCombatToolRounds, MaxOutOfCombatToolTimeoutMs, HasChoiceKey, retryOnFailure: true, ct);
+            OutOfCombatToolRounds, MaxOutOfCombatToolTimeoutMs, HasChoiceKey, retryOnFailure: true, ct,
+            kind: "rest");
 
         int healIdx = optionIds.IndexOf("HEAL");
         int smithIdx = optionIds.IndexOf("SMITH");
@@ -608,7 +623,8 @@ public class DecisionService
 
         var response = await RequestWithToolsAsync(aiPlayer, systemPrompt,
             BuildTaskPrompt(aiPlayer, context, instruction), 384, 0.3f,
-            OutOfCombatToolRounds, MaxOutOfCombatToolTimeoutMs, HasChoicesKey, retryOnFailure: true, ct);
+            OutOfCombatToolRounds, MaxOutOfCombatToolTimeoutMs, HasChoicesKey, retryOnFailure: true, ct,
+            kind: "shop");
 
         if (!response.IsSuccess) return (new List<int>(), "AI不可用，跳过购物");
 
@@ -667,7 +683,8 @@ public class DecisionService
             MaxOutOfCombatToolTimeoutMs,
             HasIndicesKey,
             retryOnFailure: true,
-            ct);
+            ct,
+            kind: "card_selection");
 
         if (!response.IsSuccess)
             return (new List<int>(), "AI不可用");
@@ -779,7 +796,8 @@ public class DecisionService
             MaxOutOfCombatToolTimeoutMs,
             HasChoiceKey,
             retryOnFailure: true,
-            ct);
+            ct,
+            kind: "event");
 
         if (!response.IsSuccess) return (0, "AI不可用，默认选第一个");
 
@@ -834,7 +852,8 @@ public class DecisionService
             MaxOutOfCombatToolTimeoutMs,
             HasChoiceKey,
             retryOnFailure: true,
-            ct);
+            ct,
+            kind: "hextech_rune");
 
         if (!response.IsSuccess)
             return (HextechRunesDecisionHandler.PickHeuristicFallback(aiPlayer, options), null, "AI不可用，使用启发式选择");

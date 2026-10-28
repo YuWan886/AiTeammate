@@ -12,6 +12,7 @@ using MegaCrit.Sts2.Core.Nodes.Rooms;
 using MegaCrit.Sts2.Core.Nodes.Vfx;
 using MegaCrit.Sts2.Core.Nodes.Vfx.Utilities;
 using MegaCrit.Sts2.Core.Runs;
+using AiTeammate.AiTeammateCode.Agent;
 using AiTeammate.AiTeammateCode.Solo;
 using AiTeammate.AiTeammateCode.Localization;
 using AiTeammate.AiTeammateCode.Personality;
@@ -36,6 +37,9 @@ public static class NGamePatch
     private static ScrollContainer? _scrollContainer;
     private static Button? _minimizedButton;
     private static Button? _pauseButton;
+    private static PanelContainer? _agentBadge;
+    private static int _lastAgentClients;
+    private static bool _agentBridgeEventsHooked;
     private static bool _chatMinimized;
     private static Action<ChatMessage>? _currentHandler;
     private static readonly DragState _panelDragState = new();
@@ -64,6 +68,12 @@ public static class NGamePatch
         if (!manager.IsInitialized)
             return false;
 
+        // A connected dsh agent drives the game like a teammate would, and the title bar has to be
+        // on screen for its badge to mean anything — including in a plain singleplayer run.
+        // 外部 Agent 接管时同样显示聊天面板（标题栏要能看到 dsh 标记）。
+        if (AgentBridgeService.ConnectedClients > 0)
+            return true;
+
         // Solo climb: the local player is AI-controlled, so the chat panel is the only way to talk.
         SoloRunController.TryBind(manager);
         if (manager.IsSoloControlled)
@@ -89,15 +99,30 @@ public static class NGamePatch
         Compat.MainThread.Capture();
 
         var manager = AiTeammateManager.Instance;
-        if (!manager.IsInitialized)
-            manager.Initialize();
+        if (!manager.TryInitialize())
+            return;
 
         // The content cache needs ModelDb, which only exists once the game is ready (an early
-        // Initialize from the settings page cannot build it).
-        manager.CacheService?.EnsureLoaded();
+        // Initialize from the settings page cannot build it). A failure here must not stop the
+        // supervisors below: without them a loaded save never gets the AI back.
+        try
+        {
+            manager.CacheService?.EnsureLoaded();
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"内容缓存构建失败（稍后重试）: {ex.Message}");
+        }
 
         // Locale is finalized by now; refresh built-in personalities when the language changed.
-        PersonalityStore.EnsureSeeded();
+        try
+        {
+            PersonalityStore.EnsureSeeded();
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"人格数据载入失败: {ex.Message}");
+        }
 
         // Live-danmaku overlay is independent of the AI-teammate chat panel; it lives on the game
         // root so it survives every room screen and manages its own visibility from settings.
@@ -120,7 +145,38 @@ public static class NGamePatch
             MainFile.Logger.Warn($"创建单人爬塔看门狗失败: {ex.Message}");
         }
 
-        if (!ShouldShowChatPanel())
+        // External agent bridge (dsh): applies the enable/port/token settings once per second.
+        try
+        {
+            AgentBridgeService.EnsureAttached(__instance);
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"创建外部 Agent 桥接失败: {ex.Message}");
+        }
+
+        // dsh attaching/leaving changes both the badge and whether the panel belongs on screen.
+        _lastAgentClients = AgentBridgeService.ConnectedClients;
+        if (!_agentBridgeEventsHooked)
+        {
+            AgentBridgeService.ClientCountChanged += OnAgentClientCountChanged;
+            _agentBridgeEventsHooked = true;
+        }
+
+        // Early in startup the run state may still be half-built; the panel state must never make the
+        // whole ready-time init (and the supervisors above it) fail.
+        bool showPanel;
+        try
+        {
+            showPanel = ShouldShowChatPanel();
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"聊天面板状态判断失败: {ex.Message}");
+            showPanel = false;
+        }
+
+        if (!showPanel)
         {
             if (_chatRoot != null && GodotObject.IsInstanceValid(_chatRoot))
                 _chatRoot.Visible = false;
@@ -207,11 +263,50 @@ public static class NGamePatch
         dragStyleBox.CornerRadiusTopRight = 4;
         dragArea.AddThemeStyleboxOverride("panel", dragStyleBox);
 
+        var titleRow = new HBoxContainer();
+        titleRow.SetAnchorsAndOffsetsPreset(Control.LayoutPreset.FullRect);
+        titleRow.AddThemeConstantOverride("separation", 6);
+        // Pass (not Stop) keeps the whole title bar draggable — the drag handler lives on dragArea.
+        titleRow.MouseFilter = Control.MouseFilterEnum.Pass;
+
         var titleLabel = new Label();
         titleLabel.Text = AiLoc.T("chat.title", "AI Teammate");
         titleLabel.HorizontalAlignment = HorizontalAlignment.Left;
         titleLabel.AddThemeColorOverride("font_color", new Color(0.7f, 1f, 0.7f));
-        dragArea.AddChild(titleLabel);
+        titleRow.AddChild(titleLabel);
+
+        // "dsh" badge: shown only while an external dsh client is attached, so the human can tell at
+        // a glance who is driving. Muted when the bridge is read-only. 外部 Agent 接管的标题栏标记。
+        var agentBadge = new PanelContainer
+        {
+            Visible = false,
+            MouseFilter = Control.MouseFilterEnum.Pass,
+            SizeFlagsVertical = Control.SizeFlags.ShrinkCenter,
+            SizeFlagsHorizontal = Control.SizeFlags.ShrinkBegin,
+        };
+        var badgeStyle = new StyleBoxFlat { BgColor = new Color(0.15f, 0.45f, 0.75f, 0.95f) };
+        badgeStyle.CornerRadiusTopLeft = 4;
+        badgeStyle.CornerRadiusTopRight = 4;
+        badgeStyle.CornerRadiusBottomLeft = 4;
+        badgeStyle.CornerRadiusBottomRight = 4;
+        badgeStyle.ContentMarginLeft = 5;
+        badgeStyle.ContentMarginRight = 5;
+        badgeStyle.ContentMarginTop = 0;
+        badgeStyle.ContentMarginBottom = 0;
+        agentBadge.AddThemeStyleboxOverride("panel", badgeStyle);
+
+        var agentBadgeLabel = new Label
+        {
+            Text = AiLoc.T("chat.agent_badge", "dsh"),
+            MouseFilter = Control.MouseFilterEnum.Ignore,
+        };
+        agentBadgeLabel.AddThemeColorOverride("font_color", new Color(0.85f, 0.95f, 1f));
+        agentBadgeLabel.AddThemeFontSizeOverride("font_size", 11);
+        agentBadge.AddChild(agentBadgeLabel);
+        titleRow.AddChild(agentBadge);
+        _agentBadge = agentBadge;
+
+        dragArea.AddChild(titleRow);
         WireDrag(dragArea, _chatRoot, _panelDragState);
 
         titleBar.AddChild(dragArea);
@@ -293,6 +388,7 @@ public static class NGamePatch
         _inputField.TextSubmitted += OnSend;
 
         UpdateSoloChatControls();
+        UpdateAgentBadge();
     }
 
     /// <summary>Hides the chat panel (solo mode released / run over). 隐藏聊天面板。</summary>
@@ -326,6 +422,81 @@ public static class NGamePatch
             _inputField.PlaceholderText = solo
                 ? AiLoc.T("chat.placeholder.solo", "Talk to the AI (this interrupts it)...")
                 : AiLoc.T("chat.placeholder", "Type a message...");
+    }
+
+    /// <summary>Follows dsh attaching/leaving: re-decides panel visibility and the title badge.</summary>
+    private static void OnAgentClientCountChanged(int clients)
+    {
+        var changed = clients != _lastAgentClients;
+        _lastAgentClients = clients;
+
+        var game = NGame.Instance;
+        if (game == null || !GodotObject.IsInstanceValid(game))
+            return;
+
+        if (changed)
+        {
+            try
+            {
+                RefreshChatUi();
+            }
+            catch (Exception ex)
+            {
+                MainFile.Logger.Warn($"刷新 dsh 接管状态失败: {ex.Message}");
+            }
+        }
+
+        UpdateAgentBadge();
+    }
+
+    /// <summary>
+    /// Marks the chat title bar while an external dsh client is attached — bright when it may act,
+    /// muted when the bridge is read-only. 外部 Agent 接管时在标题栏标记 dsh。
+    /// </summary>
+    public static void UpdateAgentBadge()
+    {
+        int clients;
+        bool allowActions;
+        try
+        {
+            clients = AgentBridgeService.ConnectedClients;
+            allowActions = AgentBridgeService.AllowActions;
+        }
+        catch
+        {
+            return;
+        }
+
+        var connected = clients > 0;
+        var title = AiLoc.T("chat.title", "AI Teammate");
+
+        if (_minimizedButton != null && GodotObject.IsInstanceValid(_minimizedButton))
+            _minimizedButton.Text = connected ? $"{title} · dsh" : title;
+
+        if (_agentBadge == null || !GodotObject.IsInstanceValid(_agentBadge))
+            return;
+
+        _agentBadge.Visible = connected;
+        if (!connected)
+        {
+            _agentBadge.TooltipText = string.Empty;
+            return;
+        }
+
+        _agentBadge.TooltipText = allowActions
+            ? AiLoc.T("chat.agent_badge.tooltip.control",
+                "dsh is playing this run ({Count} client(s))", ("Count", clients.ToString()))
+            : AiLoc.T("chat.agent_badge.tooltip.readonly",
+                "dsh is connected read-only ({Count} client(s))", ("Count", clients.ToString()));
+
+        if (_agentBadge.GetThemeStylebox("panel") is StyleBoxFlat style)
+            style.BgColor = allowActions
+                ? new Color(0.15f, 0.45f, 0.75f, 0.95f)
+                : new Color(0.32f, 0.35f, 0.4f, 0.95f);
+
+        if (_agentBadge.GetChildOrNull<Label>(0) is { } badgeLabel)
+            badgeLabel.AddThemeColorOverride("font_color",
+                allowActions ? new Color(0.85f, 0.95f, 1f) : new Color(0.78f, 0.82f, 0.86f));
     }
 
     private static void WireDrag(Control handle, Control target, DragState state)

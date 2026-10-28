@@ -196,7 +196,7 @@ public sealed class AiToolRunner
                 return _context.DescribeRun(aiPlayer);
 
             case "read_map":
-                return _context.DescribeMap(aiPlayer);
+                return ContextBuilder.DescribeMap(aiPlayer);
 
             case "deck_stats":
             case "read_deck_stats":

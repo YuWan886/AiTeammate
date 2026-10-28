@@ -330,12 +330,7 @@ public partial class DanmakuOverlay : Control
                 }
 
                 var image = new Image();
-                var error = image.LoadJpgFromBuffer(bytes);
-                if (error != Error.Ok)
-                    error = image.LoadPngFromBuffer(bytes);
-                if (error != Error.Ok)
-                    error = image.LoadWebpFromBuffer(bytes);
-                if (error != Error.Ok)
+                if (!TryLoadImage(image, bytes))
                     return;
 
                 var side = (int)Math.Max(16f, requestedSize * 2f);
@@ -350,5 +345,28 @@ public partial class DanmakuOverlay : Control
                     target.Texture = texture;
             });
         });
+    }
+
+    /// <summary>
+    /// Decodes avatar bytes by sniffing the container first. Bilibili's avatar CDN sometimes answers
+    /// with an HTML/JSON body (hotlink protection), and every blind decode attempt makes Godot print
+    /// an engine-level <c>ERROR: Condition "err" is true</c> block per danmaku, which floods the log.
+    /// </summary>
+    private static bool TryLoadImage(Image image, byte[] bytes)
+    {
+        if (bytes.Length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
+            return image.LoadJpgFromBuffer(bytes) == Error.Ok;
+
+        if (bytes.Length >= 8
+            && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47
+            && bytes[4] == 0x0D && bytes[5] == 0x0A && bytes[6] == 0x1A && bytes[7] == 0x0A)
+            return image.LoadPngFromBuffer(bytes) == Error.Ok;
+
+        if (bytes.Length >= 12
+            && bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46 // RIFF
+            && bytes[8] == 0x57 && bytes[9] == 0x45 && bytes[10] == 0x42 && bytes[11] == 0x50) // WEBP
+            return image.LoadWebpFromBuffer(bytes) == Error.Ok;
+
+        return false;
     }
 }

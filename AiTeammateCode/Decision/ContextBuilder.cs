@@ -1,4 +1,4 @@
-﻿using System.Text;
+using System.Text;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Creatures;
@@ -413,7 +413,7 @@ public class ContextBuilder
         return string.IsNullOrEmpty(desc) ? $"{name}{amountStr}" : $"{name}:{desc}{amountStr}";
     }
 
-    private static string FormatIntentCompact(MoveState move)
+    internal static string FormatIntentCompact(MoveState move)
     {
         var parts = new List<string>();
         var atkIntents = move.Intents.OfType<AttackIntent>().ToList();
@@ -839,8 +839,11 @@ public class ContextBuilder
         return sb.ToString().TrimEnd();
     }
 
-    /// <summary>Whole act map: current node, reachable nodes and the row-by-row edge graph.</summary>
-    public string DescribeMap(Player aiPlayer)
+    /// <summary>
+    /// Whole act map: current node, reachable nodes and the row-by-row edge graph. Static and
+    /// stateless so the dsh bridge can reuse the exact same view for its map phase.
+    /// </summary>
+    public static string DescribeMap(Player aiPlayer)
     {
         var runState = aiPlayer.RunState;
         if (runState?.Map == null)

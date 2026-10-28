@@ -1,4 +1,4 @@
-﻿using MegaCrit.Sts2.Core.AutoSlay.Helpers;
+using MegaCrit.Sts2.Core.AutoSlay.Helpers;
 using MegaCrit.Sts2.Core.Commands;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Context;
@@ -406,7 +406,7 @@ public static class RunReadySoloBindPatch
     public static void AfterReady()
     {
         var manager = AiTeammateManager.Instance;
-        if (!manager.IsInitialized) return;
+        if (!manager.TryInitialize()) return;
 
         if (!SoloRunController.TryBind(manager))
             SoloRunController.RequestBindRetry("NRun._Ready");
@@ -1670,7 +1670,7 @@ public static class LoadRunPatch
     public static void AfterLoadRun()
     {
         var manager = AiTeammateManager.Instance;
-        if (!manager.IsInitialized) return;
+        if (!manager.TryInitialize()) return;
         manager.DetectAndBindAiPlayer();
         if (manager.AiPlayer != null)
             MainFile.Logger.Info($"AI player re-detected after save load: {manager.AiPlayer.Character?.Id.Entry}");

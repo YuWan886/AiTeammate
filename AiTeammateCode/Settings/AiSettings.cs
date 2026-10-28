@@ -134,6 +134,20 @@ public sealed class AiSettings
     /// <summary>Ascension level for a new AI solo climb; 0 = no ascension. 单人爬塔的进阶难度。</summary>
     public int SoloAscensionLevel { get; set; }
 
+    // ---- External agent bridge (dsh) ----
+
+    /// <summary>Starts the local TCP bridge an external dsh plugin connects to. 启动外部 Agent 桥接。</summary>
+    public bool EnableAgentBridge { get; set; }
+
+    /// <summary>Loopback port the dsh plugin connects to. 外部 Agent 桥接端口。</summary>
+    public int AgentBridgePort { get; set; } = 26333;
+
+    /// <summary>Optional request token; empty means any local process may connect. 可选的请求 token。</summary>
+    public string AgentBridgeToken { get; set; } = "";
+
+    /// <summary>Allows the external agent to perform actions (not just read state). 允许外部 Agent 执行动作。</summary>
+    public bool AgentBridgeAllowActions { get; set; } = true;
+
     // ---- Maintenance ----
 
     public bool AutoRefreshCache { get; set; } = true;
@@ -198,6 +212,11 @@ public sealed class AiSettings
         EnableSoloClimb = defaults.EnableSoloClimb;
         SoloCharacterId = defaults.SoloCharacterId;
         SoloAscensionLevel = defaults.SoloAscensionLevel;
+
+        EnableAgentBridge = defaults.EnableAgentBridge;
+        AgentBridgePort = defaults.AgentBridgePort;
+        AgentBridgeToken = defaults.AgentBridgeToken;
+        AgentBridgeAllowActions = defaults.AgentBridgeAllowActions;
 
         AutoRefreshCache = defaults.AutoRefreshCache;
         EnableDecisionLog = defaults.EnableDecisionLog;

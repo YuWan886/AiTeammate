@@ -2,6 +2,7 @@ using HarmonyLib;
 using MegaCrit.Sts2.Core.Logging;
 using MegaCrit.Sts2.Core.Modding;
 using STS2RitsuLib;
+using AiTeammate.AiTeammateCode.Bootstrap;
 using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Personality;
 using AiTeammate.AiTeammateCode.Settings;
@@ -23,6 +24,10 @@ public static class MainFile
     {
         InitializeSettings();
         InstallPatches();
+
+        // The mod is loaded after NGame._Ready has already run, so the runtime stack cannot wait for
+        // that patch: the bootstrap polls for a usable game root and initializes it itself.
+        ModBootstrap.Start();
     }
 
     private static void InitializeSettings()
