@@ -9,6 +9,7 @@ using AiTeammate.AiTeammateCode.Localization;
 using AiTeammate.AiTeammateCode.Personality;
 using AiTeammate.AiTeammateCode.Settings;
 using Godot;
+using STS2RitsuLib.Ui.Toast;
 
 namespace AiTeammate.AiTeammateCode.Live;
 
@@ -22,6 +23,9 @@ public sealed partial class LiveDanmakuService : Node
 {
     private const double ReconnectDelaySeconds = 5;
     private const double SettingsPollSeconds = 0.5;
+
+    // 断线重连会反复“进入直播间”，这段时间内只弹一次连接提示。
+    private const double ConnectedToastCooldownSeconds = 30;
 
     // getDanmuInfo 是风控最敏感的接口：socket 重连时优先复用上一次握手结果，避免每次断开都
     // 重新打一轮 room_init + nav + getDanmuInfo。
@@ -42,6 +46,7 @@ public sealed partial class LiveDanmakuService : Node
     private double _settingsTimer = SettingsPollSeconds;
     private double _reconnectAt = -1;
     private double _retryDelay = ReconnectDelaySeconds;
+    private double _lastConnectedToastAt = double.NegativeInfinity;
     private bool _visible;
 
     private long _realRoomId;
@@ -365,6 +370,7 @@ public sealed partial class LiveDanmakuService : Node
         client.MessageReceived += OnDanmakuReceived;
         client.StatusChanged += OnClientStatus;
         client.Disconnected += OnClientDisconnected;
+        client.RoomEntered += OnRoomEntered;
         _client = client;
         client.Connect(host.Host, host.Port, auth, _ownUid);
         StatusText = client.Status;
@@ -373,6 +379,31 @@ public sealed partial class LiveDanmakuService : Node
     private void OnClientStatus(string status)
     {
         StatusText = status;
+    }
+
+    /// <summary>RitsuLib toast once the room handshake succeeded. 连接直播间成功后的弹窗提醒。</summary>
+    private void OnRoomEntered()
+    {
+        if (!GodotObject.IsInstanceValid(this))
+            return;
+
+        if (_time - _lastConnectedToastAt < ConnectedToastCooldownSeconds)
+            return;
+
+        _lastConnectedToastAt = _time;
+
+        var room = BilibiliApi.NormalizeRoomInput(AiSettingsStore.Current.BilibiliRoomId);
+        if (room.Length == 0)
+            room = _realRoomId.ToString();
+
+        var body = _loggedIn
+            ? AiLoc.T("live.toast.connected.logged_in",
+                "已进入直播间 {Room}，AI 可以回复观众弹幕。", ("Room", room))
+            : AiLoc.T("live.toast.connected.anonymous",
+                "已进入直播间 {Room}，当前仅接收弹幕（未登录）。", ("Room", room));
+
+        RitsuToastService.ShowInfo(body, AiLoc.T("live.toast.connected.title", "B 站直播间已连接"));
+        MainFile.Logger.Info($"[Bilibili] 已连接直播间 {room}");
     }
 
     private void OnClientDisconnected(string reason)
@@ -418,6 +449,7 @@ public sealed partial class LiveDanmakuService : Node
             client.MessageReceived -= OnDanmakuReceived;
             client.StatusChanged -= OnClientStatus;
             client.Disconnected -= OnClientDisconnected;
+            client.RoomEntered -= OnRoomEntered;
             client.Dispose();
         }
 

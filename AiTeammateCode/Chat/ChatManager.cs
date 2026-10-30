@@ -102,16 +102,7 @@ public class ChatManager
         };
         RecentMessages.Add(playerMsg);
         OnMessageReceived?.Invoke(playerMsg);
-
-        // Check if player is requesting card suggestions
-        if (AiSettingsStore.Current.EnableSuggestions && IsSuggestionRequest(content))
-        {
-            _ = Task.Run(async () =>
-            {
-                try { await TriggerSuggestionForHumanPlayerAsync(); }
-                catch { /* fire-and-forget, errors logged internally */ }
-            });
-        }
+        AiTeammateManager.Instance?.AiLog.LogChat(playerName, content);
 
         var aiPlayer = AiTeammateManager.Instance.AiPlayer;
         var runPrelude = aiPlayer != null ? _conversationContext.BuildRunPrelude(aiPlayer, _contextBuilder) : "";
@@ -127,7 +118,33 @@ public class ChatManager
             chatContext,
             latestInput);
 
-        var parsed = await SendInteractiveChatAsync(userPrompt, latestInput, ct);
+        var parsed = await SendInteractiveChatAsyncSafeAsync(userPrompt, latestInput, ct);
+
+        // A failed request used to be swallowed as "(Thinking...)" and then rendered nowhere at all
+        // when there was no AI player for a bubble, so the player saw a message go into the void.
+        // 请求失败时明确提示原因，不再静默丢掉回复。
+        if (!string.IsNullOrWhiteSpace(parsed.ErrorMessage))
+        {
+            MainFile.Logger.Warn($"[Chat] 回复失败: {parsed.ErrorMessage}");
+            AiTeammateManager.Instance?.AiLog.LogError("CHAT", $"回复失败: {parsed.ErrorMessage}");
+
+            var warning = new ChatMessage
+            {
+                SenderName = AiLoc.T("chat.system_sender", "System"),
+                IsAi = false,
+                Content = AiLoc.T("chat.reply.failed", "AI did not reply: {Error}", ("Error", parsed.ErrorMessage)),
+                Type = ChatMessageType.Warning
+            };
+            // Display only: this line must not enter the conversation history, or the next prompt
+            // would feed the error text back to the model as if the player had said it.
+            OnMessageReceived?.Invoke(warning);
+
+            if (SoloRunController.IsActive)
+                AiFlowControl.EndConversationPauseSoon(TimeSpan.FromSeconds(3));
+
+            return warning;
+        }
+
         if (parsed.Directives.Count > 0)
         {
             _directiveManager.RecordAcceptedDirectives(playerName, parsed.Directives);
@@ -148,6 +165,7 @@ public class ChatManager
         };
         RecentMessages.Add(aiMsg);
         OnMessageReceived?.Invoke(aiMsg);
+        AiTeammateManager.Instance?.AiLog.LogChat(aiMsg.SenderName, aiMsg.Content);
 
         // Let the AI answer, then give the player a moment to keep talking before resuming.
         if (SoloRunController.IsActive)
@@ -326,7 +344,7 @@ public class ChatManager
 
         var response = await _backend.SendAsync(request, linkedCts.Token);
         if (!response.IsSuccess)
-            return new InteractiveChatResult { Reply = AiLoc.T("chat.reply.thinking", "(Thinking...)") };
+            return new InteractiveChatResult { ErrorMessage = response.ErrorMessage };
 
         response = await TryRunChatScreenshotAsync(response, userPrompt, ct);
 
@@ -348,10 +366,24 @@ public class ChatManager
             ConversationHistory = BuildHistory()
         };
         var fallbackResponse = await _backend.SendAsync(fallbackRequest, ct);
-        return new InteractiveChatResult
+        if (!fallbackResponse.IsSuccess)
+            return new InteractiveChatResult { ErrorMessage = fallbackResponse.ErrorMessage };
+
+        return new InteractiveChatResult { Reply = fallbackResponse.Content.Trim() };
+    }
+
+    /// <summary>Never lets a transport/parse exception kill the fire-and-forget chat task.</summary>
+    private async Task<InteractiveChatResult> SendInteractiveChatAsyncSafeAsync(
+        string userPrompt, string latestInput, CancellationToken ct)
+    {
+        try
         {
-            Reply = fallbackResponse.IsSuccess ? fallbackResponse.Content.Trim() : AiLoc.T("chat.reply.received", "(Got it.)")
-        };
+            return await SendInteractiveChatAsync(userPrompt, latestInput, ct);
+        }
+        catch (Exception ex)
+        {
+            return new InteractiveChatResult { ErrorMessage = ex.Message };
+        }
     }
 
     /// <summary>
@@ -537,50 +569,7 @@ public class ChatManager
     private sealed class InteractiveChatResult
     {
         public string Reply { get; init; } = "";
+        public string ErrorMessage { get; init; } = "";
         public List<PlayerDirectiveProposal> Directives { get; } = new();
-    }
-
-    /// <summary>检测玩家消息是否在请求卡牌建议。</summary>
-    private static bool IsSuggestionRequest(string content)
-    {
-        if (string.IsNullOrWhiteSpace(content)) return false;
-        var lower = content.ToLowerInvariant();
-        // 中文关键词
-        string[] cnKeywords = { "建议", "推荐", "怎么打", "怎么出", "选哪张", "出什么", "高亮", "推荐卡牌", "帮我看看" };
-        foreach (var kw in cnKeywords)
-            if (content.Contains(kw, StringComparison.OrdinalIgnoreCase))
-                return true;
-        // 英文关键词
-        string[] enKeywords = { "suggest", "recommend", "highlight", "which card", "what card" };
-        foreach (var kw in enKeywords)
-            if (lower.Contains(kw))
-                return true;
-        return false;
-    }
-
-    /// <summary>异步触发对非AI玩家的卡牌建议。</summary>
-    private static async Task TriggerSuggestionForHumanPlayerAsync()
-    {
-        try
-        {
-            var manager = AiTeammateManager.Instance;
-            if (!manager.IsInitialized || manager.SuggestionService == null) return;
-
-            var state = CombatManager.Instance.DebugOnlyGetState();
-            if (state == null) return;
-
-            var humanPlayer = state.Players.FirstOrDefault(p => p != manager.AiPlayer);
-            if (humanPlayer == null) return;
-
-            var suggestions = await manager.SuggestionService.AnalyzeAsync(humanPlayer, System.Threading.CancellationToken.None);
-            if (suggestions.Count > 0)
-            {
-                Compat.MainThread.Post(() => manager.CardHighlighter?.ApplyHighlights(suggestions, humanPlayer));
-            }
-        }
-        catch (Exception ex)
-        {
-            MainFile.Logger.Warn($"Suggestion request error: {ex.Message}");
-        }
     }
 }

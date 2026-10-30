@@ -1,442 +1,335 @@
 ﻿using System.Reflection;
-using Godot;
 using HarmonyLib;
-using AiTeammate.AiTeammateCode.Decision;
-using AiTeammate.AiTeammateCode.Compat;
-using AiTeammate.AiTeammateCode.Solo;
+using MegaCrit.Sts2.Core.Entities.Multiplayer;
 using MegaCrit.Sts2.Core.Entities.Players;
+using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Multiplayer.Game;
+using MegaCrit.Sts2.Core.Runs;
+using AiTeammate.AiTeammateCode.Compat;
+using AiTeammate.AiTeammateCode.Decision;
+using AiTeammate.AiTeammateCode.Solo;
 
 namespace AiTeammate.AiTeammateCode.Patches;
 
-// ---- Foundation patches: make HextechRunes recognize AiTeammate ----
-
 /// <summary>
-/// Makes HextechAiTeammateCompat.IsLoopbackHostSession() return true when
-/// AiTeammate has an active AI player. This enables the full screen-based
-/// Hextech rune selection flow (host-controlled path) which supports rerolls.
+/// Compatibility with HextechRunes (ARAM: Mayhem).
+///
+/// That mod parks a <c>PlayerChoiceSynchronizer</c> transaction for every player during act rune
+/// selection, forge/relic picks and the act-selection ack. An AiTeammate AI player has no network peer,
+/// so those waits never complete and the act transition soft-locks. These patches answer the waits for AI
+/// players only; real players keep the stock flow.
+///
+/// Targets are resolved by name at install time (the Hextech build is a multi-version bundle and its
+/// coordinator is <c>internal</c>); a missing member only skips that one patch.
 /// </summary>
-[HarmonyPatch]
-public static class HextechIsLoopbackHostSessionPatch
+internal static class HextechPatchTargets
 {
-    private static MethodInfo? _targetMethod;
+    public const string CoordinatorType = "HextechRunes.HextechRuneSelectionCoordinator";
+    public const string SyncedRelicChoiceType = "HextechRunes.HextechSyncedRelicChoice";
+    public const string RuneGrantHelperType = "HextechRunes.HextechRuneGrantHelper";
+    public const string ScreenType = "HextechRunes.HextechRuneSelectionScreen";
 
-    public static bool Prepare() => HextechRunesDecisionHandler.IsAvailable;
+    private const BindingFlags StaticFlags =
+        BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
 
-    public static MethodBase TargetMethod()
+    public static MethodInfo? Find(string typeName, string methodName, params Type[] parameters)
     {
-        var type = FindCompatType();
-        _targetMethod = type?.GetMethod("IsLoopbackHostSession",
-            BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-        if (_targetMethod == null)
-            throw new InvalidOperationException("Cannot find IsLoopbackHostSession");
-        return _targetMethod;
+        var type = HextechRunesDecisionHandler.FindHextechType(typeName);
+        if (type == null) return null;
+
+        if (parameters.Length == 0)
+        {
+            var matches = type.GetMethods(StaticFlags).Where(m => m.Name == methodName).ToList();
+            if (matches.Count == 0) return null;
+            return matches.OrderByDescending(m => m.GetParameters().Length).First();
+        }
+
+        return type.GetMethod(methodName, StaticFlags, null, parameters, null);
     }
 
-    public static void Postfix(ref bool __result)
+    public static MethodInfo? FindInstance(string typeName, string methodName, params Type[] parameters)
     {
-        if (__result) return;
-        var manager = AiTeammateManager.Instance;
-        if (!manager.IsInitialized) return;
-        // Check if there's an AI player anywhere in the current run
-        try
-        {
-            var runState = global::MegaCrit.Sts2.Core.Runs.RunManager.Instance?.DebugOnlyGetState();
-            if (runState != null)
-            {
-                foreach (var p in runState.Players)
-                {
-                    if (AiIdentity.IsAi(p.NetId))
-                    {
-                        __result = true;
-                        return;
-                    }
-                }
-            }
-        }
-        catch { }
-    }
-
-    private static Type? FindCompatType()
-    {
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            var type = asm.GetType("HextechRunes.HextechAiTeammateCompat", throwOnError: false);
-            if (type != null) return type;
-        }
-        return null;
+        var type = HextechRunesDecisionHandler.FindHextechType(typeName);
+        if (type == null) return null;
+        return type.GetMethod(methodName,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            null, parameters, null);
     }
 }
 
 /// <summary>
-/// Makes HextechAiTeammateCompat.IsAiPlayer(Player) recognize AI players by
-/// their NetId range (0xA1AA_A000 - 0xA1AA_FFFF) instead of relying on
-/// AiSessionRegistry which doesn't exist in this AiTeammate setup.
+/// Act rune selection (<c>SelectRuneMultiplayer</c>): for an AI player, schedule a decision and feed the
+/// resulting payload into the local synchronizer. The original method keeps waiting and resolves it through
+/// Hextech's normal remote branch (journal, seen history, relic grant), so nothing is re-implemented.
 /// </summary>
-[HarmonyPatch]
-public static class HextechIsAiPlayerPatch
+internal static class HextechSelectRunePatch
 {
-    public static bool Prepare() => HextechRunesDecisionHandler.IsAvailable;
+    public static MethodInfo? Target() => HextechPatchTargets.Find(
+        HextechPatchTargets.CoordinatorType, "SelectRuneMultiplayer");
 
-    public static MethodBase TargetMethod()
+    public static bool Prefix(object[] __args)
     {
-        var type = FindCompatType();
-        var method = type?.GetMethod("IsAiPlayer",
-            BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
-            null, new[] { typeof(Player) }, null);
-        if (method == null)
-            throw new InvalidOperationException("Cannot find IsAiPlayer");
-        return method;
-    }
-
-    public static void Postfix(Player? player, ref bool __result)
-    {
-        if (__result) return;
-        if (player == null) return;
-        if (AiIdentity.IsAi(player.NetId) || SoloRunController.IsAiControlledPlayer(player))
-            __result = true;
-    }
-
-    private static Type? FindCompatType()
-    {
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            var type = asm.GetType("HextechRunes.HextechAiTeammateCompat", throwOnError: false);
-            if (type != null) return type;
-        }
-        return null;
-    }
-}
-
-/// <summary>
-/// Provides host player NetId to HextechRunes so it can order player screens
-/// correctly (human first, AI last). Falls back to finding the first non-AI
-/// player in the run state.
-/// </summary>
-[HarmonyPatch]
-public static class HextechTryGetHostPlayerIdPatch
-{
-    public static bool Prepare() => HextechRunesDecisionHandler.IsAvailable;
-
-    public static MethodBase TargetMethod()
-    {
-        var type = FindCompatType();
-        var method = type?.GetMethod("TryGetHostPlayerId",
-            BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-        if (method == null)
-            throw new InvalidOperationException("Cannot find TryGetHostPlayerId");
-        return method;
-    }
-
-    public static void Postfix(ref bool __result, ref ulong hostPlayerId)
-    {
-        if (__result) return;
-        try
-        {
-            var runState = global::MegaCrit.Sts2.Core.Runs.RunManager.Instance?.DebugOnlyGetState();
-            if (runState == null) return;
-            foreach (var p in runState.Players)
-            {
-                // Find the first human player (non-AI NetId)
-                if (!AiIdentity.IsAi(p.NetId))
-                {
-                    hostPlayerId = p.NetId;
-                    __result = true;
-                    return;
-                }
-            }
-        }
-        catch { }
-    }
-
-    private static Type? FindCompatType()
-    {
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            var type = asm.GetType("HextechRunes.HextechAiTeammateCompat", throwOnError: false);
-            if (type != null) return type;
-        }
-        return null;
-    }
-}
-
-/// <summary>
-/// Provides AI player display name to HextechRunes for the title override
-/// shown on the selection screen ("为XXX选择一个海克斯符文").
-/// </summary>
-[HarmonyPatch]
-public static class HextechGetDisplayNamePatch
-{
-    public static bool Prepare() => HextechRunesDecisionHandler.IsAvailable;
-
-    public static MethodBase TargetMethod()
-    {
-        var type = FindCompatType();
-        var method = type?.GetMethod("GetDisplayName",
-            BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
-            null, new[] { typeof(Player) }, null);
-        if (method == null)
-            throw new InvalidOperationException("Cannot find GetDisplayName");
-        return method;
-    }
-
-    public static void Postfix(Player player, ref string __result)
-    {
-        // Only override if the original returned a fallback name
-        if (string.IsNullOrEmpty(__result) || __result.StartsWith("玩家"))
-        {
-            var manager = AiTeammateManager.Instance;
-            if (manager.IsInitialized && manager.PersonalityManager?.Active != null)
-            {
-                var personalityName = manager.PersonalityManager.Active.Name;
-                if (!string.IsNullOrEmpty(personalityName))
-                    __result = personalityName;
-            }
-        }
-    }
-
-    private static Type? FindCompatType()
-    {
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            var type = asm.GetType("HextechRunes.HextechAiTeammateCompat", throwOnError: false);
-            if (type != null) return type;
-        }
-        return null;
-    }
-}
-
-// ---- Decision patches ----
-
-/// <summary>
-/// Intercepts HextechAiTeammateCompat.PickRandomRuneIndex to replace random
-/// with LLM-based decision. This handles the multiplayer AI-auto-select path
-/// where no selection screen is shown.
-/// </summary>
-[HarmonyPatch]
-public static class HextechPickRandomRunePatch
-{
-    public static bool Prepare() => HextechRunesDecisionHandler.IsAvailable;
-
-    /// <summary>
-    /// Dynamically target HextechAiTeammateCompat.PickRandomRuneIndex.
-    /// </summary>
-    public static MethodBase TargetMethod()
-    {
-        var type = FindCompatType();
-        var method = type?.GetMethod("PickRandomRuneIndex",
-            BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
-            null, new[] { typeof(Player), typeof(IReadOnlyList<RelicModel>) }, null);
-        return method ?? throw new InvalidOperationException("Cannot find PickRandomRuneIndex");
-    }
-
-    /// <summary>
-    /// Prefix: replace the random pick with LLM-based decision.
-    /// Returns false to skip original method.
-    /// </summary>
-    public static bool Prefix(Player player, IReadOnlyList<RelicModel> options, ref int __result)
-    {
-        var manager = AiTeammateManager.Instance;
-        if (!manager.IsInitialized || manager.AiPlayer == null)
-            return true;
+        if (!HextechRunesDecisionHandler.IsAvailable) return true;
 
         try
         {
-            var runeInfos = options.Select((r, i) => new RuneOptionInfo
-            {
-                Index = i,
-                Name = PromptTextHelper.ResolveLocString(r.Title),
-                Description = CleanDescription(PromptTextHelper.ResolveLocString(r.DynamicDescription)),
-                RelicId = (r.CanonicalInstance?.Id ?? r.Id).Entry
-            }).ToList();
+            if (__args.Length < 5) return true;
 
-            var task = System.Threading.Tasks.Task.Run(async () =>
-                await HextechRunesDecisionHandler.DecideRuneWithLlmAsync(manager.AiPlayer!, runeInfos, null));
-            __result = task.GetAwaiter().GetResult();
-            return false;
+            var selection = __args[1];
+            if (selection == null) return true;
+
+            var aiPlayer = ReadMember<Player>(selection, "Player");
+            if (aiPlayer == null || !AiIdentity.IsAi(aiPlayer.NetId)) return true;
+            if (ReadMember<bool>(selection, "IsLocal")) return true;
+
+            var options = ReadMember<IReadOnlyList<RelicModel>>(selection, "Options");
+            var choiceId = ReadMember<uint>(selection, "ChoiceId");
+            if (options == null || options.Count == 0) return true;
+
+            var synchronizer = __args[2] as PlayerChoiceSynchronizer;
+            int actIndex = __args[3] is int act ? act : -1;
+            int choiceOrdinal = __args[4] is int ordinal ? ordinal : -1;
+
+            HextechRunesDecisionHandler.AnswerRuneChoiceForAi(
+                aiPlayer, options, actIndex, choiceOrdinal, choiceId, synchronizer);
         }
         catch (Exception ex)
         {
-            MainFile.Logger.Warn($"[HextechRunes] LLM决策异常，使用随机选择: {ex.Message}");
-            return true;
+            MainFile.Logger.Warn($"[HextechRunes] 符文选择拦截失败: {ex.Message}");
         }
+
+        return true;
     }
 
-    private static Type? FindCompatType()
+    private static T ReadMember<T>(object instance, string name)
     {
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            var type = asm.GetType("HextechRunes.HextechAiTeammateCompat", throwOnError: false);
-            if (type != null) return type;
-        }
-        return null;
-    }
+        var type = instance.GetType();
+        var property = type.GetProperty(name,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        if (property?.GetValue(instance) is T value) return value;
 
-    private static string CleanDescription(string desc)
-    {
-        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\[.*?\]", "");
-        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"res://\S+", "");
-        return desc.Trim();
+        var field = type.GetField(name,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        return field?.GetValue(instance) is T fieldValue ? fieldValue : default!;
     }
 }
 
 /// <summary>
-/// Intercepts HextechRuneSelectionScreen.AfterOverlayOpened to auto-select
-/// runes for AI players in the host-controlled path. This path supports rerolls
-/// because the full UI is shown. The screen is immediately hidden to prevent
-/// it from flashing in front of the human player.
+/// Forge / relic-option choices (<c>HextechSyncedRelicChoice.SelectAsync</c>): an AI player picks locally.
+/// Every peer computes the same seed-stable pick, so the transaction is skipped instead of waiting for a
+/// peer that does not exist.
 /// </summary>
-[HarmonyPatch]
-public static class HextechRuneSelectionScreenAutoPatch
+internal static class HextechSyncedRelicChoicePatch
 {
-    private static Type? _screenType;
+    public static MethodInfo? Target() => HextechPatchTargets.Find(
+        HextechPatchTargets.SyncedRelicChoiceType, "SelectAsync");
 
-    public static bool Prepare() => HextechRunesDecisionHandler.IsAvailable;
-
-    public static MethodBase TargetMethod()
+    public static bool Prefix(
+        Player player,
+        IReadOnlyList<RelicModel> options,
+        string context,
+        bool syncMultiplayerChoice,
+        ref Task<RelicModel?> __result)
     {
-        _screenType = FindScreenType();
-        var method = _screenType?.GetMethod("AfterOverlayOpened",
-            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        return method ?? throw new InvalidOperationException("Cannot find AfterOverlayOpened");
+        if (!HextechRunesDecisionHandler.IsAvailable) return true;
+        if (player == null || !AiIdentity.IsAi(player.NetId)) return true;
+        if (!syncMultiplayerChoice) return true;
+
+        var netType = RunManager.Instance?.NetService?.Type;
+        if (netType is null or NetGameType.Singleplayer or NetGameType.None) return true;
+
+        __result = HextechRunesDecisionHandler.SelectRelicForAiAsync(player, options, context);
+        return false;
+    }
+}
+
+/// <summary>
+/// Act-selection ack (<c>SynchronizeActSelectionApplied</c>): it waits for an "applied" message from every
+/// player. The AI applies its choice locally, so treat its ack as already delivered.
+/// </summary>
+internal static class HextechActSelectionAppliedPatch
+{
+    public static MethodInfo? Target()
+    {
+        var type = HextechRunesDecisionHandler.FindHextechType(HextechPatchTargets.CoordinatorType);
+        return type?.GetMethod("WaitForRemoteActSelectionApplied",
+            BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
     }
 
-    /// <summary>
-    /// Postfix: after the screen is shown, check if it's for an AI player.
-    /// If so, hide the screen, reopen the map (closed by HandleActSelection),
-    /// and start the auto-decision process in background.
-    /// </summary>
+    public static bool Prefix(Player player, ref Task __result)
+    {
+        if (!HextechRunesDecisionHandler.IsAvailable) return true;
+        if (player == null || !AiIdentity.IsAi(player.NetId)) return true;
+
+        __result = Task.CompletedTask;
+        MainFile.Logger.Info($"[HextechRunes] 跳过 AI 的幕选择确认等待 player={player.NetId}");
+        return false;
+    }
+}
+
+/// <summary>
+/// Act-roll authority (<c>GetActRollAuthorityPlayer</c>): clients wait for the host's act roll. If the
+/// returned player is the AI (it can be the first entry in the player list), every client would wait for a
+/// payload nobody sends; fall back to the first real player instead.
+/// </summary>
+internal static class HextechActRollAuthorityPatch
+{
+    public static MethodInfo? Target() => HextechPatchTargets.Find(
+        HextechPatchTargets.CoordinatorType, "GetActRollAuthorityPlayer");
+
+    public static void Postfix(ref Player? __result)
+    {
+        if (!HextechRunesDecisionHandler.IsAvailable) return;
+        if (__result == null || !AiIdentity.IsAi(__result.NetId)) return;
+
+        try
+        {
+            var runState = RunManager.Instance?.DebugOnlyGetState();
+            var replacement = runState?.Players.FirstOrDefault(p => !AiIdentity.IsAi(p.NetId));
+            if (replacement != null)
+            {
+                __result = replacement;
+                MainFile.Logger.Info($"[HextechRunes] 幕抽签权威改为非 AI 玩家 {replacement.NetId}");
+            }
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[HextechRunes] 修正幕抽签权威失败: {ex.Message}");
+        }
+    }
+}
+
+/// <summary>
+/// Random rune grants (<c>HextechRuneGrantHelper.TryObtainRandomRunesMultiplayer</c>): letting it return
+/// false makes the public caller fall back to its singleplayer path, which picks with Hextech's seed-stable
+/// RNG and obtains locally — identical on every client, no peer needed.
+/// </summary>
+internal static class HextechRandomRuneGrantPatch
+{
+    public static MethodInfo? Target() => HextechPatchTargets.Find(
+        HextechPatchTargets.RuneGrantHelperType, "TryObtainRandomRunesMultiplayer");
+
+    public static bool Prefix(Player player, ref Task<bool> __result)
+    {
+        if (!HextechRunesDecisionHandler.IsAvailable) return true;
+        if (player == null || !AiIdentity.IsAi(player.NetId)) return true;
+
+        __result = Task.FromResult(false);
+        return false;
+    }
+}
+
+/// <summary>
+/// Solo climb: Hextech shows a modal selection screen and waits for a click. While the AI drives the local
+/// player nobody clicks, so the run soft-locks. The handler answers the screen (LLM or stable pick) and
+/// leaves it alone when the player paused the AI.
+/// </summary>
+internal static class HextechSoloScreenPatch
+{
+    public static MethodInfo? Target() => HextechPatchTargets.FindInstance(
+        HextechPatchTargets.ScreenType, "AfterOverlayOpened");
+
     public static void Postfix(object __instance)
     {
-        var manager = AiTeammateManager.Instance;
-        if (!manager.IsInitialized || manager.AiPlayer == null) return;
+        if (!HextechRunesDecisionHandler.IsAvailable) return;
+        if (__instance == null) return;
+        if (!SoloRunController.IsActive) return;
+        if (AiFlowControl.IsPaused) return;
 
-        if (!HextechRunesDecisionHandler.IsScreenForAi(__instance)) return;
-
-        // Prevent AfterOverlayHidden from queueing RestoreAfterMapReopenAsync,
-        // which would close our map and re-show the hidden overlay.
-        var restoreFlagField = _screenType!.GetField("_restoreAfterMapReopenQueued",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        restoreFlagField?.SetValue(__instance, true);
-
-        // Hide the screen so the player doesn't see rune selection UI.
-        if (__instance is CanvasItem canvas)
-            canvas.Visible = false;
-
-        // HextechRunes closed the map before starting selections; reopen it so
-        // the player sees the map (not blackness) while the LLM decides.
-        try
-        {
-            var map = MegaCrit.Sts2.Core.Nodes.Screens.Map.NMapScreen.Instance;
-            if (map != null && !map.IsOpen)
-                map.Open();
-        }
-        catch { }
-
-        MainFile.Logger.Info("[HextechRunes] 检测到AI海克斯符文选择界面，已隐藏并恢复地图");
-
-        _ = AutoSelectForAiAsync(__instance, manager);
-    }
-
-    private static async System.Threading.Tasks.Task AutoSelectForAiAsync(
-        object screenInstance, AiTeammateManager manager)
-    {
-        try
-        {
-            var aiPlayer = manager.AiPlayer;
-            if (aiPlayer == null) return;
-
-            var options = HextechRunesDecisionHandler.ExtractOptions(screenInstance);
-            var monsterHex = HextechRunesDecisionHandler.ExtractMonsterHex(screenInstance);
-
-            if (options.Count == 0)
-            {
-                MainFile.Logger.Warn("[HextechRunes] 无法提取符文选项，跳过自动决策");
-                return;
-            }
-
-            manager.AiLog.Log("AI_THINK",
-                $"[海克斯符文] 开始选择 | act={aiPlayer.RunState?.CurrentActIndex} | 选项={options.Count} | monsterHex={monsterHex?.KindName}");
-
-            var choice = await HextechRunesDecisionHandler.DecideRuneWithLlmAsync(
-                aiPlayer, options, monsterHex, screenInstance);
-
-            if (choice >= 0 && choice < options.Count)
-            {
-                var clicked = await HextechRunesDecisionHandler.ClickRuneCard(
-                    screenInstance, choice, options);
-                if (!clicked)
-                    MainFile.Logger.Warn("[HextechRunes] 自动点击卡牌失败");
-            }
-            else
-            {
-                MainFile.Logger.Warn($"[HextechRunes] LLM决策返回无效索引 {choice}");
-                await HextechRunesDecisionHandler.ClickRuneCard(screenInstance, 0, options);
-            }
-        }
-        catch (Exception ex)
-        {
-            MainFile.Logger.Error($"[HextechRunes] 自动决策异常: {ex.Message}");
-        }
-    }
-
-    private static Type? FindScreenType()
-    {
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            var type = asm.GetType("HextechRunes.HextechRuneSelectionScreen", throwOnError: false);
-            if (type != null) return type;
-        }
-        return null;
+        HextechRunesDecisionHandler.AutoAnswerSoloScreen(__instance);
     }
 }
 
 /// <summary>
-/// Install/detect helpers. Called from AiTeammateManager during initialization.
+/// Installs the HextechRunes patches. Waits for the Hextech assembly when it has not been loaded yet
+/// (mod initialization order is not guaranteed), and installs each patch independently.
 /// </summary>
 public static class HextechRunesPatchInstaller
 {
     private static bool _installed;
+    private static bool _waitingForAssembly;
 
-    public static void TryInstall(Harmony harmony)
+    public static void Initialize()
+    {
+        TryInstall();
+        if (_installed || _waitingForAssembly) return;
+
+        _waitingForAssembly = true;
+        AppDomain.CurrentDomain.AssemblyLoad += OnAssemblyLoad;
+    }
+
+    private static void OnAssemblyLoad(object? sender, AssemblyLoadEventArgs args)
+    {
+        if (args.LoadedAssembly.GetName().Name != "HextechRunes") return;
+
+        AppDomain.CurrentDomain.AssemblyLoad -= OnAssemblyLoad;
+        _waitingForAssembly = false;
+        MainFile.Logger.Info("[HextechRunes] 检测到 HextechRunes 程序集加载，安装集成补丁");
+        TryInstall();
+    }
+
+    private static void TryInstall()
     {
         if (_installed) return;
         if (!HextechRunesDecisionHandler.IsAvailable) return;
 
+        var harmony = new HarmonyLib.Harmony(MainFile.ModId + ".HextechRunes");
+        int installed = 0;
+
+        installed += TryPatch(harmony, "符文三选一", HextechSelectRunePatch.Target(),
+            typeof(HextechSelectRunePatch), "Prefix", isPrefix: true);
+        installed += TryPatch(harmony, "锻造/遗物选择", HextechSyncedRelicChoicePatch.Target(),
+            typeof(HextechSyncedRelicChoicePatch), "Prefix", isPrefix: true);
+        installed += TryPatch(harmony, "幕选择确认", HextechActSelectionAppliedPatch.Target(),
+            typeof(HextechActSelectionAppliedPatch), "Prefix", isPrefix: true);
+        installed += TryPatch(harmony, "幕抽签权威", HextechActRollAuthorityPatch.Target(),
+            typeof(HextechActRollAuthorityPatch), "Postfix", isPrefix: false);
+        installed += TryPatch(harmony, "随机符文发放", HextechRandomRuneGrantPatch.Target(),
+            typeof(HextechRandomRuneGrantPatch), "Prefix", isPrefix: true);
+        installed += TryPatch(harmony, "单人界面自动选择", HextechSoloScreenPatch.Target(),
+            typeof(HextechSoloScreenPatch), "Postfix", isPrefix: false);
+
+        _installed = installed > 0;
+        MainFile.Logger.Info($"[HextechRunes] 集成补丁安装完成: {installed}/6");
+    }
+
+    private static int TryPatch(
+        HarmonyLib.Harmony harmony,
+        string label,
+        MethodInfo? target,
+        Type patchType,
+        string patchMethodName,
+        bool isPrefix)
+    {
+        if (target == null)
+        {
+            MainFile.Logger.Info($"[HextechRunes] 跳过「{label}」: 未找到目标方法（海克斯版本不匹配）");
+            return 0;
+        }
+
         try
         {
-            // Foundation patches: make HextechRunes recognize AiTeammate
-            harmony.Patch(
-                HextechIsLoopbackHostSessionPatch.TargetMethod(),
-                postfix: new HarmonyMethod(typeof(HextechIsLoopbackHostSessionPatch), "Postfix"));
+            var method = patchType.GetMethod(patchMethodName,
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (method == null)
+            {
+                MainFile.Logger.Warn($"[HextechRunes] 跳过「{label}」: 找不到补丁方法 {patchType.Name}.{patchMethodName}");
+                return 0;
+            }
 
-            harmony.Patch(
-                HextechIsAiPlayerPatch.TargetMethod(),
-                postfix: new HarmonyMethod(typeof(HextechIsAiPlayerPatch), "Postfix"));
+            var harmonyMethod = new HarmonyMethod(method);
+            harmony.Patch(target,
+                prefix: isPrefix ? harmonyMethod : null,
+                postfix: isPrefix ? null : harmonyMethod);
 
-            harmony.Patch(
-                HextechTryGetHostPlayerIdPatch.TargetMethod(),
-                postfix: new HarmonyMethod(typeof(HextechTryGetHostPlayerIdPatch), "Postfix"));
-
-            harmony.Patch(
-                HextechGetDisplayNamePatch.TargetMethod(),
-                postfix: new HarmonyMethod(typeof(HextechGetDisplayNamePatch), "Postfix"));
-
-            // Decision patches
-            harmony.Patch(
-                HextechPickRandomRunePatch.TargetMethod(),
-                prefix: new HarmonyMethod(typeof(HextechPickRandomRunePatch), "Prefix"));
-
-            harmony.Patch(
-                HextechRuneSelectionScreenAutoPatch.TargetMethod(),
-                postfix: new HarmonyMethod(typeof(HextechRuneSelectionScreenAutoPatch), "Postfix"));
-
-            _installed = true;
-            MainFile.Logger.Info("[HextechRunes] Harmony patches installed successfully (6 patches)");
+            MainFile.Logger.Info($"[HextechRunes] 已安装「{label}」→ {target.DeclaringType?.Name}.{target.Name}");
+            return 1;
         }
         catch (Exception ex)
         {
-            MainFile.Logger.Warn($"[HextechRunes] Failed to install patches: {ex.Message}");
+            MainFile.Logger.Warn($"[HextechRunes] 安装「{label}」失败: {ex.Message}");
+            return 0;
         }
     }
 }

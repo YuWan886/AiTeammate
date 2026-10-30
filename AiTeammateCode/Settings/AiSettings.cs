@@ -117,12 +117,6 @@ public sealed class AiSettings
     public int ChatCooldownMs { get; set; } = 15000;
     public int MaxChatHistoryForPrompt { get; set; } = 10;
 
-    // ---- Suggestions ----
-
-    public bool EnableSuggestions { get; set; } = true;
-    public bool AutoSuggestOnTurnStart { get; set; }
-    public int MaxSuggestionsPerTurn { get; set; } = 3;
-
     // ---- Solo climb ----
 
     /// <summary>Lets the AI drive the local player in singleplayer runs. 单人模式由 AI 接管。</summary>
@@ -204,10 +198,6 @@ public sealed class AiSettings
         EnableSpeechBubble = defaults.EnableSpeechBubble;
         ChatCooldownMs = defaults.ChatCooldownMs;
         MaxChatHistoryForPrompt = defaults.MaxChatHistoryForPrompt;
-
-        EnableSuggestions = defaults.EnableSuggestions;
-        AutoSuggestOnTurnStart = defaults.AutoSuggestOnTurnStart;
-        MaxSuggestionsPerTurn = defaults.MaxSuggestionsPerTurn;
 
         EnableSoloClimb = defaults.EnableSoloClimb;
         SoloCharacterId = defaults.SoloCharacterId;

@@ -1198,54 +1198,6 @@ public class ContextBuilder
         return sb.ToString();
     }
 
-    public string BuildSuggestionContext(Player player)
-    {
-        var state = CombatManager.Instance.DebugOnlyGetState();
-        if (state == null) return "";
-
-        var sb = new StringBuilder();
-        sb.AppendLine("[请求卡牌建议 - 玩家手牌分析]");
-        sb.AppendLine();
-
-        var combat = player.PlayerCombatState;
-        if (combat != null)
-        {
-            var handCards = combat.Hand.Cards.ToList();
-            sb.AppendLine($"玩家当前手牌({handCards.Count}张)：");
-            for (int i = 0; i < handCards.Count; i++)
-                sb.AppendLine($"{i + 1}. {FormatCardBrief(handCards[i])}");
-        }
-
-        sb.AppendLine();
-        sb.AppendLine("场上敌人：");
-        foreach (var enemy in state.Enemies.Where(e => e.IsAlive))
-            sb.AppendLine($"- {enemy.Name}({enemy.CurrentHp}血)");
-
-        sb.AppendLine();
-        sb.AppendLine("请选出2-3张最适合当前局势的卡牌，并给出简短理由。");
-
-        if (combat != null)
-        {
-            var handKnowledge = _query.FormatCardKnowledge(combat.Hand.Cards, maxCount: 10);
-            if (!string.IsNullOrWhiteSpace(handKnowledge))
-            {
-                sb.AppendLine();
-                sb.AppendLine("[手牌详细资料]");
-                sb.AppendLine(handKnowledge);
-            }
-
-            var piles = BuildPileDetail(player);
-            if (!string.IsNullOrWhiteSpace(piles))
-            {
-                sb.AppendLine();
-                sb.AppendLine("[牌堆]");
-                sb.AppendLine(piles);
-            }
-        }
-
-        return sb.ToString();
-    }
-
     // ---- Non-combat contexts ----
 
     public string BuildCardRewardContext(Player aiPlayer, List<CardModel> choices)

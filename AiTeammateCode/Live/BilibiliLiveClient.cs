@@ -41,6 +41,9 @@ public sealed class BilibiliLiveClient : IDisposable
     public event Action<string>? StatusChanged;
     public event Action<string>? Disconnected;
 
+    /// <summary>Raised once the server accepts the auth packet (the client is really inside the room). 成功进入直播间。</summary>
+    public event Action? RoomEntered;
+
     /// <summary>Builds the op=7 auth packet for an anonymous (<paramref name="uid"/> 0) or logged-in session.</summary>
     public static byte[] BuildAuthPacket(long roomId, long uid, string token, string buvid)
     {
@@ -238,6 +241,8 @@ public sealed class BilibiliLiveClient : IDisposable
                         // 进入直播间后立刻发一次心跳，并以此作为存活计时起点。
                         _livenessTimer = 0;
                         SendHeartbeat();
+                        try { RoomEntered?.Invoke(); }
+                        catch (Exception ex) { MainFile.Logger.Warn($"[Bilibili] 连接提示失败: {ex.Message}"); }
                     }
                     else
                     {

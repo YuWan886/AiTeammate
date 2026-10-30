@@ -33,6 +33,7 @@ using MegaCrit.Sts2.Core.Nodes.Screens.CardSelection;
 using MegaCrit.Sts2.Core.Nodes.Screens.GameOverScreen;
 using MegaCrit.Sts2.Core.Nodes.Screens.Map;
 using MegaCrit.Sts2.Core.Nodes.Screens.Overlays;
+using MegaCrit.Sts2.Core.Nodes.Screens.TreasureRoomRelic;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.Saves;
@@ -163,6 +164,23 @@ internal static class AgentSnapshotBuilder
 
         FillRunSection(ctx, state);
 
+        // The pause menu is a capstone submenu, not an overlay: without this check the snapshot would
+        // report the room underneath as actionable while the player is paused.
+        // 暂停菜单不在 NOverlayStack 里，必须单独识别。
+        if (AgentActions.IsPauseMenuOpen())
+        {
+            ctx.Phase = "paused";
+            ctx.Actionable = false;
+            ctx.BlockedBy = "paused";
+            ctx.Json["controlled"] = new JsonObject
+            {
+                ["kind"] = ctx.AiPlayer != null && AgentDecisionBroker.Enabled ? "ai" : "local"
+            };
+            ctx.Notes.Add("The game is paused. Call sts2_resume to continue, "
+                          + "or sts2_save / sts2_quit_to_menu / sts2_abandon.");
+            return;
+        }
+
         if (ctx.AiPlayer != null && AgentDecisionBroker.Enabled)
         {
             FillAiDecision(ctx, ctx.AiPlayer);
@@ -183,6 +201,22 @@ internal static class AgentSnapshotBuilder
             ["name"] = SafeLoc(ctx.Local.Character?.Title, ctx.Local.Character?.Id.Entry ?? "player"),
             ["net_id"] = ctx.Local.NetId
         };
+
+        // dsh can park decisions for the local player too (kind=hand_select replaces the vanilla hand
+        // UI); while one is pending it is the only thing dsh should answer. 本地玩家也可能有挂起决策。
+        var localDecision = AgentDecisionBroker.SnapshotJson();
+        if (localDecision != null)
+        {
+            ctx.Phase = "ai_decision";
+            ctx.Actionable = true;
+            ctx.Json["decision"] = localDecision;
+            AppendCombatJson(ctx, ctx.Local, CombatManager.Instance.DebugOnlyGetState(), withOptions: false);
+            ctx.Notes.Add("The game is waiting for your "
+                          + (localDecision["kind"]?.GetValue<string>() ?? "card")
+                          + " decision. Read decision.prompt / decision.options and answer with "
+                          + "sts2_decide {decision: {...}} — use exactly the JSON shape the prompt asks for.");
+            return;
+        }
 
         DetectPhase(ctx);
 
@@ -217,6 +251,11 @@ internal static class AgentSnapshotBuilder
             ["solo_climb"] = SoloRunController.IsActive
         };
 
+        // The live board in both branches. The hand changes while the executor plays (cards and
+        // potions draw), so dsh can re-read it here instead of waiting for the next decision prompt
+        // to show the new cards. 实时手牌：抽到的牌在下次决策前也能看到。
+        AppendCombatJson(ctx, aiPlayer, CombatManager.Instance.DebugOnlyGetState(), withOptions: false);
+
         var decision = AgentDecisionBroker.SnapshotJson();
         if (decision != null)
         {
@@ -233,7 +272,7 @@ internal static class AgentSnapshotBuilder
         ctx.Actionable = false;
         ctx.BlockedBy = "ai_busy";
         ctx.Notes.Add("The AI is executing the previous decision (playing cards / resolving the room). "
-                      + "Call sts2_wait for the next decision.");
+                      + "Call sts2_wait for the next decision; sts2_state's combat section shows the live hand.");
     }
 
     /// <summary>
@@ -423,7 +462,6 @@ internal static class AgentSnapshotBuilder
     private static void DetectCombat(Context ctx)
     {
         var player = ctx.Local!;
-        var combat = player.PlayerCombatState!;
         var state = CombatManager.Instance.DebugOnlyGetState();
         var cm = CombatManager.Instance;
 
@@ -447,6 +485,22 @@ internal static class AgentSnapshotBuilder
         {
             ctx.BlockedBy = "combat_ending";
         }
+
+        AppendCombatJson(ctx, player, state, withOptions: true);
+    }
+
+    /// <summary>
+    /// Writes the <c>combat</c> section: HP / energy / stars / powers, the **live** hand, enemies and
+    /// pile counts. <paramref name="withOptions"/> also publishes the hand as <c>options</c> indices,
+    /// which only makes sense when the local human is driven through the UI actions; in AI mode dsh
+    /// answers decisions instead and only needs the board itself.
+    /// 战斗快照。AI 模式也带上实时手牌 —— 出牌/药水抽到的牌必须先让 dsh 看见。
+    /// </summary>
+    private static void AppendCombatJson(Context ctx, Player player, CombatState? state, bool withOptions)
+    {
+        var combat = player.PlayerCombatState;
+        if (combat == null)
+            return;
 
         var combatJson = new JsonObject
         {
@@ -495,14 +549,17 @@ internal static class AgentSnapshotBuilder
                     or TargetType.AnyAlly or TargetType.Osty,
                 ["description"] = desc
             });
-            ctx.Options.Add(new JsonObject
+            if (withOptions)
             {
-                ["index"] = handIndex,
-                ["kind"] = "card",
-                ["label"] = $"{name}{FormatCost(card)}",
-                ["detail"] = desc,
-                ["playable"] = playable
-            });
+                ctx.Options.Add(new JsonObject
+                {
+                    ["index"] = handIndex,
+                    ["kind"] = "card",
+                    ["label"] = $"{name}{FormatCost(card)}",
+                    ["detail"] = desc,
+                    ["playable"] = playable
+                });
+            }
             handIndex++;
         }
 
@@ -759,6 +816,15 @@ internal static class AgentSnapshotBuilder
         var options = GetRestOptions(player);
         if (options.Count == 0)
         {
+            // Once a rest-site option has been taken the options list empties out and the room
+            // only offers the proceed button. Fall back to it instead of deadlocking on
+            // "rest_not_ready"; a fresh room whose options are still loading has no enabled
+            // proceed button, so this stays non-actionable until the room is really ready.
+            DetectProceedOnly(ctx);
+            if (ctx.Actionable)
+                return;
+
+            ctx.Phase = "rest";
             ctx.Actionable = false;
             ctx.BlockedBy = "rest_not_ready";
             ctx.Notes.Add("The rest site options are not available yet; call sts2_wait.");
@@ -784,6 +850,13 @@ internal static class AgentSnapshotBuilder
         ctx.Actionable = anyEnabled;
         if (!anyEnabled)
         {
+            // A choice was already made (buttons are spent); the room only has proceed left.
+            DetectProceedOnly(ctx);
+            if (ctx.Actionable)
+                return;
+
+            ctx.Phase = "rest";
+            ctx.Actionable = false;
             ctx.BlockedBy = "rest_waiting";
             ctx.Notes.Add("No rest-site option is selectable right now (maybe a choice was already made). Proceed to leave.");
             return;
@@ -1067,10 +1140,39 @@ internal static class AgentSnapshotBuilder
             return true;
         }
 
+        // The chest is open: the relic it holds is an in-room card (NTreasureRoomRelicCollection),
+        // not an overlay, so it never shows up in the overlay-stack switch above.
+        var holders = GetTreasureRelicHolders(runNode);
+        if (holders.Count > 0)
+        {
+            ctx.Phase = "treasure_relic";
+            for (var i = 0; i < holders.Count; i++)
+            {
+                var model = holders[i].Relic?.Model;
+                ctx.Options.Add(new JsonObject
+                {
+                    ["index"] = i,
+                    ["kind"] = "treasure_relic",
+                    ["label"] = SafeLoc(model?.Title, model?.Id.Entry ?? "relic"),
+                    ["detail"] = SafeLoc(model?.DynamicDescription, "")
+                });
+            }
+
+            ctx.Actionable = true;
+            ctx.Notes.Add("Take the treasure relic with sts2_choose index=<n>.");
+            return true;
+        }
+
         // The chest was opened already and the relic overlay has not appeared yet.
         if (NOverlayStack.Instance?.Peek() != null)
             return false;
 
+        // Chest finished and nothing left to take: the room only offers its proceed button now.
+        DetectProceedOnly(ctx);
+        if (ctx.Actionable)
+            return true;
+
+        ctx.Phase = "treasure";
         ctx.Actionable = false;
         ctx.BlockedBy = "treasure_waiting";
         ctx.Notes.Add("The treasure room is not ready yet; call sts2_wait.");
@@ -1151,6 +1253,9 @@ internal static class AgentSnapshotBuilder
                 break;
             case "treasure":
                 ctx.Notes.Add("Use sts2_proceed to open the chest.");
+                break;
+            case "treasure_relic":
+                ctx.Notes.Add("Use sts2_choose index=<n> to take the treasure relic.");
                 break;
             case "room_proceed":
                 ctx.Notes.Add("Use sts2_proceed.");
@@ -1334,6 +1439,22 @@ internal static class AgentSnapshotBuilder
     internal static NButton? FindSkipButton(Node root) =>
         UiHelper.FindAll<NChoiceSelectionSkipButton>(root)
             .FirstOrDefault(b => GodotObject.IsInstanceValid(b) && b.IsVisibleInTree() && b.IsEnabled);
+
+    /// <summary>
+    /// The relic card(s) shown inside an opened treasure chest. Singleplayer shows one holder
+    /// (<c>%SingleplayerRelicHolder</c>); multiplayer with several relics shows one per relic.
+    /// </summary>
+    internal static List<NTreasureRoomRelicHolder> GetTreasureRelicHolders(Node? runNode)
+    {
+        if (runNode == null || !GodotObject.IsInstanceValid(runNode))
+            return new List<NTreasureRoomRelicHolder>();
+        return UiHelper.FindAll<NTreasureRoomRelicHolder>(runNode)
+            .Where(h => GodotObject.IsInstanceValid(h)
+                        && h.IsVisibleInTree()
+                        && h.IsEnabled
+                        && h.Relic?.Model != null)
+            .ToList();
+    }
 
     internal static bool IsRestButtonEnabled(NRestSiteRoom? room, RestSiteOption option)
     {

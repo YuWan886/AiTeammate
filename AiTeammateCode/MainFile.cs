@@ -6,7 +6,6 @@ using AiTeammate.AiTeammateCode.Bootstrap;
 using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Personality;
 using AiTeammate.AiTeammateCode.Settings;
-using AiTeammate.AiTeammateCode.Suggestion;
 
 namespace AiTeammate.AiTeammateCode;
 
@@ -43,7 +42,6 @@ public static class MainFile
             // Built-in personality text is localized, so seeding waits until LocManager exists
             // (NGame ready or the settings page build); mod initialization runs before it.
             AiSettingsPage.Register();
-            SuggestionHighlightState.Register();
 
             Logger.Info("设置初始化完成（人格数据将在游戏就绪时载入）");
         }

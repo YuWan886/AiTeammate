@@ -51,8 +51,6 @@ public static class AiSettingsPage
             (s, v) => { if (!string.IsNullOrEmpty(v)) s.DeepSeekApiKey = v; });
     private static readonly ModSettingsValueBinding<AiSettings, string> DeepSeekModel =
         B(s => s.DeepSeekModel, (s, v) => s.DeepSeekModel = v);
-    private static readonly ModSettingsValueBinding<AiSettings, string> DeepSeekModelPick =
-        B(s => s.DeepSeekModel, (s, v) => s.DeepSeekModel = v);
     private static readonly ModSettingsValueBinding<AiSettings, string> DeepSeekBaseUrl =
         B(s => s.DeepSeekBaseUrl, (s, v) => s.DeepSeekBaseUrl = v);
 
@@ -61,14 +59,10 @@ public static class AiSettingsPage
             (s, v) => { if (!string.IsNullOrEmpty(v)) s.OpenAiApiKey = v; });
     private static readonly ModSettingsValueBinding<AiSettings, string> OpenAiModel =
         B(s => s.OpenAiModel, (s, v) => s.OpenAiModel = v);
-    private static readonly ModSettingsValueBinding<AiSettings, string> OpenAiModelPick =
-        B(s => s.OpenAiModel, (s, v) => s.OpenAiModel = v);
     private static readonly ModSettingsValueBinding<AiSettings, string> OpenAiBaseUrl =
         B(s => s.OpenAiBaseUrl, (s, v) => s.OpenAiBaseUrl = v);
 
     private static readonly ModSettingsValueBinding<AiSettings, string> OllamaModel =
-        B(s => s.OllamaModel, (s, v) => s.OllamaModel = v);
-    private static readonly ModSettingsValueBinding<AiSettings, string> OllamaModelPick =
         B(s => s.OllamaModel, (s, v) => s.OllamaModel = v);
     private static readonly ModSettingsValueBinding<AiSettings, string> OllamaBaseUrl =
         B(s => s.OllamaBaseUrl, (s, v) => s.OllamaBaseUrl = v);
@@ -150,13 +144,6 @@ public static class AiSettingsPage
     private static readonly ModSettingsValueBinding<AiSettings, int> MaxChatHistoryForPrompt =
         B(s => s.MaxChatHistoryForPrompt, (s, v) => s.MaxChatHistoryForPrompt = v);
 
-    private static readonly ModSettingsValueBinding<AiSettings, bool> EnableSuggestions =
-        B(s => s.EnableSuggestions, (s, v) => s.EnableSuggestions = v);
-    private static readonly ModSettingsValueBinding<AiSettings, bool> AutoSuggestOnTurnStart =
-        B(s => s.AutoSuggestOnTurnStart, (s, v) => s.AutoSuggestOnTurnStart = v);
-    private static readonly ModSettingsValueBinding<AiSettings, int> MaxSuggestionsPerTurn =
-        B(s => s.MaxSuggestionsPerTurn, (s, v) => s.MaxSuggestionsPerTurn = v);
-
     private static readonly ModSettingsValueBinding<AiSettings, bool> EnableSoloClimb =
         B(s => s.EnableSoloClimb, (s, v) => s.EnableSoloClimb = v);
     private static readonly ModSettingsValueBinding<AiSettings, string> SoloCharacter =
@@ -229,16 +216,13 @@ public static class AiSettingsPage
                     description: S("settings.backend.deepseek_key.desc",
                         "The saved key is never shown. Type a new key to replace it, or use the clear row below."))
                     .WithEntryVisibleWhen("deepseek_api_key", () => IsBackend("DeepSeek"))
-                .AddString("deepseek_model", S("settings.backend.deepseek_model", "DeepSeek model"), DeepSeekModel,
-                    description: S("settings.backend.deepseek_model.desc", "For example, deepseek-v4-flash."))
-                    .WithEntryVisibleWhen("deepseek_model", () => IsBackend("DeepSeek"))
-                .AddDynamicChoice("deepseek_model_pick", S("settings.backend.deepseek_model.pick", "DeepSeek model list"),
-                    DeepSeekModelPick,
+                .AddDynamicChoice("deepseek_model", S("settings.backend.deepseek_model.pick", "DeepSeek model list"),
+                    DeepSeekModel,
                     () => BuildModelOptions("DeepSeek", AiSettingsStore.Current.DeepSeekModel),
                     description: S("settings.backend.model_pick.desc",
-                        "Models reported by the endpoint. Pick one to write it into the model field above; “Fetch models” refreshes this list."),
+                        "Models reported by the endpoint. Pick one to use it; “Fetch models” refreshes this list."),
                     presentation: ModSettingsChoicePresentation.Dropdown)
-                    .WithEntryVisibleWhen("deepseek_model_pick", () => IsBackend("DeepSeek"))
+                    .WithEntryVisibleWhen("deepseek_model", () => IsBackend("DeepSeek"))
                 .AddString("deepseek_base_url", S("settings.backend.deepseek_url", "DeepSeek Base URL"), DeepSeekBaseUrl)
                     .WithEntryVisibleWhen("deepseek_base_url", () => IsBackend("DeepSeek"))
                 .AddButton("deepseek_api_key_clear", S("settings.backend.deepseek_key.clear", "Clear DeepSeek key"),
@@ -251,15 +235,13 @@ public static class AiSettingsPage
                     description: S("settings.backend.openai_key.desc",
                         "The saved key is never shown. Type a new key to replace it, or use the clear row below."))
                     .WithEntryVisibleWhen("openai_api_key", () => IsBackend("OpenAI"))
-                .AddString("openai_model", S("settings.backend.openai_model", "OpenAI model"), OpenAiModel)
-                    .WithEntryVisibleWhen("openai_model", () => IsBackend("OpenAI"))
-                .AddDynamicChoice("openai_model_pick", S("settings.backend.openai_model.pick", "OpenAI model list"),
-                    OpenAiModelPick,
+                .AddDynamicChoice("openai_model", S("settings.backend.openai_model.pick", "OpenAI model list"),
+                    OpenAiModel,
                     () => BuildModelOptions("OpenAI", AiSettingsStore.Current.OpenAiModel),
                     description: S("settings.backend.model_pick.desc",
-                        "Models reported by the endpoint. Pick one to write it into the model field above; “Fetch models” refreshes this list."),
+                        "Models reported by the endpoint. Pick one to use it; “Fetch models” refreshes this list."),
                     presentation: ModSettingsChoicePresentation.Dropdown)
-                    .WithEntryVisibleWhen("openai_model_pick", () => IsBackend("OpenAI"))
+                    .WithEntryVisibleWhen("openai_model", () => IsBackend("OpenAI"))
                 .AddString("openai_base_url", S("settings.backend.openai_url", "OpenAI Base URL"), OpenAiBaseUrl)
                     .WithEntryVisibleWhen("openai_base_url", () => IsBackend("OpenAI"))
                 .AddButton("openai_api_key_clear", S("settings.backend.openai_key.clear", "Clear OpenAI key"),
@@ -267,15 +249,13 @@ public static class AiSettingsPage
                     ModSettingsButtonTone.Normal,
                     S("settings.backend.openai_key.clear.desc", "Remove the saved OpenAI key from this PC."))
                     .WithEntryVisibleWhen("openai_api_key_clear", () => IsBackend("OpenAI"))
-                .AddString("ollama_model", S("settings.backend.ollama_model", "Ollama model"), OllamaModel)
-                    .WithEntryVisibleWhen("ollama_model", () => IsBackend("Ollama"))
-                .AddDynamicChoice("ollama_model_pick", S("settings.backend.ollama_model.pick", "Ollama model list"),
-                    OllamaModelPick,
+                .AddDynamicChoice("ollama_model", S("settings.backend.ollama_model.pick", "Ollama model list"),
+                    OllamaModel,
                     () => BuildModelOptions("Ollama", AiSettingsStore.Current.OllamaModel),
                     description: S("settings.backend.model_pick.desc",
-                        "Models reported by the endpoint. Pick one to write it into the model field above; “Fetch models” refreshes this list."),
+                        "Models reported by the endpoint. Pick one to use it; “Fetch models” refreshes this list."),
                     presentation: ModSettingsChoicePresentation.Dropdown)
-                    .WithEntryVisibleWhen("ollama_model_pick", () => IsBackend("Ollama"))
+                    .WithEntryVisibleWhen("ollama_model", () => IsBackend("Ollama"))
                 .AddString("ollama_base_url", S("settings.backend.ollama_url", "Ollama Base URL"), OllamaBaseUrl)
                     .WithEntryVisibleWhen("ollama_base_url", () => IsBackend("Ollama"))
                 .AddToggle("thinking", S("settings.backend.thinking", "Enable model thinking"), EnableModelThinking,
@@ -350,7 +330,7 @@ public static class AiSettingsPage
                     S("settings.personality.restore.button", "Restore"), RestorePersonality)
             )
             .AddSection("chat", section => section
-                .WithTitle(S("settings.section.chat", "Chat & Suggestions"))
+                .WithTitle(S("settings.section.chat", "Chat"))
                 .AddToggle("ai_chat", S("settings.chat.enabled", "Enable AI chat"), EnableAIChat)
                 .AddToggle("speech_bubble", S("settings.chat.bubble", "Show speech bubbles"), EnableSpeechBubble)
                 .AddIntSlider("chat_cooldown", S("settings.chat.cooldown", "Auto-chat cooldown (ms)"), ChatCooldownMs,
@@ -359,13 +339,6 @@ public static class AiSettingsPage
                 .AddIntSlider("chat_history", S("settings.chat.history", "Chat history entries in prompt"), MaxChatHistoryForPrompt,
                     0, 30, 1)
                     .WithEntryVisibleWhen("chat_history", () => AiSettingsStore.Current.EnableAIChat)
-                .AddToggle("suggestions", S("settings.suggestions.enabled", "Enable card suggestions"), EnableSuggestions)
-                .AddToggle("auto_suggest", S("settings.suggestions.auto", "Auto-suggest at turn start"), AutoSuggestOnTurnStart,
-                    description: S("settings.suggestions.auto.desc", "Requests suggestions and highlights cards each turn, consuming extra tokens."))
-                    .WithEntryVisibleWhen("auto_suggest", () => AiSettingsStore.Current.EnableSuggestions)
-                .AddIntSlider("max_suggestions", S("settings.suggestions.max", "Max suggestions per turn"), MaxSuggestionsPerTurn,
-                    1, 10, 1)
-                    .WithEntryVisibleWhen("max_suggestions", () => AiSettingsStore.Current.EnableSuggestions)
             )
             .AddSection("live", section => section
                 .WithTitle(S("settings.section.live", "Bilibili Live Danmaku"))
@@ -497,11 +470,6 @@ public static class AiSettingsPage
                     S("settings.agent.restart.button", "Restart"), RestartAgentBridge,
                     ModSettingsButtonTone.Normal,
                     S("settings.agent.restart.desc", "Apply the port/token changes immediately and rebind the bridge."))
-                .AddButton("agent_copy", S("settings.agent.copy.label", "dsh plugin"),
-                    S("settings.agent.copy.button", "Copy install command"), CopyAgentInstallCommand,
-                    ModSettingsButtonTone.Accent,
-                    S("settings.agent.copy.desc",
-                        "Copies the command that installs the bundled dsh plugin into your web profile."))
             )
             .AddSection("maintenance", section => section
                 .WithTitle(S("settings.section.maintenance", "Maintenance"))
@@ -564,21 +532,6 @@ public static class AiSettingsPage
         {
             AgentBridgeService.Restart();
             RitsuToastService.ShowInfo(DescribeAgentBridgeStatus());
-        }
-        catch (Exception ex)
-        {
-            RitsuToastService.ShowError(ex.Message);
-        }
-    }
-
-    private static void CopyAgentInstallCommand(IModSettingsUiActionHost host)
-    {
-        try
-        {
-            const string command = "dsh plugin --profile web add -w dsh-sts2";
-            DisplayServer.ClipboardSet(command);
-            RitsuToastService.ShowInfo(AiLoc.T("toast.agent_command_copied",
-                "Install command copied to the clipboard."));
         }
         catch (Exception ex)
         {

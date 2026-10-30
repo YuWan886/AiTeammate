@@ -24,14 +24,12 @@ public static class CombatManagerPatch
         manager.DecisionService.ResetCombatHistory();
         manager.DirectiveManager.ResetCombat();
         manager.ResetExtraPlayerTurnCombatDecisionState();
-        manager.CardHighlighter.ClearAllHighlights();
         CombatDecisionExecutor.ResetReadyToBeginEnemyTurnSignal();
 
         // Subscribe to combat events once per session
         if (!_eventsSubscribed)
         {
             CombatManager.Instance.TurnStarted += OnTurnStarted;
-            CombatManager.Instance.TurnEnded += OnTurnEnded;
             CombatManager.Instance.CombatWon += OnCombatWon;
             _eventsSubscribed = true;
         }
@@ -115,14 +113,6 @@ public static class CombatManagerPatch
         {
             manager.ResetExtraPlayerTurnCombatDecisionState();
             CombatDecisionExecutor.ResetReadyToBeginEnemyTurnSignal();
-
-            var settings = Settings.AiSettingsStore.Current;
-            if (!manager.IsSoloControlled && settings.EnableSuggestions && settings.AutoSuggestOnTurnStart)
-            {
-                var human = MegaCrit.Sts2.Core.Context.LocalContext.GetMe(state);
-                if (human != null)
-                    _ = manager.OnPlayerTurnStarted(human);
-            }
         }
 
         try
@@ -133,11 +123,6 @@ public static class CombatManagerPatch
         {
             MainFile.Logger.Error($"AI turn error: {ex.Message}");
         }
-    }
-
-    private static void OnTurnEnded(CombatState state)
-    {
-        AiTeammateManager.Instance.CardHighlighter?.ClearAllHighlights();
     }
 
     private static void OnCombatWon(MegaCrit.Sts2.Core.Rooms.CombatRoom room)

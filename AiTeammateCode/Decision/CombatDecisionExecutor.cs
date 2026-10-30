@@ -11,6 +11,7 @@ using MegaCrit.Sts2.Core.MonsterMoves.Intents;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
 using MegaCrit.Sts2.Core.Platform;
 using MegaCrit.Sts2.Core.Runs;
+using AiTeammate.AiTeammateCode.Agent;
 using AiTeammate.AiTeammateCode.Solo;
 
 namespace AiTeammate.AiTeammateCode.Decision;
@@ -158,8 +159,13 @@ public class CombatDecisionExecutor
                 if (PausedMidTurn) return cardsPlayed;
             }
 
-            // Phase 3: Play any remaining playable cards
-            if (!CombatManager.Instance.IsOverOrEnding && (combat.Energy > 0 || combat.Stars > 0))
+            // Phase 3: Play any remaining playable cards.
+            // Not when an external agent supplies the decisions: cards drawn mid-turn (by cards or
+            // potions) must be seen by it, so the pass loop re-asks instead of spending the energy
+            // on cards it never saw. The caller decides whether another decision pass is worth it.
+            if (!AgentDecisionBroker.Enabled
+                && !CombatManager.Instance.IsOverOrEnding
+                && (combat.Energy > 0 || combat.Stars > 0))
             {
                 cardsPlayed += await PlayRemainingCards(aiPlayer, state, combat, cardsPlayed);
             }

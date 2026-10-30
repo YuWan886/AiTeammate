@@ -28,6 +28,11 @@ using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using AiTeammate.AiTeammateCode.Decision;
 using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Solo;
+using AiTeammate.AiTeammateCode.Agent;
+using AiTeammate.AiTeammateCode.Personality;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace AiTeammate.AiTeammateCode.Patches;
 
@@ -1093,11 +1098,74 @@ public static class FromHandAiPatch
         ref Task<IEnumerable<CardModel>> __result)
     {
         var manager = AiTeammateManager.Instance;
-        if (!manager.IsInitialized || manager.AiPlayer == null) return true;
+        if (!manager.IsInitialized) return true;
+
+        // dsh owns the local player: never open the vanilla hand-selection UI (it soft-locks),
+        // park a hand_select decision for the external agent instead.
+        if (DshHandSelect.AppliesTo(player))
+        {
+            __result = SelectFromHandForDshAsync(context, player, prefs, filter, source, manager);
+            return false;
+        }
+
+        if (manager.AiPlayer == null) return true;
         if (player.NetId != manager.AiPlayer.NetId) return true;
 
         __result = SelectFromHandForAiAsync(context, player, prefs, filter, source, manager);
         return false;
+    }
+
+    private static async Task<IEnumerable<CardModel>> SelectFromHandForDshAsync(
+        PlayerChoiceContext context,
+        Player player,
+        CardSelectorPrefs prefs,
+        Func<CardModel, bool>? filter,
+        AbstractModel source,
+        AiTeammateManager manager)
+    {
+        if (CombatManager.Instance.IsOverOrEnding)
+            return Array.Empty<CardModel>();
+
+        NPlayerHand.Instance?.CancelAllCardPlay();
+
+        var cards = PileType.Hand.GetPile(player).Cards
+            .Where(filter ?? (_ => true))
+            .ToList();
+
+        if (cards.Count == 0)
+            return cards;
+
+        if (!prefs.RequireManualConfirmation && cards.Count <= prefs.MinSelect)
+            return cards;
+
+        var choiceId = RunManager.Instance.PlayerChoiceSynchronizer.ReserveChoiceId(player);
+        await Compat.GameCompat.SignalPlayerChoiceBegun(context, player, PlayerChoiceOptions.CancelPlayCardActions);
+        try
+        {
+            var pickCount = CardGridSelectionPatch.ResolveHandSelectionCount(cards.Count, prefs.MinSelect, prefs.MaxSelect);
+            var selectionTag = CardGridSelectionPatch.DescribeHandSelectionSource(source, prefs, "FromHand");
+            var picked = pickCount == 0
+                ? new List<CardModel>()
+                : await DshHandSelect.AskAsync(player, cards, pickCount, selectionTag, CancellationToken.None);
+
+            var names = picked.Count > 0
+                ? string.Join(", ", picked.Select(c => c.Title ?? c.Id.Entry))
+                : "(空)";
+
+            MainFile.Logger.Info($"[Agent] FromHand hand_select: [{names}] for {selectionTag} (pick={pickCount})");
+            manager.AiLog.Log("AI_ACTION", $"手牌选牌(dsh): {names} | {selectionTag}");
+
+            RunManager.Instance.PlayerChoiceSynchronizer.SyncLocalChoice(
+                player,
+                choiceId,
+                PlayerChoiceResult.FromMutableCombatCards(picked));
+
+            return picked;
+        }
+        finally
+        {
+            await AiPlayerChoiceContextHelper.EndChoiceAsync(context, player);
+        }
     }
 
     private static async Task<IEnumerable<CardModel>> SelectFromHandForAiAsync(
@@ -1166,11 +1234,65 @@ public static class FromHandForUpgradeAiPatch
         ref Task<CardModel?> __result)
     {
         var manager = AiTeammateManager.Instance;
-        if (!manager.IsInitialized || manager.AiPlayer == null) return true;
+        if (!manager.IsInitialized) return true;
+
+        // dsh owns the local player: park a hand_select decision instead of opening the vanilla
+        // UpgradeSelect UI, which dsh has no way to complete. 升级选牌改由 dsh 决策。
+        if (DshHandSelect.AppliesTo(player))
+        {
+            __result = SelectUpgradeFromHandForDshAsync(context, player, source, manager);
+            return false;
+        }
+
+        if (manager.AiPlayer == null) return true;
         if (player.NetId != manager.AiPlayer.NetId) return true;
 
         __result = SelectUpgradeFromHandForAiAsync(context, player, source, manager);
         return false;
+    }
+
+    private static async Task<CardModel?> SelectUpgradeFromHandForDshAsync(
+        PlayerChoiceContext context,
+        Player player,
+        AbstractModel source,
+        AiTeammateManager manager)
+    {
+        if (CombatManager.Instance.IsOverOrEnding)
+            return null;
+
+        NPlayerHand.Instance?.CancelAllCardPlay();
+
+        var cards = PileType.Hand.GetPile(player).Cards
+            .Where(c => c.IsUpgradable)
+            .ToList();
+
+        if (cards.Count <= 1)
+            return cards.FirstOrDefault();
+
+        var choiceId = RunManager.Instance.PlayerChoiceSynchronizer.ReserveChoiceId(player);
+        await Compat.GameCompat.SignalPlayerChoiceBegun(context, player, PlayerChoiceOptions.CancelPlayCardActions);
+        try
+        {
+            var sourceTag = source is CardModel sourceCard ? sourceCard.Id.Entry : "Upgrade";
+            var picked = await DshHandSelect.AskAsync(
+                player, cards, 1, sourceTag, CancellationToken.None, "从中挑一张手牌升级");
+            var selected = picked.FirstOrDefault();
+            var selectedName = selected?.Title ?? selected?.Id.Entry ?? "(空)";
+
+            MainFile.Logger.Info($"[Agent] FromHandForUpgrade hand_select: [{selectedName}]");
+            manager.AiLog.Log("AI_ACTION", $"手牌升级选择(dsh): {selectedName}");
+
+            RunManager.Instance.PlayerChoiceSynchronizer.SyncLocalChoice(
+                player,
+                choiceId,
+                PlayerChoiceResult.FromMutableCombatCard(selected));
+
+            return selected;
+        }
+        finally
+        {
+            await AiPlayerChoiceContextHelper.EndChoiceAsync(context, player);
+        }
     }
 
     private static async Task<CardModel?> SelectUpgradeFromHandForAiAsync(
@@ -1213,6 +1335,145 @@ public static class FromHandForUpgradeAiPatch
         {
             await AiPlayerChoiceContextHelper.EndChoiceAsync(context, player);
         }
+    }
+}
+
+// ---- dsh hand selection: replace the vanilla hand UI with a parked hand_select decision ----
+/// <summary>
+/// When dsh drives the local player, <c>NPlayerHand.SelectCards</c> would open a UI that dsh cannot
+/// complete (and that soft-locks combat). Instead we park a <c>kind=hand_select</c> decision in
+/// <see cref="AgentDecisionBroker"/> with the candidate cards as <c>options</c>; dsh answers with
+/// <c>sts2_decide {"indices":[...]}</c> and the existing SyncLocalChoice path hands it back.
+/// </summary>
+internal static class DshHandSelect
+{
+    /// <summary>True when <paramref name="player"/> is the local player driven by dsh (not the mod's AI player).</summary>
+    public static bool AppliesTo(Player player)
+    {
+        if (!AgentDecisionBroker.Enabled)
+            return false;
+
+        var manager = AiTeammateManager.Instance;
+        if (manager == null || !manager.IsInitialized)
+            return false;
+
+        // When the mod drives an AI player in this run, dsh is that AI's brain and the human local
+        // player still uses the normal UI; only a plain local-player takeover needs this path.
+        var runState = RunManager.Instance?.DebugOnlyGetState();
+        if (manager.AiPlayer != null && runState != null && runState.Players.Contains(manager.AiPlayer))
+            return false;
+
+        return LocalContext.NetId is ulong localId && player.NetId == localId;
+    }
+
+    /// <summary>
+    /// Parks a hand_select decision and returns the cards dsh picked (heuristic fallback when it
+    /// never answers). Always returns exactly <paramref name="pickCount"/> cards when possible.
+    /// </summary>
+    public static async Task<List<CardModel>> AskAsync(
+        Player player, List<CardModel> cards, int pickCount, string selectionType,
+        CancellationToken ct, string? header = null)
+    {
+        if (cards.Count == 0 || pickCount <= 0)
+            return new List<CardModel>();
+
+        var options = new JsonArray();
+        var prompt = new StringBuilder();
+        prompt.AppendLine($"[手牌选择] 来源: {selectionType}");
+        if (!string.IsNullOrWhiteSpace(header))
+            prompt.AppendLine(header!);
+        prompt.AppendLine($"需要从下面的手牌中选择 {pickCount} 张（只能选这个列表里的牌）：");
+        for (var i = 0; i < cards.Count; i++)
+        {
+            var card = cards[i];
+            prompt.AppendLine($"{i}: {card.Title ?? card.Id.Entry}");
+            options.Add(new JsonObject
+            {
+                ["index"] = i,
+                ["card"] = card.Title ?? card.Id.Entry,
+                ["upgradable"] = card.IsUpgradable
+            });
+        }
+        prompt.AppendLine("请以 JSON 返回：{\"indices\":[...], \"reason\":\"理由\"}");
+
+        var systemPrompt = PersonalityPromptBuilder.BuildExternalAgentSystemPrompt(
+            requireJson: true, includeTeamPrinciples: false);
+
+        // The game's action queue is waiting on this choice: don't hold it for the broker's full
+        // 300s budget when dsh is attached but idle.
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+        var answer = await AgentDecisionBroker.RequestAsync(
+            player, "hand_select", systemPrompt, prompt.ToString(), linkedCts.Token, options);
+        var picked = ParseIndices(answer, cards.Count)
+            .Select(index => cards[index])
+            .ToList();
+
+        if (string.IsNullOrWhiteSpace(answer))
+            MainFile.Logger.Warn($"[Agent] hand_select not answered ({selectionType}); falling back to heuristic");
+
+        // Never hand the game an empty/partial selection: top up in heuristic order.
+        if (picked.Count < pickCount)
+        {
+            foreach (var candidate in CardGridSelectionPatch.PickCardsByHeuristic(
+                         cards, pickCount, pickCount, selectionType))
+            {
+                if (picked.Contains(candidate)) continue;
+                picked.Add(candidate);
+                if (picked.Count >= pickCount) break;
+            }
+        }
+
+        return picked.Count > pickCount ? picked.Take(pickCount).ToList() : picked;
+    }
+
+    /// <summary>Parses {"indices":[...]} (or a single {"index":n}); invalid entries are dropped.</summary>
+    private static List<int> ParseIndices(string? answer, int cardCount)
+    {
+        var indices = new List<int>();
+        if (string.IsNullOrWhiteSpace(answer))
+            return indices;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(ResponseParser.ExtractJson(answer));
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                return indices;
+
+            if (root.TryGetProperty("indices", out var array) && array.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var element in array.EnumerateArray())
+                {
+                    var index = ReadIndex(element);
+                    if (index.HasValue && index.Value >= 0 && index.Value < cardCount
+                        && !indices.Contains(index.Value))
+                        indices.Add(index.Value);
+                }
+            }
+            else if (root.TryGetProperty("index", out var single))
+            {
+                var index = ReadIndex(single);
+                if (index.HasValue && index.Value >= 0 && index.Value < cardCount)
+                    indices.Add(index.Value);
+            }
+        }
+        catch
+        {
+            // Malformed answer: the heuristic fallback takes over.
+        }
+
+        return indices;
+    }
+
+    private static int? ReadIndex(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out var number))
+            return number;
+        if (element.ValueKind == JsonValueKind.String && int.TryParse(element.GetString(), out number))
+            return number;
+        return null;
     }
 }
 

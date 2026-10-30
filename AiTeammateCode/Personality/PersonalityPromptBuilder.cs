@@ -43,6 +43,29 @@ public class PersonalityPromptBuilder
         return sb.ToString();
     }
 
+    /// <summary>
+    /// System prompt for a run an external agent (dsh) drives: that agent brings its own persona, so
+    /// the mod must not layer its personality profile on top of it. 外接 Agent 接管时不再注入人格设定。
+    /// </summary>
+    public static string BuildExternalAgentSystemPrompt(bool requireJson, bool includeTeamPrinciples)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine(AiLoc.T("prompt.system.external_agent",
+            "An external agent drives this run and defines the character's persona, voice and tactics; this mod injects no personality."));
+
+        if (includeTeamPrinciples)
+            sb.AppendLine(AiLoc.T("prompt.system.team",
+                "Teamwork: check teammates and synergy first, protect low-HP teammates, don't steal kills, and consult [reference material] before deciding."));
+
+        sb.AppendLine(requireJson
+            ? AiLoc.T("prompt.system.output_json", "Output requirement: return valid JSON only; output nothing else.")
+            : AiLoc.T("prompt.system.output_text", "Output requirement: English, concise, like a real player; avoid generic analysis tone."));
+        sb.AppendLine(AiLoc.T("prompt.system.output_language",
+            "Output language: all player-facing text (chat, suggestions, thinking summaries) must be in English."));
+
+        return sb.ToString();
+    }
+
     public string AppendTeamPrinciples(string systemPrompt)
     {
         var sb = new StringBuilder(systemPrompt);

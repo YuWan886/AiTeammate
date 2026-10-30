@@ -27,8 +27,25 @@ v1 只让 dsh 操作**本地真人玩家**。v2 增加了一条更重要的通�
   - 单人爬塔不再需要关掉开关：`SoloRunController` 的循环照常跑，只是每步决策在等 dsh，天然「自动退位」。
   - 多人局里 AI 队友的选牌/事件/商店/篝火/地图投票也一并交给 dsh（这些流程只存在于数据层，本地没有可点的 UI）。
   - 没有 AI 玩家（普通单人局）时行为与 v1 相同：dsh 用 UI 动作自己玩。
-- 失败与超时：单个决策最多等 300 秒；客户端断开（客户端数降到 0）会立刻 `Abort`，等待方返回空内容，走 mod 原有的兜底路径；战斗回合的 45 秒硬安全网在有外部大脑时放宽到 330 秒。
+- 失败与超时：单个决策最多等 300 秒；客户端断开（客户端数降到 0）会立刻 `Abort`，等待方返回空内容，走 mod 原有的兜底路径；战斗回合的 45 秒硬安全网在有外部大脑时放宽到 `330 + 90×(单回合决策次数-1)` 秒。
 - 动作归属：`controlled.kind=ai` 时 `sts2_play_card` 等 UI 动作会被拒绝（避免与内置执行器抢同一玩家），只能用 `sts2_decide`。
+
+### 1.2 战斗中的抽牌（v2.1）
+
+内置 AI 的战斗执行器在打完计划牌之后还有一个 Phase 3：用启发式把手里剩下能打的牌全部打掉。对 dsh 来说这一步是错的——出牌、药水抽到的新牌它根本没看见，就被启发式花掉了。现在：
+
+- `controlled.kind=ai` 时 **Phase 3 关闭**（`CombatDecisionExecutor` 判 `AgentDecisionBroker.Enabled`）。每执行完一次决策，只要仍有能量/辉星且手牌里有能打出的牌，`ProcessCombatTurnAsync` 会**再挂一次决策**，prompt 里就是抽完牌之后的新手牌与新牌堆；单回合最多 6 次决策（内置后端仍是 3 次）。
+- 计划里显式返回 `{"type":"end_turn"}` 时立即停止追加决策（内置后端也尊重该动作，只是它的 Phase 3 已经先出完剩余牌）。
+- `ai_decision` / `ai_busy` 两种快照都带上了 `combat` 段（实时手牌、能量/辉星、敌人、牌堆张数）。执行期间（`ai_busy`）也可以用 `sts2_state` 直接看到抽到的牌；`options` 在 AI 模式下仍为空——出牌要用 `sts2_decide`，不用索引。
+- 决策内容里返回 `tool_calls`（`read_pile` / `card_info` …）同样有效：游戏在主线程执行完只读工具，把结果拼进新 prompt 后**再挂一次决策**，不会像以前那样掉进启发式兜底。图片类工具（`screenshot`）没有图像回传通道，`sts2_screenshot` 请当作独立工具调用。
+- 内置 LLM 后端行为不变：仍是每回合最多 3 次决策，Phase 3 照常补牌。
+
+### 1.3 手牌选择、运行控制与人格（v2.2）
+
+- dsh 接管本地玩家时，`CardSelectCmd.FromHand` / `FromHandForUpgrade` 不再打开原版手牌选择 UI（`NPlayerHand.SelectCards` 会一直等真人点击，dsh 无法完成；期间 `play_card` / `end_turn` 还会抢着执行，造成软锁与 ERROR 刷屏）。现在改为在 `AgentDecisionBroker` 挂一个 `kind=hand_select` 决策：`options=[{index, card, upgradable}]`，dsh 用 `sts2_decide {"indices":[...], "reason":"..."}` 回答，模组照原有写法 `SyncLocalChoice` 交回；超时/未回答则启发式兜底，绝不把空选择交给游戏。
+- `sts2_play_card` / `sts2_end_turn` 在 `NPlayerHand.IsInCardSelection` 为真时直接拒绝并提示先回答选牌决策。
+- 运行控制工具：`sts2_pause` / `sts2_resume` / `sts2_save` / `sts2_quit_to_menu` / `sts2_abandon`。暂停菜单（capstone submenu）不在 overlay 栈里，快照单独识别为 `phase=paused`、不可行动。
+- 人格：`AgentDecisionBroker.Enabled` 时 system prompt 不再包含 mod 的人格档案与长期记忆（改为 `prompt.system.external_agent`），人格由 dsh 自己决定；只保留 JSON/语言等输出要求与团队协作原则。
 
 
 ## 2. 为什么用 dsh 插件而不是 MCP
@@ -150,8 +167,9 @@ TCP + UTF-8 行分隔 JSON。每行一个请求，服务器每行一个响应。
 | phase | 来源 | 可用动作 |
 |---|---|---|
 | `menu` | 没有进行中的存档（主菜单） | `start_run` / `continue_run`；`options` 列出可选角色 |
-| `ai_decision` | AI 玩家有一个决策挂在 `AgentDecisionBroker` 上 | `sts2_decide`（`decision` 里带 prompt 与期望 JSON） |
-| `ai_busy` | AI 正在执行上一条决策（出牌/结算房间） | 无；`sts2_wait` 等下一个决策 |
+| `ai_decision` | 有决策挂在 `AgentDecisionBroker` 上（AI 玩家的决策，或本地玩家的 `kind=hand_select` 选牌） | `sts2_decide`（`decision` 里带 prompt/options 与期望 JSON）；`combat` 段是实时局面 |
+| `ai_busy` | AI 正在执行上一条决策（出牌/结算房间） | 无；`sts2_wait` 等下一个决策，`sts2_state.combat` 可看实时手牌/抽到的牌 |
+| `paused` | 暂停菜单（capstone submenu）打开 | `sts2_resume` / `sts2_save` / `sts2_quit_to_menu` / `sts2_abandon` |
 | `combat` | `CombatManager.IsInProgress` | `play_card` / `use_potion` / `discard_potion` / `end_turn` |
 | `map` | `NMapScreen.IsOpen` | `choose`；另带 `map` 字段=全幕路线图（与内置 AI 同一份文本） |
 | `rewards` | `NRewardsScreen` overlay | `choose`（领取）/ `proceed` |
@@ -249,6 +267,11 @@ export function apply(ctx, config) { /* 注册工具 + 连接 + autoplay */ }
 | `sts2_decide` | `{decision}` | **v2**：回答 `phase=ai_decision` 里的挂起决策；内容是 prompt 要求的 JSON（对象或字符串均可） |
 | `sts2_start_run` | `{character?, ascension?, seed?}` | **v2**：从主菜单开一局新的单人游戏 |
 | `sts2_continue_run` | `{}` | **v2**：读取存档继续 |
+| `sts2_pause` | `{}` | 打开暂停菜单（`NPauseMenu`）；单人爬塔/AI 队友模式下同时挂起自动化。快照变为 `phase=paused`、不可行动 |
+| `sts2_resume` | `{}` | 关闭暂停菜单并解除自动化挂起 |
+| `sts2_save` | `{}` | 立即写盘当前存档（单人/主机；客户端会被拒绝）。游戏平时在检查点自动存档 |
+| `sts2_quit_to_menu` | `{}` | 存档并返回主菜单（等价暂停菜单的 Save and Quit） |
+| `sts2_abandon` | `{}` | 放弃当前局并返回主菜单（会删除当前存档）；只允许单人/主机，客户端会被拒绝 |
 | `sts2_play_card` | `{card, target?}` | 出牌；`card` 为手牌索引或卡名（`controlled.kind=local` 时可用）。走 `CardModel.TryManualPlay`＝手牌 UI 的同一条路（`PlayCardAction`），会正常扣能量/辉星并触发「打出一张牌」钩子；`CardCmd.AutoPlay` 是「免费打出」，不扣费，不能用于这里 |
 | `sts2_use_potion` | `{potion, target?}` | 用药水；`AnyTime` 药水在战斗外也能用 |
 | `sts2_discard_potion` | `{potion}` | **v2**：丢弃药水 |
@@ -318,7 +341,7 @@ Continue with the sts2_* tools. Current state:
 | `AgentBridgeToken` | `""` | 可选请求 token |
 | `AgentBridgeAllowActions` | `true` | 允许动作工具；关闭后只能读 |
 
-设置页显示运行状态（运行中 / 端口占用 / 错误）和**已连接的 dsh 客户端数**，并提供「复制 dsh 插件安装命令」按钮。连接/断开时 `AiLogger` 记录 `[Agent] client connected/disconnected`。由于插件是懒连接，只有 dsh 第一次调用 `sts2_*` 工具后才会看到客户端。
+设置页显示运行状态（运行中 / 端口占用 / 错误）和**已连接的 dsh 客户端数**。连接/断开时 `AiLogger` 记录 `[Agent] client connected/disconnected`。由于插件是懒连接，只有 dsh 第一次调用 `sts2_*` 工具后才会看到客户端。
 
 ### 9.1 dsh 侧为什么默认“没有端口设置、看不到连接状态”
 
@@ -416,7 +439,7 @@ dsh --profile web --dump-config
 | `AiTeammateCode/Agent/AgentActions.cs` | 各动作的游戏 API/UI 实现 |
 | `AiTeammateCode/Agent/AgentDecisionBroker.cs` | v2：把 AI 的决策调用挂起，等 dsh 用 `sts2_decide` 回答 |
 | `AiTeammateCode/Settings/AiSettings.cs` | 4 个新设置字段 |
-| `AiTeammateCode/Settings/AiSettingsPage.cs` | 新分区、状态段落、复制安装命令 |
+| `AiTeammateCode/Settings/AiSettingsPage.cs` | 新分区、状态段落、重启按钮 |
 | `AiTeammateCode/Patches/NGamePatch.cs` | 挂载 supervisor |
 | `AiTeammate/localization/{eng,zhs}.json` | 设置/提示文案 |
 | `docs/dsh-agent-bridge.md` | 本文档 |

@@ -16,7 +16,6 @@ using AiTeammate.AiTeammateCode.Decision;
 using AiTeammate.AiTeammateCode.Personality;
 using AiTeammate.AiTeammateCode.Settings;
 using AiTeammate.AiTeammateCode.Solo;
-using AiTeammate.AiTeammateCode.Suggestion;
 using AiTeammate.AiTeammateCode.Teamwork;
 using AiTeammate.AiTeammateCode.Patches;
 using AiTeammate.AiTeammateCode.Localization;
@@ -27,6 +26,17 @@ namespace AiTeammate.AiTeammateCode;
 public class AiTeammateManager
 {
     private const int MaxCombatDecisionPassesPerTurn = 3;
+
+    /// <summary>
+    /// dsh answers every pass itself and the executor no longer auto-plays leftover cards, so a turn
+    /// with draw effects needs more than one decision. Passes are only spent while energy and a
+    /// playable card remain, so this cap only guards against pathological draw loops.
+    /// 外部 Agent 当大脑时，每轮抽到的新牌都要再决策一次。
+    /// </summary>
+    private const int MaxExternalAgentCombatDecisionPassesPerTurn = 6;
+
+    /// <summary>Extra hard-timeout budget per decision pass beyond the first (dsh round trips).</summary>
+    private const int ExternalAgentCombatTurnSecondsPerExtraPass = 90;
     private static readonly Lazy<AiTeammateManager> _instance = new(() => new());
     public static AiTeammateManager Instance => _instance.Value;
 
@@ -36,12 +46,10 @@ public class AiTeammateManager
     public ContentQueryService QueryService { get; private set; } = null!;
     public DecisionService DecisionService { get; private set; } = null!;
     public ChatManager ChatManager { get; private set; } = null!;
-    public SuggestionService SuggestionService { get; private set; } = null!;
     public ConversationContextManager ConversationContext { get; private set; } = null!;
     public PlayerDirectiveManager DirectiveManager { get; private set; } = null!;
     public CombatDecisionExecutor CombatExecutor { get; private set; } = null!;
     public OutOfCombatExecutor OutOfCombatExecutor { get; private set; } = null!;
-    public CardHighlighter CardHighlighter { get; private set; } = null!;
     public DecisionValidator Validator { get; private set; } = null!;
 
     public AiLogger AiLog { get; private set; } = null!;
@@ -90,10 +98,8 @@ public class AiTeammateManager
         // Services
         DecisionService = new DecisionService(BackendManager, PersonalityManager, QueryService, ConversationContext);
         ChatManager = new ChatManager(BackendManager, PersonalityManager, QueryService, ConversationContext, DirectiveManager);
-        SuggestionService = new SuggestionService(BackendManager, PersonalityManager, QueryService, ConversationContext);
         CombatExecutor = new CombatDecisionExecutor(AiLog);
         OutOfCombatExecutor = new OutOfCombatExecutor(DecisionService);
-        CardHighlighter = new CardHighlighter();
         Validator = new DecisionValidator();
 
         IsInitialized = true;
@@ -104,16 +110,12 @@ public class AiTeammateManager
         // HextechRunes integration (soft dependency)
         try
         {
+            // Also waits for the Hextech assembly when it has not been loaded yet (load order is not guaranteed).
+            HextechRunesPatchInstaller.Initialize();
             if (HextechRunesDecisionHandler.IsAvailable)
-            {
-                var harmony = new HarmonyLib.Harmony(MainFile.ModId + ".HextechRunes");
-                HextechRunesPatchInstaller.TryInstall(harmony);
                 AiLog.Log("SYSTEM", "海克斯符文集成已启用");
-            }
             else
-            {
-                MainFile.Logger.Info("[HextechRunes] 未检测到海克斯符文mod，跳过集成");
-            }
+                MainFile.Logger.Info("[HextechRunes] 暂未检测到海克斯符文mod，已注册延迟检测");
         }
         catch (Exception ex)
         {
@@ -170,7 +172,6 @@ public class AiTeammateManager
 
         IsSoloControlled = false;
         AiPlayer = null;
-        CardHighlighter?.ClearAllHighlights();
         MainFile.Logger.Info("AI 已停止控制本地玩家");
         AiLog.Log("SYSTEM", "AI 已释放本地玩家控制权");
     }
@@ -191,7 +192,12 @@ public class AiTeammateManager
         if (!IsInitialized || aiPlayer?.Creature == null || combat == null)
             return false;
 
-        if (!aiPlayer.Creature.IsAlive || combat.Energy <= 0 || combat.Hand.Cards.Count == 0)
+        if (!aiPlayer.Creature.IsAlive || combat.Hand.Cards.Count == 0)
+            return false;
+
+        // The built-in executor only asks again when there is energy left; an external agent also
+        // gets a pass for free / star-only hands, since it never auto-plays leftovers.
+        if (!AgentDecisionBroker.Enabled && combat.Energy <= 0)
             return false;
 
         var state = CombatManager.Instance.DebugOnlyGetState();
@@ -470,13 +476,19 @@ public class AiTeammateManager
             // === Hard safety timeout for the entire turn processing ===
             // Without an external brain this is a last-resort deadlock net: the LLM call has its own
             // timeout and card execution takes <5s. When dsh is driving the AI, a turn legitimately
-            // takes minutes (the agent has to read the prompt and answer), so the net widens.
-            using var hardTimeoutCts = new CancellationTokenSource(
-                TimeSpan.FromSeconds(AgentDecisionBroker.Enabled ? 330 : 45));
+            // takes minutes (the agent has to read the prompt and answer) and can now hold several
+            // decision passes (one per mid-turn draw), so both the pass count and the net widen.
+            var maxDecisionPasses = AgentDecisionBroker.Enabled
+                ? MaxExternalAgentCombatDecisionPassesPerTurn
+                : MaxCombatDecisionPassesPerTurn;
+            var turnBudgetSeconds = AgentDecisionBroker.Enabled
+                ? 330 + ExternalAgentCombatTurnSecondsPerExtraPass * (maxDecisionPasses - 1)
+                : 45;
+            using var hardTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(turnBudgetSeconds));
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, hardTimeoutCts.Token);
             var effectiveCt = linkedCts.Token;
 
-            for (var decisionPass = 1; decisionPass <= MaxCombatDecisionPassesPerTurn; decisionPass++)
+            for (var decisionPass = 1; decisionPass <= maxDecisionPasses; decisionPass++)
             {
                 effectiveCt.ThrowIfCancellationRequested();
 
@@ -553,6 +565,17 @@ public class AiTeammateManager
                     AiLog.Log("COMBAT", "玩家打断：暂停出牌，保留本回合");
                     break;
                 }
+
+                // The plan said "end turn": that is the brain's answer for this turn, don't spend
+                // another decision just because resources are left. (The built-in executor's Phase 3
+                // already auto-played its leftovers before we get here.) Read the raw plan, not
+                // validActions — the validator injects an end_turn of its own when nothing was usable,
+                // and that case still deserves another pass.
+                if (!result.IsFallback && result.Actions.Any(action => action.Type == "end_turn"))
+                {
+                    AiLog.Log("COMBAT", "决策包含 end_turn，本回合不再发起新的战斗决策");
+                    break;
+                }
             }
 
             if (pausedHold)
@@ -565,7 +588,7 @@ public class AiTeammateManager
 
             if (HasExtraPlayerTurnCombatDecisionOpportunity())
             {
-                AiLog.Log("COMBAT", $"达到单回合最多 {MaxCombatDecisionPassesPerTurn} 次战斗决策上限，结束本次AI行动");
+                AiLog.Log("COMBAT", $"达到单回合最多 {maxDecisionPasses} 次战斗决策上限，结束本次AI行动");
             }
 
             if (CombatManager.Instance.IsInProgress
@@ -629,23 +652,6 @@ public class AiTeammateManager
                     MainFile.Logger.Warn($"AI force-end-turn error: {finalEx.Message}");
                 }
             }
-        }
-    }
-
-    public async Task OnPlayerTurnStarted(Player player)
-    {
-        if (!IsInitialized || SuggestionService == null) return;
-        if (!AiSettingsStore.Current.EnableSuggestions) return;
-
-        try
-        {
-            var suggestions = await SuggestionService.AnalyzeAsync(player, CancellationToken.None);
-            if (suggestions.Count > 0)
-                MainThread.Post(() => CardHighlighter.ApplyHighlights(suggestions, player));
-        }
-        catch (Exception ex)
-        {
-            MainFile.Logger.Warn($"Suggestion error: {ex.Message}");
         }
     }
 

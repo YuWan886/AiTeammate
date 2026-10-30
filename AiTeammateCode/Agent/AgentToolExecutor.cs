@@ -84,9 +84,12 @@ internal static class AgentToolExecutor
             ["instructions"] =
                 "Call sts2_state to inspect the game, sts2_wait to block until input is needed. "
                 + "When sts2_state shows controlled.kind=local you play with the sts2_* UI actions "
-                + "(play_card / use_potion / end_turn / choose / select_cards / proceed); "
+                + "(play_card / use_potion / end_turn / choose / select_cards / proceed); a card choice "
+                + "for that local player arrives as phase=ai_decision kind=hand_select and is answered "
+                + "with sts2_decide. "
                 + "when it shows kind=ai the AI player is yours and decisions come as phase=ai_decision, "
-                + "answered with sts2_decide. Start or resume a run with sts2_start_run / sts2_continue_run."
+                + "answered with sts2_decide. Start or resume a run with sts2_start_run / sts2_continue_run; "
+                + "run control is sts2_pause / sts2_resume / sts2_save / sts2_quit_to_menu / sts2_abandon."
         };
         return AgentToolResult.Ok(json.ToJsonString(AgentJson.Options));
     }

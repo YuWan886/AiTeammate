@@ -374,6 +374,12 @@ public static class NGamePatch
         _currentHandler = msg => Callable.From(() => RouteChatMessage(msg)).CallDeferred();
         manager.ChatManager.OnMessageReceived += _currentHandler;
 
+        // The panel can be built after the conversation already started (AI joined, solo climb
+        // began, or a dsh client connected mid-run), so replay what has been said so far.
+        // 面板可能晚于对话创建：把已有消息补进记录。
+        foreach (var existing in manager.ChatManager.RecentMessages.TakeLast(40))
+            AddMessageToPanel(existing);
+
         void OnSend(string text)
         {
             var trimmed = text.Trim();
@@ -574,13 +580,15 @@ public static class NGamePatch
 
     private static void RouteChatMessage(ChatMessage message)
     {
-        if (message.Type == ChatMessageType.Normal)
-        {
-            ShowBubbleChat(message);
-            return;
-        }
-
+        // The panel is the chat transcript: every line lands there, so a reply is never lost just
+        // because a speech bubble had nobody to attach to. Bubbles are an extra in-world flourish.
+        // 面板才是聊天记录：所有消息都进面板，气泡只是额外表现。
         AddMessageToPanel(message);
+
+        // Only the AI speaks through an in-world bubble; the player's own lines stay in the panel.
+        // 玩家自己的话只进面板，不走气泡。
+        if (message.Type == ChatMessageType.Normal && message.IsAi)
+            ShowBubbleChat(message);
     }
 
     private static void AddMessageToPanel(ChatMessage message)

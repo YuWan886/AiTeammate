@@ -42,7 +42,13 @@ public class DecisionService
     {
         // Solo climb has no teammates; team-coordination rules would only add noise.
         var withTeam = includeTeamPrinciples && !SoloRunController.IsActive;
-        var prompt = _promptBuilder.BuildSystemPrompt(requireJson: true, includeTeamPrinciples: withTeam);
+
+        // dsh brings its own persona: don't layer the mod's personality profile on top of it.
+        // dsh 接管时人格由它自己决定，不再注入 mod 的人格设定。
+        var prompt = AgentDecisionBroker.Enabled
+            ? PersonalityPromptBuilder.BuildExternalAgentSystemPrompt(requireJson: true, includeTeamPrinciples: withTeam)
+            : _promptBuilder.BuildSystemPrompt(requireJson: true, includeTeamPrinciples: withTeam);
+
         return withTeam
             ? _promptBuilder.AppendTeamPrinciples(prompt)
             : prompt;
@@ -141,11 +147,36 @@ public class DecisionService
     {
         // dsh takeover: an attached external agent answers this decision instead of the LLM backend.
         // The parked call resumes as soon as sts2_decide arrives, or falls back on timeout/disconnect.
+        // Inline read-only tool calls work here too: the tools run on the main thread and the
+        // follow-up decision is parked again with the results, exactly like the LLM loop below.
         if (AgentDecisionBroker.Enabled)
         {
-            var external = await AgentDecisionBroker.RequestAsync(aiPlayer, kind, systemPrompt, firstPrompt, ct);
-            if (!string.IsNullOrWhiteSpace(external))
-                return new AiResponse { Content = external, IsSuccess = true };
+            var externalPrompt = firstPrompt;
+            var answer = await AgentDecisionBroker.RequestAsync(aiPlayer, kind, systemPrompt, externalPrompt, ct);
+
+            for (var round = 0; round < maxToolRounds; round++)
+            {
+                if (string.IsNullOrWhiteSpace(answer))
+                    break;
+
+                var calls = ResponseParser.ExtractToolCalls(answer);
+                if (calls.Count == 0 || HasAnswer(answer, hasAnswer))
+                    break;
+
+                // The human interrupted mid-decision in solo climb: don't spend another request.
+                if (SoloRunController.IsActive && AiFlowControl.IsPaused)
+                    break;
+
+                var toolResult = MainThread.Invoke(() => _tools.Execute(aiPlayer, calls));
+                LogToolCalls(calls, toolResult.Text);
+                externalPrompt = firstPrompt +
+                                 "\n\n工具结果：\n" + toolResult.Text +
+                                 "\n\n请基于上面的工具结果，直接输出最终决策 JSON；不要再次调用工具。";
+                answer = await AgentDecisionBroker.RequestAsync(aiPlayer, kind, systemPrompt, externalPrompt, ct);
+            }
+
+            if (!string.IsNullOrWhiteSpace(answer))
+                return new AiResponse { Content = answer, IsSuccess = true };
         }
 
         var history = new List<AiMessage>();
@@ -326,6 +357,14 @@ public class DecisionService
         sb.AppendLine("若敌人已被队友压到残血，除非你能稳定完成击杀，否则不要抢斩杀；用 chat_message 明确集火目标。");
         sb.AppendLine("若上方存在[玩家战术指令]，应优先考虑执行；尤其是集火目标和给队友上药水。若你认为不该执行，请在 thinking 和 chat_message 中体现理由。");
 
+        // With dsh as the brain the executor no longer auto-plays leftovers, so one turn can hold
+        // several decisions — one per mid-turn draw. Tell the agent how the loop behaves.
+        if (AgentDecisionBroker.Enabled)
+        {
+            sb.AppendLine("【外部大脑】本回合不再自动补牌：你的 actions 执行完后，若仍有能量/辉星且手牌里有能打出的牌（包括出牌、药水抽到的牌），系统会把最新局面再交给你决策一次；");
+            sb.AppendLine("所以你只需规划眼前这一步。不想再出牌时，务必在 actions 中返回 {\"type\":\"end_turn\"} 结束回合。");
+        }
+
         if (allowReadTools)
             AppendToolInstructions(sb, combat: true);
 
@@ -344,7 +383,10 @@ public class DecisionService
             sb.AppendLine();
         }
 
-        if (profile != null && settings.EnableLongTermMemory && settings.MaxMemoriesPerPrompt > 0)
+        // Long-term memories belong to the mod's personality profile; with dsh driving they would
+        // contradict the persona it defines, so they stay out of the prompt. dsh 接管时不注入人格记忆。
+        if (profile != null && !AgentDecisionBroker.Enabled
+            && settings.EnableLongTermMemory && settings.MaxMemoriesPerPrompt > 0)
         {
             var memory = _memoryManager.Load(profile.Id);
             var memories = _memoryManager.GetRelevantMemories(profile.Id, settings.MaxMemoriesPerPrompt);

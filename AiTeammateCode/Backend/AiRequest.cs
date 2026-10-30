@@ -4,7 +4,6 @@ public enum AiRequestType
 {
     Decision,
     Chat,
-    Suggestion,
     Memory,
     SelfReflection
 }

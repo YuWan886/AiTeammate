@@ -26,6 +26,7 @@ internal static class AgentDecisionBroker
         public ulong PlayerNetId;
         public string SystemPrompt = "";
         public string Prompt = "";
+        public JsonArray? Options;
         public DateTimeOffset CreatedAt = DateTimeOffset.UtcNow;
         public readonly TaskCompletionSource<string?> Completion =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -64,6 +65,7 @@ internal static class AgentDecisionBroker
                 ["max_wait_seconds"] = MaxWaitSeconds,
                 ["system_prompt"] = _pending.SystemPrompt,
                 ["prompt"] = _pending.Prompt,
+                ["options"] = _pending.Options?.DeepClone(),
                 ["answer_with"] = "sts2_decide {decision: <the JSON object the prompt asks for>}"
             };
         }
@@ -74,7 +76,7 @@ internal static class AgentDecisionBroker
     /// budget expires. Returns null when nothing usable arrived (callers fall back to their defaults).
     /// </summary>
     public static async Task<string?> RequestAsync(Player aiPlayer, string kind, string systemPrompt,
-        string prompt, CancellationToken ct)
+        string prompt, CancellationToken ct, JsonArray? options = null)
     {
         if (!Enabled)
             return null;
@@ -93,7 +95,8 @@ internal static class AgentDecisionBroker
                 PlayerName = aiPlayer?.Character?.Id.Entry ?? "ai",
                 PlayerNetId = aiPlayer?.NetId ?? 0,
                 SystemPrompt = systemPrompt,
-                Prompt = prompt
+                Prompt = prompt,
+                Options = options?.DeepClone() as JsonArray
             };
             _pending = pending;
         }

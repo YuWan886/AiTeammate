@@ -22,6 +22,7 @@ using MegaCrit.Sts2.Core.Multiplayer.Game;
 using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Nodes.Cards;
 using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
+using MegaCrit.Sts2.Core.Nodes.Combat;
 using MegaCrit.Sts2.Core.Nodes.CommonUi;
 using MegaCrit.Sts2.Core.Nodes.Events;
 using MegaCrit.Sts2.Core.Nodes.Events.Custom.CrystalSphere;
@@ -31,10 +32,12 @@ using MegaCrit.Sts2.Core.Nodes.RestSite;
 using MegaCrit.Sts2.Core.Nodes.Rewards;
 using MegaCrit.Sts2.Core.Nodes.Rooms;
 using MegaCrit.Sts2.Core.Nodes.Screens;
+using MegaCrit.Sts2.Core.Nodes.Screens.Capstones;
 using MegaCrit.Sts2.Core.Nodes.Screens.CardSelection;
 using MegaCrit.Sts2.Core.Nodes.Screens.GameOverScreen;
 using MegaCrit.Sts2.Core.Nodes.Screens.Map;
 using MegaCrit.Sts2.Core.Nodes.Screens.Overlays;
+using MegaCrit.Sts2.Core.Nodes.Screens.PauseMenu;
 using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.Saves;
 using AiTeammate.AiTeammateCode.Compat;
@@ -99,6 +102,16 @@ internal static class AgentActions
                     return StartRun(args);
                 case "sts2_continue_run":
                     return ContinueRun();
+                case "sts2_pause":
+                    return PauseRun();
+                case "sts2_resume":
+                    return ResumeRun();
+                case "sts2_abandon":
+                    return AbandonRun();
+                case "sts2_save":
+                    return SaveRun();
+                case "sts2_quit_to_menu":
+                    return QuitToMenu();
             }
 
             var snap = AgentSnapshotBuilder.Capture();
@@ -165,6 +178,8 @@ internal static class AgentActions
         if (RunManager.Instance?.NetService?.Type is { } startNetType && startNetType != NetGameType.Singleplayer)
             return Fail("A new run can only be started from a singleplayer session.");
 
+        ReleaseAgentPause();
+
         var character = StringArg(args, "character");
         var ascension = IntArg(args, "ascension") ?? 0;
         var seed = StringArg(args, "seed");
@@ -182,6 +197,8 @@ internal static class AgentActions
 
         if (RunManager.Instance?.NetService?.Type is { } continueNetType && continueNetType != NetGameType.Singleplayer)
             return Fail("A saved singleplayer run can only be loaded from a singleplayer session.");
+
+        ReleaseAgentPause();
 
         try
         {
@@ -218,10 +235,183 @@ internal static class AgentActions
         }
     }
 
+    // ---- Run control (pause / save / abandon / quit) ---------------------------------------
+
+    private static bool AgentPausedAi;
+
+    /// <summary>True while the run's pause menu (a capstone submenu, not an overlay) is open.</summary>
+    internal static bool IsPauseMenuOpen()
+    {
+        try
+        {
+            return NCapstoneContainer.Instance?.CurrentCapstoneScreen is NCapstoneSubmenuStack stack
+                   && stack.Type == CapstoneSubmenuType.PauseMenu;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Pauses the game: opens the pause menu and, when the mod drives the local player, holds its automation.</summary>
+    private static AgentActionResult PauseRun()
+    {
+        if (RunManager.Instance?.DebugOnlyGetState() == null)
+            return Fail("No run in progress.");
+
+        var globalUi = NRun.Instance?.GlobalUi;
+        if (globalUi == null)
+            return Fail("The run UI is not ready yet.");
+
+        if (!IsPauseMenuOpen())
+        {
+            var screen = globalUi.SubmenuStack.ShowScreen(CapstoneSubmenuType.PauseMenu);
+            if (screen is NPauseMenu pauseMenu)
+                pauseMenu.Initialize(RunManager.Instance.DebugOnlyGetState()!);
+        }
+
+        // The pause menu alone does not stop the mod's own automation, so solo climb needs the gate too.
+        if (AiTeammateManager.Instance?.IsSoloControlled == true && !AiFlowControl.ManualPaused)
+        {
+            AgentPausedAi = true;
+            AiFlowControl.SetManualPaused(true);
+        }
+
+        return new AgentActionResult(true, "Paused (pause menu open)", 600);
+    }
+
+    /// <summary>Closes the pause menu and releases the automation gate it took.</summary>
+    private static AgentActionResult ResumeRun()
+    {
+        if (!IsPauseMenuOpen())
+            return Fail("The game is not paused.");
+
+        try
+        {
+            NCapstoneContainer.Instance?.Close();
+        }
+        catch (Exception ex)
+        {
+            return Fail("Could not close the pause menu: " + ex.Message);
+        }
+
+        if (AgentPausedAi)
+            ReleaseAgentPause();
+
+        return new AgentActionResult(true, "Resumed", 500);
+    }
+
+    /// <summary>Drops the automation hold that <see cref="PauseRun"/> took, never a human's own pause.</summary>
+    private static void ReleaseAgentPause()
+    {
+        if (!AgentPausedAi)
+            return;
+
+        AgentPausedAi = false;
+        AiFlowControl.SetManualPaused(false);
+    }
+
+    /// <summary>Abandons the run in progress. Clients cannot: only the singleplayer session / host owns the run.</summary>
+    private static AgentActionResult AbandonRun()
+    {
+        var run = RunManager.Instance;
+        if (run?.DebugOnlyGetState() == null)
+            return Fail("No run in progress.");
+
+        if (run.NetService?.Type == NetGameType.Client)
+            return Fail("Only the host can abandon a multiplayer run.");
+
+        ReleaseAgentPause();
+        run.Abandon();
+        return new AgentActionResult(true, "Abandoning the run", 3000);
+    }
+
+    /// <summary>Writes the run save now (singleplayer/host only; the game otherwise saves at checkpoints).</summary>
+    private static AgentActionResult SaveRun()
+    {
+        var run = RunManager.Instance;
+        if (run?.DebugOnlyGetState() == null)
+            return Fail("No run in progress.");
+
+        if (run.NetService?.Type == NetGameType.Client)
+            return Fail("Only the host can save a multiplayer run.");
+
+        if (!run.ShouldSave)
+            return Fail("This run is not saving (it is over or being torn down).");
+
+        _ = SaveRunAsync();
+        return new AgentActionResult(true, "Saving the run", 900);
+    }
+
+    private static async Task SaveRunAsync()
+    {
+        try
+        {
+            if (SaveManager.Instance != null)
+                await SaveManager.Instance.SaveRun(null);
+            MainFile.Logger.Info("[Agent] run saved on request");
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[Agent] explicit save failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Saves and returns to the main menu, like the pause menu's Save and Quit.</summary>
+    private static AgentActionResult QuitToMenu()
+    {
+        if (RunManager.Instance?.DebugOnlyGetState() == null)
+            return Fail("No run in progress.");
+
+        ReleaseAgentPause();
+        _ = SaveAndQuitAsync();
+        return new AgentActionResult(true, "Saving and returning to the main menu", 3000);
+    }
+
+    private static async Task SaveAndQuitAsync()
+    {
+        try
+        {
+            if (SaveManager.Instance != null)
+                await SaveManager.Instance.SaveRun(null);
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[Agent] save before quitting failed: {ex.Message}");
+        }
+
+        try
+        {
+            if (NGame.Instance != null)
+                await NGame.Instance.ReturnToMainMenu();
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[Agent] quit to menu failed: {ex.Message}");
+        }
+    }
+
     // ---- Combat -------------------------------------------------------------------------
+
+    /// <summary>True while the vanilla hand UI is asking for a card pick (dsh has no tool for it).</summary>
+    private static bool IsHandSelecting()
+    {
+        try
+        {
+            return NPlayerHand.Instance?.IsInCardSelection == true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     private static AgentActionResult PlayCard(JsonObject args, AgentSnapshot snap)
     {
+        if (IsHandSelecting())
+            return Fail("The hand is in card-selection mode; answer the pending hand_select decision "
+                        + "with sts2_decide before playing or ending the turn.");
+
         if (snap.Phase != "combat")
             return Fail($"sts2_play_card only works in combat (current phase: {snap.Phase}).");
 
@@ -346,6 +536,10 @@ internal static class AgentActions
 
     private static AgentActionResult EndTurn(AgentSnapshot snap)
     {
+        if (IsHandSelecting())
+            return Fail("The hand is in card-selection mode; answer the pending hand_select decision "
+                        + "with sts2_decide before playing or ending the turn.");
+
         if (snap.Phase != "combat")
             return Fail($"sts2_end_turn only works in combat (current phase: {snap.Phase}).");
 
@@ -374,6 +568,7 @@ internal static class AgentActions
             "card_reward" => ChooseCardReward(index, skip),
             "card_choice" => ChooseCardChoice(index, skip),
             "relic_select" => ChooseRelic(index, skip),
+            "treasure_relic" => ChooseTreasureRelic(index),
             "rest" => ChooseRest(index),
             "event" => ChooseEvent(index),
             "shop" => ChooseShop(index),
@@ -495,6 +690,20 @@ internal static class AgentActions
 
         holders[i].ForceClick();
         return new AgentActionResult(true, $"Selected relic {i}", 600);
+    }
+
+    /// <summary>The relic card sitting inside an opened treasure chest (in-room, not an overlay).</summary>
+    private static AgentActionResult ChooseTreasureRelic(int? index)
+    {
+        var holders = AgentSnapshotBuilder.GetTreasureRelicHolders(NRun.Instance);
+        if (holders.Count == 0)
+            return Fail("There is no treasure relic to take right now.");
+        if (index is not { } i || i < 0 || i >= holders.Count)
+            return Fail($"Treasure relic index out of range (0..{holders.Count - 1}).");
+
+        var name = holders[i].Relic?.Model?.Id.Entry ?? "?";
+        holders[i].ForceClick();
+        return new AgentActionResult(true, $"Taking treasure relic {i} ({name})", 900);
     }
 
     private static AgentActionResult ChooseRest(int? index)
