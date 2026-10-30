@@ -66,6 +66,49 @@ internal static class AgentBridgeService
 
     private static int _lastClientCount;
 
+    // ---- Client activity -----------------------------------------------------
+    // Every request from dsh counts as "the agent is alive", and a request that is still running
+    // (sts2_wait blocks up to 50s) keeps that alive state too. AgentDecisionBroker uses this to fall
+    // back to the built-in backend when a client stays connected but nobody is actually driving.
+    // 每次 dsh 请求都算“Agent 还在”；等待 dsh 应答时靠它判断是否该回退。
+
+    private static long _lastClientActivityTicks;
+    private static int _inFlightRequests;
+
+    /// <summary>Marks a dsh request as started. dsh 请求开始。</summary>
+    public static void BeginClientRequest()
+    {
+        Interlocked.Increment(ref _inFlightRequests);
+        Interlocked.Exchange(ref _lastClientActivityTicks, DateTime.UtcNow.Ticks);
+    }
+
+    /// <summary>Marks a dsh request as finished. dsh 请求结束。</summary>
+    public static void EndClientRequest()
+    {
+        Interlocked.Exchange(ref _lastClientActivityTicks, DateTime.UtcNow.Ticks);
+        Interlocked.Decrement(ref _inFlightRequests);
+    }
+
+    /// <summary>
+    /// Seconds since dsh last touched the bridge; 0 while a request is in flight and
+    /// <see cref="double.MaxValue"/> when dsh has never called. 距 dsh 上次请求的秒数。
+    /// </summary>
+    public static double ClientIdleSeconds
+    {
+        get
+        {
+            if (Volatile.Read(ref _inFlightRequests) > 0)
+                return 0;
+
+            var ticks = Interlocked.Read(ref _lastClientActivityTicks);
+            if (ticks == 0)
+                return double.MaxValue;
+
+            var idle = (DateTime.UtcNow - new DateTime(ticks, DateTimeKind.Utc)).TotalSeconds;
+            return idle < 0 ? 0 : idle;
+        }
+    }
+
     /// <summary>Fans a count transition out once; safe to call every tick. 转发客户端数量变化。</summary>
     private static void NotifyClientCount()
     {

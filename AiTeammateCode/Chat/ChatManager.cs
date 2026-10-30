@@ -2,6 +2,7 @@
 using MegaCrit.Sts2.Core.Entities.Players;
 using AiTeammate.AiTeammateCode;
 using AiTeammate.AiTeammateCode.Backend;
+using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Context;
 using AiTeammate.AiTeammateCode.Decision;
 using AiTeammate.AiTeammateCode.Personality;
@@ -53,7 +54,7 @@ public class ChatManager
         if (string.IsNullOrWhiteSpace(content)) return;
         var msg = new ChatMessage
         {
-            SenderName = _promptBuilder.ActivePersonalityName,
+            SenderName = AiNames.DisplayName,
             IsAi = true,
             Content = content.Trim(),
             Type = ChatMessageType.Normal
@@ -152,13 +153,26 @@ public class ChatManager
                 MainFile.Logger.Info($"[ChatDirective] {playerName} -> {directive.Type}: {directive.Summary}");
         }
 
+        // The AI may rename itself in the same reply ("以后叫你小明"). The system line documents the
+        // change, and the reply below already carries the new sender name.
+        if (!string.IsNullOrWhiteSpace(parsed.Nickname))
+        {
+            var previous = AiNames.DisplayName;
+            var change = AiNames.SetNickname(parsed.Nickname, "chat");
+            if (change.Ok && !string.Equals(previous, change.DisplayName, StringComparison.Ordinal))
+            {
+                AddSystemMessage(AiLoc.T("system.nickname_changed", "{Old} is now called {New}",
+                    ("Old", previous), ("New", change.DisplayName)));
+            }
+        }
+
         var replyContent = !string.IsNullOrWhiteSpace(parsed.Reply)
             ? parsed.Reply
             : AiLoc.T("chat.reply.ack", "(Got it — I'll act if it makes sense.)");
 
         var aiMsg = new ChatMessage
         {
-            SenderName = _promptBuilder.ActivePersonalityName,
+            SenderName = AiNames.DisplayName,
             IsAi = true,
             Content = replyContent,
             Type = ChatMessageType.Normal
@@ -217,7 +231,7 @@ public class ChatManager
 
         var msg = new ChatMessage
         {
-            SenderName = _promptBuilder.ActivePersonalityName,
+            SenderName = AiNames.DisplayName,
             IsAi = true,
             Content = response.Content.Trim(),
             Type = ChatMessageType.Normal
@@ -297,6 +311,8 @@ public class ChatManager
         sb.AppendLine(AiLoc.T("prompt.chat.rule.3", "3. For \"focus that enemy next turn / hit that target first\", use focus_target and name the target."));
         sb.AppendLine(AiLoc.T("prompt.chat.rule.4", "4. Set accepted=true only when you're willing to try; set accepted=false if you lack resources, it isn't worth it, or it's too dangerous."));
         sb.AppendLine(AiLoc.T("prompt.chat.rule.5", "5. The reply must read like a real teammate typing, not a scripted explanation."));
+        sb.AppendLine(AiLoc.T("prompt.chat.rule.6",
+            "6. Nickname: if the player gives you a new nickname, or you decide to change how you are displayed, add \"nickname\":\"the new name\" (max 24 chars, no line breaks) to the JSON; otherwise omit it. All player-facing names update immediately."));
         if (AiSettingsStore.Current.EnableScreenshotTool)
         {
             sb.AppendLine(AiLoc.T("prompt.chat.screenshot_tool",
@@ -457,7 +473,8 @@ public class ChatManager
             var root = doc.RootElement;
             var result = new InteractiveChatResult
             {
-                Reply = GetStringProperty(root, "reply")
+                Reply = GetStringProperty(root, "reply"),
+                Nickname = GetStringProperty(root, "nickname")
             };
 
             if (root.TryGetProperty("directives", out var directives) && directives.ValueKind == JsonValueKind.Array)
@@ -569,6 +586,7 @@ public class ChatManager
     private sealed class InteractiveChatResult
     {
         public string Reply { get; init; } = "";
+        public string Nickname { get; init; } = "";
         public string ErrorMessage { get; init; } = "";
         public List<PlayerDirectiveProposal> Directives { get; } = new();
     }

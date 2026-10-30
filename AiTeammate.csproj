@@ -1,4 +1,4 @@
-﻿<Project Sdk="Godot.NET.Sdk/4.5.1" InitialTargets="CheckDependencyPaths">
+<Project Sdk="Godot.NET.Sdk/4.5.1" InitialTargets="CheckDependencyPaths">
     <Import Project=".\Sts2PathDiscovery.props"/>
     <PropertyGroup>
         <TargetFramework>net9.0</TargetFramework>
@@ -55,8 +55,21 @@
 
     <ItemGroup>
         <PackageReference Include="Krafs.Publicizer" Version="2.3.0" PrivateAssets="All"/>
-        <PackageReference Include="STS2.RitsuLib" Version="0.6.10"/>
+        <!--
+          Offline switch: the NuGet package ships the same assemblies the runtime bundle deploys
+          (compat/<ver>/ + shared/). When nuget.org is unreachable, build with
+          -p:RitsuLibOffline=true to compile against the installed bundle instead of restoring.
+        -->
+        <PackageReference Include="STS2.RitsuLib" Version="0.6.10" Condition="'$(RitsuLibOffline)' != 'true'"/>
         <PackageReference Include="BSchneppe.StS2.PckPacker" Version="0.1.1" PrivateAssets="All"/>
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(RitsuLibOffline)' == 'true'">
+        <Reference Include="STS2-RitsuLib" HintPath="$(Sts2Path)/mods/STS2-RitsuLib/compat/0.107.1/STS2-RitsuLib.dll" Private="false"/>
+        <Reference Include="STS2-RitsuLib.Runtime" HintPath="$(Sts2Path)/mods/STS2-RitsuLib/compat/0.107.1/STS2-RitsuLib.Runtime.dll" Private="false"/>
+        <Reference Include="STS2-RitsuLib.Shared" HintPath="$(Sts2Path)/mods/STS2-RitsuLib/shared/STS2-RitsuLib.Shared.dll" Private="false"/>
+        <Reference Include="STS2-RitsuLib.Ui" HintPath="$(Sts2Path)/mods/STS2-RitsuLib/shared/STS2-RitsuLib.Ui.dll" Private="false"/>
+        <Reference Include="STS2-RitsuLib.Settings" HintPath="$(Sts2Path)/mods/STS2-RitsuLib/shared/STS2-RitsuLib.Settings.dll" Private="false"/>
     </ItemGroup>
 
     <ItemGroup>

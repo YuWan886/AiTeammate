@@ -558,27 +558,52 @@ public static class RestSiteBeginPatch
                 }
                 case "MEND":
                 {
-                    // MEND heals OTHER characters by 30% max HP.
-                    // OnSelect() would open a target selection screen which our auto-pick
-                    // can't handle, so we apply the effect directly — heal the lowest-HP teammate.
-                    var state = CombatManager.Instance.DebugOnlyGetState();
-                    var teammates = state?.Players
-                        .Where(p => p != aiPlayer && p.Creature.IsAlive)
-                        .OrderBy(p => p.Creature.CurrentHp)
-                        .ToList();
+                    // MEND heals OTHER players and vanilla opens a target picker that our
+                    // auto-pick can't drive, so apply the effect directly to the most
+                    // endangered teammate.
+                    // Do NOT enumerate CombatManager's state here: it is reset to null as soon
+                    // as the previous combat ends, so at a rest site it is always null and MEND
+                    // silently turned into a no-op. The run state always has every player.
+                    var teammates = aiPlayer.RunState?.Players
+                        .Where(p => p != aiPlayer && p.Creature != null && p.Creature.IsAlive)
+                        .OrderBy(p => (double)p.Creature.CurrentHp / Math.Max(1, p.Creature.MaxHp))
+                        .ThenBy(p => p.Creature.CurrentHp)
+                        .ToList() ?? new List<Player>();
 
-                    if (teammates == null || teammates.Count == 0)
+                    if (teammates.Count == 0)
                     {
                         log.Log("REST", "MEND: no alive teammates to heal");
                         break;
                     }
 
-                    // Heal the lowest-HP teammate
+                    // Heal the most endangered teammate
                     var target = teammates[0];
                     var targetCreature = target.Creature;
-                    int mendAmount = (int)(targetCreature.MaxHp * 0.3m);
+                    decimal mendAmount;
+                    try
+                    {
+                        // Same amount vanilla MEND heals, including relic modifiers (Regal Pillow).
+                        mendAmount = MegaCrit.Sts2.Core.Entities.RestSite.MendRestSiteOption.GetHealAmount(target);
+                    }
+                    catch
+                    {
+                        mendAmount = MegaCrit.Sts2.Core.Entities.RestSite.HealRestSiteOption.GetBaseHealAmount(targetCreature);
+                    }
+
                     int oldTargetHp = targetCreature.CurrentHp;
                     await MegaCrit.Sts2.Core.Commands.CreatureCmd.Heal(targetCreature, mendAmount, playAnim: false);
+                    try
+                    {
+                        // Vanilla MEND runs the heal hooks for the target too (Stone Humidifier
+                        // max HP, Regal Pillow flash, Night Terrors). Unlike the AI-targeted HEAL
+                        // branch above, the target here is a fully initialized human player.
+                        await Hook.AfterRestSiteHeal(target.RunState, target, isMimicked: false);
+                    }
+                    catch (Exception ex)
+                    {
+                        MainFile.Logger.Warn($"[REST] MEND AfterRestSiteHeal failed: {ex.Message}");
+                    }
+
                     effectApplied = true;
                     var teammateName = target.Character?.Id.Entry ?? "Teammate";
                     log.Log("REST", $"MEND healed teammate {teammateName}: {oldTargetHp} → {targetCreature.CurrentHp}/{targetCreature.MaxHp} (+{mendAmount})");

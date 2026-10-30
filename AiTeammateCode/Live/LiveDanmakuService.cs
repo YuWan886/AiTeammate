@@ -577,8 +577,7 @@ public sealed partial class LiveDanmakuService : Node
             return;
 
         var (success, error) = await BilibiliApi.SendDanmakuAsync(roomId, text, timeout.Token);
-        var senderName = manager.PersonalityManager.Active?.Name
-                         ?? AiLoc.T("chat.ai_default_name", "AI Teammate");
+        var senderName = AiNames.DisplayName;
 
         MainThread.Post(() =>
         {

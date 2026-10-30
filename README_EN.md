@@ -35,11 +35,13 @@ The mod ships as a **multi-version bundle**: `AiTeammate.dll` is the loader, the
 ## Features
 
 - **Multiplayer · AI teammate**: its own personality, independent map votes, coordinated card play, chat, read-only views of teammates.
+- **Custom nickname**: name the AI teammate (Settings → AI Identity). It can also rename itself in chat or through dsh; the nameplate, chat, prompts and other multiplayer clients follow immediately.
 - **Singleplayer · solo climb**: the AI takes over the local player and handles routing, combat, rewards, shops, rest sites and events; you can interrupt it and talk to it at any time.
 - **It can read the board**: combat prompts carry hand, draw, discard and exhaust pile contents (**draw order is never exposed**), plus on-demand read-only tools for piles, relics, potions, teammates and the map.
 - **Vision models**: optional screenshot tool so the AI can literally look at the screen.
 - **Bilibili live danmaku**: anonymously receive a stream's chat and scroll it over the game; log in to let the AI reply to viewers.
 - **External agent takeover**: a localhost bridge lets **dsh (DeepSeek Harness)** drive the game directly.
+- **Post-run review**: when a run ends (victory or defeat) the AI reviews the deck, route, relics and fights, then writes the reason and the next-run lesson into that personality's long-term memory.
 - **Fully localized**: settings page, chat panel, character select, toasts and built-in personalities follow the game language (Simplified Chinese / English).
 
 ## Configuration
@@ -48,7 +50,7 @@ Everything is configured in **in-game → Settings → Mod Settings → AI Teamm
 
 - **AI backend**: DeepSeek / OpenAI / Ollama with their own API key, model and base URL; pick models from a drop-down after hitting "Fetch models" (`GET /models` for OpenAI-compatible backends, `/api/tags` for Ollama); optional reasoning mode; "Test connection".
 - **Decision**: combat decision timeout, chat timeout, out-of-combat retries; whether pile contents go into prompts; whether the AI may call read-only tools in/out of combat (piles, relics, potions, teammate state, map route; teammates' piles in multiplayer); **allow the AI to see the game screen** (screenshot tool, vision models only).
-- **Personality**: select/create/delete profiles; edit backstory, combat philosophy, communication style and decision principles; long-term memory and personality growth toggles.
+- **Personality**: select/create/delete profiles; edit backstory, combat philosophy, communication style and decision principles; long-term memory and personality growth toggles (with them on, every finished run is reviewed and saved to memory).
 - **Chat**: AI chat, speech bubbles, auto-speak cooldown, prompt chat history.
 - **Maintenance**: auto/manual content cache refresh, decision/traffic log toggles, log retention, open log folder, reset all settings.
 
@@ -106,6 +108,7 @@ Let **dsh (DeepSeek Harness)** drive the game directly instead of using it as a 
 dsh will handle combat, routing, rewards, shops, rest sites, events and chests until the run ends. Call `sts2_autoplay { "enabled": false }` or switch the in-game toggle off to take control back.
 
 - The bridge listens on `127.0.0.1` only and is never exposed to LAN/WAN.
+- In multiplayer the **AI teammate**'s card picks, events, shops, rest sites and map votes also go to dsh (`controlled.kind=ai`, answered with `sts2_decide`). If dsh is attached but not driving (autoplay off, nobody asking it to play), the AI does not wait forever: the "Fall back when dsh is silent" setting (default 30s) hands decisions back to the built-in backend as soon as no dsh request arrived for that long, and returns them to dsh as soon as it calls again.
 - Protocol reference: [`docs/dsh-agent-bridge.md`](docs/dsh-agent-bridge.md).
 
 ## Logs

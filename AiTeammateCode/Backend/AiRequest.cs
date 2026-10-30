@@ -5,7 +5,8 @@ public enum AiRequestType
     Decision,
     Chat,
     Memory,
-    SelfReflection
+    SelfReflection,
+    RunReview
 }
 
 public class AiRequest

@@ -20,10 +20,12 @@ using MegaCrit.Sts2.Core.Multiplayer.Game;
 using MegaCrit.Sts2.Core.Nodes.Cards;
 using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
 using MegaCrit.Sts2.Core.Nodes;
+using MegaCrit.Sts2.Core.Nodes.Combat;
 using MegaCrit.Sts2.Core.Nodes.CommonUi;
 using MegaCrit.Sts2.Core.Nodes.Events;
 using MegaCrit.Sts2.Core.Nodes.Events.Custom.CrystalSphere;
 using MegaCrit.Sts2.Core.Nodes.GodotExtensions;
+using MegaCrit.Sts2.Core.Nodes.Multiplayer;
 using MegaCrit.Sts2.Core.Nodes.Relics;
 using MegaCrit.Sts2.Core.Nodes.RestSite;
 using MegaCrit.Sts2.Core.Nodes.Rewards;
@@ -37,6 +39,7 @@ using MegaCrit.Sts2.Core.Nodes.Screens.TreasureRoomRelic;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.Saves;
+using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Decision;
 using AiTeammate.AiTeammateCode.Solo;
 
@@ -145,6 +148,10 @@ internal static class AgentSnapshotBuilder
         var run = RunManager.Instance;
         var state = run?.DebugOnlyGetState();
         ctx.Run = state;
+
+        // dsh can see (and change, via sts2_set_nickname) how the AI teammate is displayed.
+        ctx.Json["ai_name"] = AiNames.DisplayName;
+        ctx.Json["ai_nickname"] = AiNames.ConfiguredNickname;
 
         if (state == null)
         {
@@ -380,6 +387,13 @@ internal static class AgentSnapshotBuilder
 
     private static void DetectPhase(Context ctx)
     {
+        // A target picker disables whatever room or screen is underneath and waits for one node
+        // click — the action that opened it (MEND, some potions/relics) is still pending. It must
+        // win over the room detection, or dsh would re-click that action instead of the target.
+        // 选目标优先于房间：否则 dsh 会重复点击打开选择器的那一项。
+        if (DetectTargetSelect(ctx))
+            return;
+
         // The map opens on top of the finished room's overlay: a terminal rewards screen stays on the
         // overlay stack (RunManager.ClearScreens only clears it on the room transition) and the map's
         // Opened signal merely runs AfterOverlayHidden(), which disables that screen's proceed button.
@@ -418,6 +432,12 @@ internal static class AgentSnapshotBuilder
                     DetectCrystalSphere(ctx, sphere);
                     return;
                 default:
+                    if (HextechRuneSelectSupport.IsScreen(overlay))
+                    {
+                        DetectRuneSelect(ctx);
+                        return;
+                    }
+
                     ctx.Phase = "unsupported";
                     ctx.Actionable = false;
                     ctx.BlockedBy = "screen:" + overlay.GetType().Name;
@@ -806,6 +826,122 @@ internal static class AgentSnapshotBuilder
         }
 
         ctx.Notes.Add("Take a relic with sts2_choose index=<n>, or skip it.");
+    }
+
+    /// <summary>
+    /// HextechRunes (ARAM: Mayhem) act rune pick. The screen belongs to a Steam Workshop mod (the picker is
+    /// also used for forge choices and for the "no rune left" confirmation), so candidates come from its
+    /// presenter surface and choosing goes through <c>PresenterChoose</c>.
+    /// </summary>
+    private static void DetectRuneSelect(Context ctx)
+    {
+        ctx.Phase = "rune_select";
+
+        var screen = NOverlayStack.Instance?.Peek();
+        if (screen == null || !HextechRuneSelectSupport.IsScreen(screen))
+        {
+            ctx.Actionable = false;
+            ctx.BlockedBy = "rune_select_closed";
+            ctx.Notes.Add("The rune selection screen is gone; call sts2_state again.");
+            return;
+        }
+
+        if (HextechRuneSelectSupport.IsLocked(screen))
+        {
+            ctx.Actionable = false;
+            ctx.BlockedBy = "rune_select_locked";
+            ctx.Notes.Add("The rune is already locked in; call sts2_wait for the act to continue.");
+            return;
+        }
+
+        var relics = HextechRuneSelectSupport.Options(screen);
+        for (var i = 0; i < relics.Count; i++)
+        {
+            var relic = relics[i];
+            var option = new JsonObject
+            {
+                ["index"] = i,
+                ["kind"] = "rune",
+                ["label"] = SafeLoc(relic.Title, relic.Id.Entry),
+                ["detail"] = SafeLoc(relic.DynamicDescription, "")
+            };
+
+            var rarity = HextechRuneSelectSupport.RarityText(screen, i);
+            if (!string.IsNullOrEmpty(rarity))
+                option["rarity"] = rarity;
+
+            var footer = HextechRuneSelectSupport.FooterText(screen, i);
+            if (!string.IsNullOrWhiteSpace(footer))
+                option["footer"] = footer;
+
+            ctx.Options.Add(option);
+        }
+
+        if (relics.Count > 0)
+        {
+            ctx.Actionable = true;
+            ctx.Notes.Add("Pick one rune with sts2_choose index=<n>; Hextech commits it immediately (no extra confirm).");
+            return;
+        }
+
+        if (HextechRuneSelectSupport.CanConfirmEmpty(screen))
+        {
+            ctx.Options.Add(new JsonObject
+            {
+                ["index"] = 0,
+                ["kind"] = "proceed",
+                ["label"] = "确认（本幕不再有可选海克斯）"
+            });
+            ctx.Actionable = true;
+            ctx.Notes.Add("This screen has no rune to pick; confirm it with sts2_choose index=0 or sts2_proceed.");
+            return;
+        }
+
+        ctx.Actionable = false;
+        ctx.BlockedBy = "rune_select_enemy_hex";
+        ctx.Notes.Add("This Hextech screen only offers enemy-hex tweaks, which the bridge does not drive. Handle it manually.");
+    }
+
+    /// <summary>
+    /// A target picker opened by some action (rest-site MEND, some potion/relic flows) is a global
+    /// UI mode: it disables the controls underneath and waits for one node click. The options list
+    /// is the selectable nodes (shared with <see cref="AgentActions"/>), plus a trailing cancel.
+    /// 选目标阶段：休息处 MEND、部分药水/遗物会进入这里。
+    /// </summary>
+    private static bool DetectTargetSelect(Context ctx)
+    {
+        if (GetTargetManager()?.IsInSelection != true)
+            return false;
+
+        ctx.Phase = "target_select";
+        var candidates = GetTargetCandidates();
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            var candidate = candidates[i];
+            ctx.Options.Add(new JsonObject
+            {
+                ["index"] = i,
+                ["kind"] = candidate.Kind,
+                ["label"] = candidate.Label,
+                ["detail"] = $"HP {candidate.Hp}/{candidate.MaxHp}",
+                ["hp"] = candidate.Hp,
+                ["max_hp"] = candidate.MaxHp
+            });
+        }
+
+        ctx.Options.Add(new JsonObject
+        {
+            ["index"] = candidates.Count,
+            ["kind"] = "cancel",
+            ["label"] = "Cancel targeting"
+        });
+
+        ctx.Actionable = true;
+        ctx.Notes.Add(candidates.Count == 0
+            ? "The game is asking for a target but none is selectable. Cancel with sts2_choose index=0."
+            : $"The game is asking for a target. Pick one with sts2_choose index=<n> (0..{candidates.Count - 1}), "
+              + $"or cancel with sts2_choose index={candidates.Count}.");
+        return true;
     }
 
     private static void DetectRest(Context ctx)
@@ -1248,6 +1384,9 @@ internal static class AgentSnapshotBuilder
             case "shop":
                 ctx.Notes.Add("Use sts2_choose index=<n> to buy, sts2_proceed to leave.");
                 break;
+            case "target_select":
+                ctx.Notes.Add("Use sts2_choose index=<n> to pick a target (the last index cancels).");
+                break;
             case "event":
                 ctx.Notes.Add("Use sts2_choose index=<n>.");
                 break;
@@ -1394,6 +1533,122 @@ internal static class AgentSnapshotBuilder
         {
             return new List<RestSiteOption>();
         }
+    }
+
+    /// <summary>One node the game's active target picker accepts. 选目标候选。</summary>
+    internal sealed class TargetCandidate
+    {
+        public Node? Node { get; init; }
+        public string Label { get; init; } = "";
+        public string Kind { get; init; } = "";
+        public int Hp { get; init; }
+        public int MaxHp { get; init; }
+    }
+
+    /// <summary>The global target picker. 全局目标选择器。</summary>
+    internal static NTargetManager? GetTargetManager()
+    {
+        try
+        {
+            var runNode = NRun.Instance;
+            if (runNode == null || !GodotObject.IsInstanceValid(runNode))
+                return null;
+            return runNode.GlobalUi?.TargetManager;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Nodes the active target picker accepts, in UI order. The snapshot publishes these indices and
+    /// <see cref="AgentActions"/> resolves the same list, so what dsh saw is what it clicks.
+    /// 目标候选：遵守 NTargetManager 自己的过滤（例如 MEND 不能选自己）。
+    /// </summary>
+    internal static List<TargetCandidate> GetTargetCandidates()
+    {
+        var candidates = new List<TargetCandidate>();
+        var manager = GetTargetManager();
+        if (manager?.IsInSelection != true)
+            return candidates;
+
+        var seenPlayers = new HashSet<Player>();
+
+        bool Allowed(Node node)
+        {
+            try
+            {
+                return GodotObject.IsInstanceValid(node) && manager.AllowedToTargetNode(node);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        void Add(Node node, Player? player, string kind, int hp, int maxHp)
+        {
+            if (player != null && (!seenPlayers.Add(player) || player.Creature == null || !player.Creature.IsAlive))
+                return;
+
+            var label = player?.Creature?.Name
+                        ?? (node is NCreature creatureNode ? creatureNode.Entity?.Name : null)
+                        ?? "target";
+            candidates.Add(new TargetCandidate
+            {
+                Node = node,
+                Label = label,
+                Kind = player != null ? "player" : kind,
+                Hp = hp,
+                MaxHp = maxHp
+            });
+        }
+
+        // Combat: creature nodes cover enemies and (for ally effects) player creatures.
+        var combatRoom = NCombatRoom.Instance;
+        if (combatRoom != null && GodotObject.IsInstanceValid(combatRoom))
+        {
+            foreach (var node in combatRoom.CreatureNodes)
+            {
+                if (!Allowed(node))
+                    continue;
+                var entity = node.Entity;
+                if (entity == null)
+                    continue;
+                Add(node, entity.Player, entity.IsEnemy ? "enemy" : "creature", entity.CurrentHp, entity.MaxHp);
+            }
+        }
+
+        // Rest site: the character sprites in the room (MEND targets these).
+        var restRoom = NRestSiteRoom.Instance;
+        if (restRoom != null && GodotObject.IsInstanceValid(restRoom))
+        {
+            foreach (var character in restRoom.characterAnims)
+            {
+                if (!Allowed(character))
+                    continue;
+                var player = character.Player;
+                Add(character, player, "rest_site",
+                    player?.Creature?.CurrentHp ?? 0, player?.Creature?.MaxHp ?? 0);
+            }
+        }
+
+        // Multiplayer: the top-left player state panels are valid targets too.
+        var runNode = NRun.Instance;
+        if (runNode != null && GodotObject.IsInstanceValid(runNode))
+        {
+            foreach (var state in UiHelper.FindAll<NMultiplayerPlayerState>(runNode))
+            {
+                if (!Allowed(state))
+                    continue;
+                var player = state.Player;
+                Add(state, player, "player_state",
+                    player?.Creature?.CurrentHp ?? 0, player?.Creature?.MaxHp ?? 0);
+            }
+        }
+
+        return candidates;
     }
 
     internal static List<MerchantEntry> GetShopEntries(NMerchantRoom room)

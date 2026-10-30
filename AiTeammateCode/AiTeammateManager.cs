@@ -150,11 +150,24 @@ public class AiTeammateManager
         ConversationContext.ResetAll();
         DirectiveManager.ResetAll();
         ResetExtraPlayerTurnCombatDecisionState();
-        var speakerName = PersonalityManager.Active?.Name ?? AiLoc.T("chat.ai_default_name", "AI Teammate");
+        var speakerName = AiNames.DisplayName;
         ChatManager.AddSystemMessage(AiLoc.T("system.ai_joined", "{Name} joined the team", ("Name", speakerName)));
         Patches.NGamePatch.RefreshChatUi();
         MainFile.Logger.Info($"AI 玩家已加入: {aiPlayer.Character?.Id.Entry}");
         AiLog.Log("SYSTEM", $"AI 玩家加入: {aiPlayer.Character?.Id.Entry} (NetId={aiPlayer.NetId})");
+
+        // Multiplayer: let every client resolve the same nickname for this AI player.
+        try
+        {
+            AiNicknameSync.OnAiPlayerJoined();
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[Nickname] 联机昵称同步初始化失败: {ex.Message}");
+        }
+
+        // A run with an AI teammate invites a running dsh to open a conversation and take over.
+        AgentTakeoverInvite.OnAiPlayerJoined(aiPlayer.Character?.Id.Entry ?? "");
     }
 
     /// <summary>Binds the local singleplayer player to AI control (solo climb mode).</summary>

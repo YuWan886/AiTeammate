@@ -1,4 +1,4 @@
-﻿using Godot;
+using Godot;
 using STS2RitsuLib;
 using STS2RitsuLib.Settings;
 using STS2RitsuLib.Ui.Toast;
@@ -126,6 +126,17 @@ public static class AiSettingsPage
 
     private static readonly ModSettingsValueBinding<AiSettings, string> ActivePersonality =
         B(s => s.ActivePersonalityId, (s, v) => s.ActivePersonalityId = v);
+
+    // The nickname is also written by the AI itself and by dsh, so the binding only stores the
+    // normalized value; live UI/peer refresh happens on the next frame (writing inside the store's
+    // Modify callback would re-enter the data store). 昵称也可能被 AI/dsh 修改。
+    private static readonly ModSettingsValueBinding<AiSettings, string> AiNickname =
+        B(s => s.AiNickname,
+            (s, v) =>
+            {
+                s.AiNickname = AiNames.Normalize(v);
+                MainThread.Post(AiNames.NotifySettingsChanged);
+            });
     private static readonly ModSettingsValueBinding<AiSettings, bool> EnablePersonalityGrowth =
         B(s => s.EnablePersonalityGrowth, (s, v) => s.EnablePersonalityGrowth = v);
     private static readonly ModSettingsValueBinding<AiSettings, bool> EnableLongTermMemory =
@@ -161,6 +172,14 @@ public static class AiSettingsPage
         B(s => s.AgentBridgeToken, (s, v) => s.AgentBridgeToken = v);
     private static readonly ModSettingsValueBinding<AiSettings, bool> AgentBridgeAllowActions =
         B(s => s.AgentBridgeAllowActions, (s, v) => s.AgentBridgeAllowActions = v);
+    private static readonly ModSettingsValueBinding<AiSettings, int> AgentFallbackSeconds =
+        B(s => s.AgentFallbackSeconds, (s, v) => s.AgentFallbackSeconds = v);
+    private static readonly ModSettingsValueBinding<AiSettings, bool> AutoLaunchAgentSession =
+        B(s => s.AutoLaunchAgentSession, (s, v) => s.AutoLaunchAgentSession = v);
+    private static readonly ModSettingsValueBinding<AiSettings, string> AgentLaunchWorkspace =
+        B(s => s.AgentLaunchWorkspace, (s, v) => s.AgentLaunchWorkspace = v);
+    private static readonly ModSettingsValueBinding<AiSettings, string> AgentLaunchPrompt =
+        B(s => s.AgentLaunchPrompt, (s, v) => s.AgentLaunchPrompt = v);
 
     private static readonly ModSettingsValueBinding<AiSettings, bool> AutoRefreshCache =
         B(s => s.AutoRefreshCache, (s, v) => s.AutoRefreshCache = v);
@@ -329,6 +348,14 @@ public static class AiSettingsPage
                 .AddButton("restore_personality", S("settings.personality.restore.label", "Restore built-in personality"),
                     S("settings.personality.restore.button", "Restore"), RestorePersonality)
             )
+            .AddSection("identity", section => section
+                .WithTitle(S("settings.section.identity", "AI Identity"))
+                .AddString("ai_nickname", S("settings.nickname.label", "AI nickname"), AiNickname,
+                    placeholder: ModSettingsText.Dynamic(() => AiNames.DefaultName),
+                    maxLength: AiNames.MaxNicknameLength,
+                    description: S("settings.nickname.desc",
+                        "Shown on the AI's nameplate, in chat and in prompts. Leave empty to use the active personality's name. The AI itself (and dsh) can change it during a run; the field shows the latest value when the page is reopened."))
+            )
             .AddSection("chat", section => section
                 .WithTitle(S("settings.section.chat", "Chat"))
                 .AddToggle("ai_chat", S("settings.chat.enabled", "Enable AI chat"), EnableAIChat)
@@ -465,11 +492,28 @@ public static class AiSettingsPage
                 .AddToggle("agent_actions", S("settings.agent.actions", "Allow the external agent to play"), AgentBridgeAllowActions,
                     description: S("settings.agent.actions.desc",
                         "Turn off to expose read-only tools. Actions are singleplayer-only and are refused while \"AI climbs alone\" is active."))
+                .AddIntSlider("agent_fallback", S("settings.agent.fallback", "Fall back when dsh is silent"), AgentFallbackSeconds,
+                    0, 300, 5,
+                    description: S("settings.agent.fallback.desc",
+                        "Seconds the AI waits for dsh before using its own backend. When no dsh request arrived for that long, decisions skip the bridge entirely, so a connected-but-idle agent can no longer freeze the AI. 0 keeps waiting forever."))
                 .AddParagraph("agent_status", ModSettingsText.Dynamic(DescribeAgentBridgeStatus))
                 .AddButton("agent_restart", S("settings.agent.restart.label", "Bridge"),
                     S("settings.agent.restart.button", "Restart"), RestartAgentBridge,
                     ModSettingsButtonTone.Normal,
                     S("settings.agent.restart.desc", "Apply the port/token changes immediately and rebind the bridge."))
+                .AddToggle("agent_takeover", S("settings.agent.takeover", "Take over automatically when an AI teammate joins"),
+                    AutoLaunchAgentSession,
+                    description: S("settings.agent.takeover.desc",
+                        "When a run gets an AI teammate and nothing is driving it, the dsh you have open opens a new conversation in this workspace and takes over. Nothing is started for you: the invitation only reaches a dsh that is already running."))
+                .AddParagraph("agent_takeover_status", ModSettingsText.Dynamic(AgentTakeoverInvite.Describe))
+                .AddString("agent_launch_workspace", S("settings.agent.launch.workspace", "Workspace"),
+                    AgentLaunchWorkspace,
+                    description: S("settings.agent.launch.workspace.desc",
+                        "Directory the new conversation belongs to (dsh groups sessions by it)."))
+                .AddMultilineString("agent_launch_prompt", S("settings.agent.launch.prompt", "First message"),
+                    AgentLaunchPrompt,
+                    S("settings.agent.launch.prompt.desc",
+                        "Sent as the first user message of the new conversation. Placeholders: {Host}, {Port}, {Token}, {Workspace}, {Character}."))
             )
             .AddSection("maintenance", section => section
                 .WithTitle(S("settings.section.maintenance", "Maintenance"))

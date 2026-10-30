@@ -568,8 +568,10 @@ internal static class AgentActions
             "card_reward" => ChooseCardReward(index, skip),
             "card_choice" => ChooseCardChoice(index, skip),
             "relic_select" => ChooseRelic(index, skip),
+            "rune_select" => ChooseRuneSelect(index),
             "treasure_relic" => ChooseTreasureRelic(index),
             "rest" => ChooseRest(index),
+            "target_select" => ChooseTarget(index),
             "event" => ChooseEvent(index),
             "shop" => ChooseShop(index),
             "bundle_select" => ChooseBundle(index),
@@ -692,7 +694,44 @@ internal static class AgentActions
         return new AgentActionResult(true, $"Selected relic {i}", 600);
     }
 
-    /// <summary>The relic card sitting inside an opened treasure chest (in-room, not an overlay).</summary>
+    /// <summary>
+    /// HextechRunes act rune pick. Commits through the screen's presenter surface, so no button click, no
+    /// anti-double-click guard and no "select then confirm" preference stands in the way.
+    /// </summary>
+    private static AgentActionResult ChooseRuneSelect(int? index)
+    {
+        var screen = NOverlayStack.Instance?.Peek();
+        if (screen == null || !HextechRuneSelectSupport.IsScreen(screen))
+            return Fail("The rune selection screen is not open anymore.");
+
+        if (HextechRuneSelectSupport.IsLocked(screen))
+            return Fail("The rune is already locked in; call sts2_wait for the act to continue.");
+
+        var relics = HextechRuneSelectSupport.Options(screen);
+        var wanted = index ?? 0;
+
+        if (relics.Count == 0)
+        {
+            if (!HextechRuneSelectSupport.CanConfirmEmpty(screen))
+                return Fail("This Hextech screen has no rune option for the bridge to pick.");
+
+            if (!HextechRuneSelectSupport.ConfirmEmpty(screen))
+                return Fail("Could not confirm the rune screen.");
+
+            return new AgentActionResult(true, "Confirmed the rune screen (no rune options this act)", 900);
+        }
+
+        if (wanted < 0 || wanted >= relics.Count)
+            return Fail($"Rune index out of range (0..{relics.Count - 1}).");
+
+        var name = AgentSnapshotBuilder.SafeLoc(relics[wanted].Title, relics[wanted].Id.Entry);
+        if (!HextechRuneSelectSupport.Choose(screen, wanted))
+            return Fail($"Could not select rune {wanted}.");
+
+        return new AgentActionResult(true, $"Selected rune {wanted} ({name})", 900);
+    }
+
+
     private static AgentActionResult ChooseTreasureRelic(int? index)
     {
         var holders = AgentSnapshotBuilder.GetTreasureRelicHolders(NRun.Instance);
@@ -749,6 +788,53 @@ internal static class AgentActions
         {
             MainFile.Logger.Warn($"[Agent] rest choice failed: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Resolves the game's active target picker (rest-site MEND, some potion/relic flows). The last
+    /// index cancels; every other index hovers that node and finishes the selection — the manager
+    /// completes with the node it considers hovered, exactly like a mouse click. 选择目标。
+    /// </summary>
+    private static AgentActionResult ChooseTarget(int? index)
+    {
+        var manager = AgentSnapshotBuilder.GetTargetManager();
+        if (manager?.IsInSelection != true)
+            return Fail("The game is not asking for a target anymore.");
+
+        var candidates = AgentSnapshotBuilder.GetTargetCandidates();
+        var cancelIndex = candidates.Count;
+        if (index is not { } i || i < 0 || i > cancelIndex)
+            return Fail($"Target index out of range (0..{cancelIndex}; "
+                        + $"{candidates.Count} target(s), index {cancelIndex} cancels).");
+
+        if (i == cancelIndex)
+        {
+            manager.CancelTargeting();
+            return new AgentActionResult(true, "Cancelled the target selection", 700);
+        }
+
+        var candidate = candidates[i];
+        var node = candidate.Node;
+        if (node == null || !GodotObject.IsInstanceValid(node))
+            return Fail("That target is gone; call sts2_state for a fresh list.");
+
+        manager.OnNodeHovered(node);
+        var hovered = AccessTools.Property(typeof(NTargetManager), "HoveredNode")?.GetValue(manager) as Node;
+        if (hovered == null || !ReferenceEquals(hovered, node))
+        {
+            // Targeting hooks refused this node (e.g. a prevent-target effect). Drop the hover so
+            // the arrow does not stay stuck on it.
+            try { manager.OnNodeUnhovered(node); } catch { /* best effort */ }
+            return Fail("The game refused that target.");
+        }
+
+        var finish = AccessTools.Method(typeof(NTargetManager), "FinishTargeting", new[] { typeof(bool) });
+        if (finish == null)
+            return Fail("Could not complete the target selection (FinishTargeting not found).");
+
+        finish.Invoke(manager, new object[] { false });
+        var label = string.IsNullOrWhiteSpace(candidate.Label) ? $"target {i}" : candidate.Label;
+        return new AgentActionResult(true, $"Targeted {label}", 900);
     }
 
     private static AgentActionResult ChooseEvent(int? index)
@@ -954,10 +1040,12 @@ internal static class AgentActions
         {
             "map" => Fail("Use sts2_choose to travel instead of sts2_proceed."),
             "combat" => Fail("Use sts2_end_turn to finish the turn."),
+            "target_select" => Fail("Use sts2_choose index=<n> to pick a target (the last index cancels)."),
             "rewards" => ProceedRewards(),
             "card_reward" => ChooseCardReward(null, skip: true),
             "card_choice" => ChooseCardChoice(null, skip: true),
             "relic_select" => ChooseRelic(null, skip: true),
+            "rune_select" => ChooseRuneSelect(null),
             "event" => ProceedEvent(),
             "shop" => ProceedShop(),
             "bundle_select" => ProceedBundle(),

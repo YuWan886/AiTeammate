@@ -858,6 +858,8 @@ public class ContextBuilder
         var travelable = GetTravelableMapPoints(aiPlayer);
         if (travelable.Count > 0)
             sb.AppendLine($"可前往: {string.Join("、", travelable.Select(DescribeMapPoint))}");
+        if (travelable.Count == 1 && travelable[0].PointType == MapPointType.Ancient)
+            sb.AppendLine("（幕开局的先古房间：必须先进入它，本幕下一行的房间才会开放。）");
 
         sb.AppendLine(runState.Map.SecondBossMapPoint is { } secondBoss
             ? $"Boss: {DescribeMapPoint(runState.Map.BossMapPoint)} | 第二Boss: {DescribeMapPoint(secondBoss)}"
@@ -946,8 +948,9 @@ public class ContextBuilder
     }
 
     /// <summary>
-    /// Nodes reachable from the current position, mirroring <c>NMapScreen</c>: start nodes before the
-    /// first move, the boss after the last normal row, and the second boss after the first boss.
+    /// Nodes reachable from the current position, mirroring <c>NMapScreen.RecalculateTravelability</c>:
+    /// the act's starting point (the Ancient room) before the first move, the boss after the last
+    /// normal row, and the second boss after the first boss.
     /// </summary>
     public static IReadOnlyList<MapPoint> GetTravelableMapPoints(Player aiPlayer)
     {
@@ -956,8 +959,11 @@ public class ContextBuilder
         if (runState == null || map == null)
             return Array.Empty<MapPoint>();
 
+        // No node visited yet: the map screen only enables StartingMapPoint (the Ancient/start node of
+        // this act). Returning map.startMapPoints (the row-1 nodes) here let the AI vote straight past
+        // the act-start Ancient, skipping it entirely.
         if (runState.VisitedMapCoords.Count == 0)
-            return SortPoints(map.startMapPoints);
+            return SortPoints(new[] { map.StartingMapPoint });
 
         if (runState.CurrentMapPoint is not { } current)
             return Array.Empty<MapPoint>();

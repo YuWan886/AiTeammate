@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using MegaCrit.Sts2.Core.Entities.Players;
+using AiTeammate.AiTeammateCode.Settings;
 
 namespace AiTeammate.AiTeammateCode.Agent;
 
@@ -12,10 +13,16 @@ namespace AiTeammate.AiTeammateCode.Agent;
 /// for <c>sts2_decide</c>. The client sees the exact prompt the LLM would have seen and answers with
 /// the same JSON the parser expects, so nothing downstream changes.
 /// 对接 dsh 后，AI 的决策改由 dsh 给出（dsh 当大脑，mod 当手）。
+///
+/// A connected client is not the same as a driving one: the dsh host keeps its socket open while no
+/// agent turn is running. If dsh has not touched the bridge for <see cref="FallbackSeconds"/>, the
+/// broker stops parking decisions so the AI falls back to its own backend instead of freezing the game.
+/// 连着 ≠ 在驱动：dsh 静默太久时改回自带后端，避免 AI 被卡住。
 /// </summary>
 internal static class AgentDecisionBroker
 {
     private const int MaxWaitSeconds = 300;
+    private const int WaitFloorSeconds = 60;
     private const int PollMs = 500;
 
     private sealed class Pending
@@ -47,6 +54,32 @@ internal static class AgentDecisionBroker
         get { lock (Sync) return _pending != null; }
     }
 
+    /// <summary>
+    /// How long dsh may stay silent before decisions go straight to the built-in backend.
+    /// 0 disables the fallback. dsh 静默多少秒后回退到自带后端；0 = 不回退。
+    /// </summary>
+    private static int FallbackSeconds
+    {
+        get
+        {
+            try { return Math.Clamp(AiSettingsStore.Current.AgentFallbackSeconds, 0, 3600); }
+            catch { return 30; }
+        }
+    }
+
+    /// <summary>
+    /// How long one parked decision may wait for its answer. Three times the silence window (at least
+    /// a minute) so a model that thinks for a while is not cut off, while a client that died mid-turn
+    /// still releases the AI. 单次决策的等待预算。
+    /// </summary>
+    private static int WaitBudgetSeconds(int fallbackSeconds)
+        => fallbackSeconds <= 0
+            ? MaxWaitSeconds
+            : Math.Clamp(fallbackSeconds * 3, WaitFloorSeconds, MaxWaitSeconds);
+
+    private static string DescribeSilence(double seconds)
+        => seconds >= 3600 ? "超过 1 小时" : $"{seconds:F0} 秒";
+
     /// <summary>JSON view of the outstanding decision, or null. Main-thread safe.</summary>
     public static JsonObject? SnapshotJson()
     {
@@ -62,7 +95,7 @@ internal static class AgentDecisionBroker
                 ["player"] = _pending.PlayerName,
                 ["net_id"] = _pending.PlayerNetId,
                 ["age_seconds"] = Math.Round((DateTimeOffset.UtcNow - _pending.CreatedAt).TotalSeconds, 1),
-                ["max_wait_seconds"] = MaxWaitSeconds,
+                ["max_wait_seconds"] = WaitBudgetSeconds(FallbackSeconds),
                 ["system_prompt"] = _pending.SystemPrompt,
                 ["prompt"] = _pending.Prompt,
                 ["options"] = _pending.Options?.DeepClone(),
@@ -81,6 +114,21 @@ internal static class AgentDecisionBroker
         if (!Enabled)
             return null;
 
+        var fallbackSeconds = FallbackSeconds;
+        if (fallbackSeconds > 0)
+        {
+            var idleSeconds = AgentBridgeService.ClientIdleSeconds;
+            if (idleSeconds > fallbackSeconds)
+            {
+                // A socket stays open while no agent turn is running. Don't make the AI (and the other
+                // players) wait for an answer that nobody is going to write.
+                MainFile.Logger.Info(
+                    $"[Agent] dsh 已静默 {DescribeSilence(idleSeconds)}，本次 {kind} 决策改用自带后端");
+                return null;
+            }
+        }
+
+        var waitBudgetSeconds = WaitBudgetSeconds(fallbackSeconds);
         Pending pending;
         Pending? superseded = null;
         lock (Sync)
@@ -110,7 +158,7 @@ internal static class AgentDecisionBroker
         MainFile.Logger.Info($"[Agent] waiting for dsh decision {pending.Id} ({kind})");
         try
         {
-            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(MaxWaitSeconds));
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(waitBudgetSeconds));
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
 
             while (!pending.Completion.Task.IsCompleted)
@@ -138,7 +186,8 @@ internal static class AgentDecisionBroker
                 return content;
             }
 
-            MainFile.Logger.Warn($"[Agent] dsh decision {pending.Id} ({kind}) not answered in time");
+            MainFile.Logger.Warn(
+                $"[Agent] dsh 未在 {waitBudgetSeconds} 秒内应答 {pending.Id} ({kind})，回退自带后端");
             return null;
         }
         finally

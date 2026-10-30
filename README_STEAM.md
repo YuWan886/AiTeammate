@@ -15,6 +15,8 @@ AI 队友为《杀戮尖塔 2》加入一个由大语言模型操控的玩家—
 [list]
 [*][b]👥 多人联机 AI 队友[/b]：拥有独立人格（战术家 / 激进 / 谨慎 / 混沌，也可自定义），会读整幕地图、血量、金币与构筑后[b]自主投票选路[/b]，而不是复制人类投的节点；战斗按阶段协作出牌（药水 → 铺垫 → 集火 → 剩余手牌）；能在聊天里交流；可只读查看你的手牌、牌堆、金币、遗物与药水。
 
+[*][b]🏷️ 自定义昵称[/b]：给 AI 队友起名字（设置 → AI 身份）；它自己在聊天里、或通过 dsh 也能改名，名牌、聊天、提示词与联机客户端同步更新。
+
 [*][b]🏔️ 独自爬塔（单人模式）[/b]：AI 接管本地玩家，自动完成选路、战斗出牌与用药水、奖励与选牌、商店、篝火、事件、宝箱和进入下一幕。发消息即可打断，点 ⏸/▶ 暂停或继续，还能下达「先打左边」这类战术指令。
 
 [*][b]🧠 看得懂牌桌[/b]：战斗提示包含手牌、抽牌堆、弃牌堆、消耗堆内容（[b]永远不暴露牌序[/b]）、地图连线图，以及选牌奖励与商店的完整牌组；需要时可调用只读工具查询牌堆、单卡、遗物、药水、玩家状态、局内状态与牌组统计。
@@ -97,6 +99,8 @@ Adds a player driven by a large language model to Slay the Spire 2. In multiplay
 
 [list]
 [*][b]👥 Multiplayer AI Teammate[/b]: Its own personality (tactician / aggressive / cautious / chaos-seeker, or custom), [b]independent map votes[/b] based on the whole act map, HP, gold and deck instead of copying a human vote, coordinated card play in phases (potions → setup → focused attacks → leftovers), chat, and read-only views of your hand, piles, gold, relics and potions.
+
+[*][b]🏷️ Custom nickname[/b]: Name the AI teammate (Settings → AI Identity); it can also rename itself in chat or through dsh, and the nameplate, chat, prompts and other multiplayer clients follow immediately.
 
 [*][b]🏔️ Solo Climb (Singleplayer)[/b]: The AI takes over the local player and handles routing, combat cards and potions, rewards and card picks, shops, rest sites, events, chests and act transitions. Send a chat message to interrupt it, press ⏸/▶ to pause or resume, and give tactical orders like "kill the left one first".
 

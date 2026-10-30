@@ -1,3 +1,5 @@
+using AiTeammate.AiTeammateCode.Agent;
+
 namespace AiTeammate.AiTeammateCode.Settings;
 
 /// <summary>Scrolling direction of the live-danmaku overlay. 弹幕滚动方向。</summary>
@@ -102,6 +104,15 @@ public sealed class AiSettings
     /// <summary>How many recent danmaku are shown to the AI in one reply request. 每次回复参考的弹幕条数。</summary>
     public int DanmakuAiChatBatchSize { get; set; } = 6;
 
+    // ---- Identity ----
+
+    /// <summary>
+    /// Custom display name for the AI teammate. Empty follows the active personality's name.
+    /// The AI and dsh may change it during a run, so treat this as "last known nickname".
+    /// AI 队友的自定义昵称；为空时沿用当前人格名。
+    /// </summary>
+    public string AiNickname { get; set; } = "";
+
     // ---- Personality / memory ----
 
     public string ActivePersonalityId { get; set; } = "tactician";
@@ -141,6 +152,27 @@ public sealed class AiSettings
 
     /// <summary>Allows the external agent to perform actions (not just read state). 允许外部 Agent 执行动作。</summary>
     public bool AgentBridgeAllowActions { get; set; } = true;
+
+    /// <summary>
+    /// How long the external agent may stay silent before the AI stops waiting and hands the
+    /// decision to its own backend. 0 disables the fallback (keep waiting like before).
+    /// dsh 静默多少秒后回退到自带后端；0 = 不回退。
+    /// </summary>
+    public int AgentFallbackSeconds { get; set; } = 30;
+
+    // ---- Auto-launched dsh session ----
+    // The mod can start a dsh session by itself when an AI teammate joins a run, so the player no
+    // longer has to open a conversation and type "play Slay the Spire 2" by hand.
+    // AI 队友入局时自动拉起一个 dsh 会话，省掉手动开对话的步骤。
+
+    /// <summary>Lets dsh take over automatically when an AI teammate joins the run. 自动接管。</summary>
+    public bool AutoLaunchAgentSession { get; set; } = true;
+
+    /// <summary>Directory the new conversation belongs to (dsh groups sessions by it). 会话工作区。</summary>
+    public string AgentLaunchWorkspace { get; set; } = @"F:\sts2-mod\MiniMods";
+
+    /// <summary>First message of the conversation the plugin opens. 新对话的首条消息。</summary>
+    public string AgentLaunchPrompt { get; set; } = AgentTakeoverInvite.DefaultPrompt;
 
     // ---- Maintenance ----
 
@@ -188,6 +220,8 @@ public sealed class AiSettings
         DanmakuAiChatCooldownMs = defaults.DanmakuAiChatCooldownMs;
         DanmakuAiChatBatchSize = defaults.DanmakuAiChatBatchSize;
 
+        AiNickname = defaults.AiNickname;
+
         ActivePersonalityId = defaults.ActivePersonalityId;
         EnablePersonalityGrowth = defaults.EnablePersonalityGrowth;
         EnableLongTermMemory = defaults.EnableLongTermMemory;
@@ -207,6 +241,10 @@ public sealed class AiSettings
         AgentBridgePort = defaults.AgentBridgePort;
         AgentBridgeToken = defaults.AgentBridgeToken;
         AgentBridgeAllowActions = defaults.AgentBridgeAllowActions;
+        AgentFallbackSeconds = defaults.AgentFallbackSeconds;
+        AutoLaunchAgentSession = defaults.AutoLaunchAgentSession;
+        AgentLaunchWorkspace = defaults.AgentLaunchWorkspace;
+        AgentLaunchPrompt = defaults.AgentLaunchPrompt;
 
         AutoRefreshCache = defaults.AutoRefreshCache;
         EnableDecisionLog = defaults.EnableDecisionLog;

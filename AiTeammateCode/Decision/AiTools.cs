@@ -3,6 +3,7 @@ using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Models;
 using AiTeammate.AiTeammateCode.Cache;
+using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Settings;
 
 namespace AiTeammate.AiTeammateCode.Decision;
@@ -30,8 +31,9 @@ public sealed class ToolExecutionResult
 }
 
 /// <summary>
-/// Read-only information tools the AI can call before deciding. Everything here only *reads* live
-/// combat/run state; nothing mutates the game. Must run on the main thread (card text formatting).
+/// Information tools the AI can call before deciding. Everything here reads live combat/run state;
+/// the one exception is <c>set_nickname</c>, which changes only the AI's own display name. Must run
+/// on the main thread (card text formatting, settings writes).
 /// </summary>
 public sealed class AiToolRunner
 {
@@ -57,6 +59,7 @@ public sealed class AiToolRunner
         "- read_potions: args {\"player\":\"可选\"}；返回该玩家全部药水与完整效果、槽位占用。\n" +
         "- read_player: args {\"player\":\"可选\"}；返回血量/格挡/能量/辉星/金币/状态/手牌/牌堆张数/药水与遗物数量。\n" +
         "- read_run: args {}；返回幕/层/进阶、所有玩家血量与金币、已访问节点统计、构筑判断。\n" +
+        DescribeNicknameTool() + "\n" +
         (includeScreenshot ? DescribeScreenshotTool() + "\n" : "") +
         "多人模式下可直接查看队友，例如 {\"name\":\"read_relics\",\"args\":{\"player\":\"队友名\"}}。";
 
@@ -70,7 +73,12 @@ public sealed class AiToolRunner
         "- read_pile: args {\"pile\":\"deck|hand\", \"detail\":\"brief|full\", \"player\":\"可选\"}；返回主牌组或手牌内容。\n" +
         "- deck_stats: args {\"player\":\"可选\"}；返回牌组统计（类型/稀有度/平均费用/升级数/关键词）。\n" +
         "- card_info: args {\"name\":\"卡名\", \"player\":\"可选\"}；返回单卡完整描述。\n" +
+        DescribeNicknameTool() + "\n" +
         (includeScreenshot ? DescribeScreenshotTool() : "");
+
+    /// <summary>Manifest line for the self-rename tool. 修改自己昵称的工具说明。</summary>
+    public static string DescribeNicknameTool() =>
+        "- set_nickname: args {\"name\":\"新昵称\"}；修改你自己的显示昵称（最多24字，玩家、聊天与名牌会立刻更新；传空字符串恢复当前人格名）。想改名时随时可调用。";
 
     /// <summary>Manifest line for the vision tool; only advertised when the setting is on.</summary>
     public static string DescribeScreenshotTool() =>
@@ -195,6 +203,16 @@ public sealed class AiToolRunner
             case "read_run":
                 return _context.DescribeRun(aiPlayer);
 
+            case "set_nickname":
+            case "rename_self":
+            {
+                var name = call.Get("name");
+                if (string.IsNullOrWhiteSpace(name))
+                    name = call.Get("nickname");
+                var change = AiNames.SetNickname(name, "ai-tool");
+                return change.Message;
+            }
+
             case "read_map":
                 return ContextBuilder.DescribeMap(aiPlayer);
 
@@ -207,7 +225,7 @@ public sealed class AiToolRunner
             }
 
             default:
-                return $"未知工具 \"{call.Name}\"。可用: read_pile, card_info, read_relics, read_potions, read_player, read_run, read_map, deck_stats"
+                return $"未知工具 \"{call.Name}\"。可用: read_pile, card_info, read_relics, read_potions, read_player, read_run, read_map, deck_stats, set_nickname"
                        + (AiSettingsStore.Current.EnableScreenshotTool ? ", screenshot" : "");
         }
     }

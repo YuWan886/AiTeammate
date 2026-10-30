@@ -154,7 +154,15 @@ internal sealed class AgentBridgeServer : IDisposable
         }
 
         var args = request["args"] as JsonObject ?? new JsonObject();
+
+        // Poll-style calls must not count as "dsh is alive": the plugin asks for a take-over
+        // invitation every few seconds even when no session is driving, and stamping them would
+        // keep the silence fallback from ever firing.
+        var passive = call is "sts2_takeover";
+
         AgentToolResult result;
+        if (!passive)
+            AgentBridgeService.BeginClientRequest();
         try
         {
             result = await AgentToolExecutor.ExecuteAsync(call, args, _allowActions, ct).ConfigureAwait(false);
@@ -166,6 +174,11 @@ internal sealed class AgentBridgeServer : IDisposable
         catch (Exception ex)
         {
             result = AgentToolResult.Error(ex.Message);
+        }
+        finally
+        {
+            if (!passive)
+                AgentBridgeService.EndClientRequest();
         }
 
         var response = new JsonObject

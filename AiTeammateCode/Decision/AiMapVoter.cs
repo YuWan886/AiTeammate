@@ -159,6 +159,18 @@ internal static class AiMapVoter
             if (existing.HasValue && existing.Value.mapGenerationCount == generation)
                 return;
 
+            // Last-line guard: only vote a node the map screen would actually enable. A stale or
+            // hallucinated coordinate otherwise gets accepted by the synchronizer and drags the whole
+            // party past the act-start Ancient room.
+            var travelable = ContextBuilder.GetTravelableMapPoints(aiPlayer);
+            if (!travelable.Any(point => point.coord.Equals(coord.Value)))
+            {
+                MainFile.Logger.Warn(
+                    $"[MapVote] AI vote ({coord.Value.col},{coord.Value.row}) is not travelable " +
+                    $"(allowed: {string.Join(",", travelable.Select(p => $"({p.coord.col},{p.coord.row})"))}); vote dropped.");
+                return;
+            }
+
             synchronizer.PlayerVotedForMapCoord(aiPlayer, source, new MapVote
             {
                 mapGenerationCount = generation,

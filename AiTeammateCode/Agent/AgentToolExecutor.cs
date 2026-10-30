@@ -38,6 +38,9 @@ internal static class AgentToolExecutor
             {
                 case "sts2_hello":
                     return Hello();
+                case "sts2_takeover":
+                    // Invitation poll: a plugin may claim the run and create a dsh session for it.
+                    return AgentToolResult.Ok(AgentTakeoverInvite.TryTakeoverJson());
                 case "sts2_state":
                     return CaptureState();
                 case "sts2_wait":
@@ -52,6 +55,9 @@ internal static class AgentToolExecutor
                     return await ClaimRewardsAsync(args, ct);
                 case "sts2_read":
                     return Read(args);
+                case "sts2_set_nickname":
+                    // Cosmetic self-rename: allowed even in read-only mode, like sts2_read.
+                    return SetNickname(args);
                 case "sts2_screenshot":
                     return Screenshot();
             }
@@ -89,7 +95,8 @@ internal static class AgentToolExecutor
                 + "with sts2_decide. "
                 + "when it shows kind=ai the AI player is yours and decisions come as phase=ai_decision, "
                 + "answered with sts2_decide. Start or resume a run with sts2_start_run / sts2_continue_run; "
-                + "run control is sts2_pause / sts2_resume / sts2_save / sts2_quit_to_menu / sts2_abandon."
+                + "run control is sts2_pause / sts2_resume / sts2_save / sts2_quit_to_menu / sts2_abandon. "
+                + "sts2_set_nickname changes the AI teammate's display name at any time."
         };
         return AgentToolResult.Ok(json.ToJsonString(AgentJson.Options));
     }
@@ -214,6 +221,20 @@ internal static class AgentToolExecutor
             var result = runner.Execute(player, new[] { call });
             return AgentToolResult.Ok(result.Text);
         });
+    }
+
+    /// <summary>
+    /// dsh changes the AI teammate's display name. Empty clears it and restores the personality name.
+    /// 外部 Agent 修改 AI 昵称。
+    /// </summary>
+    private static AgentToolResult SetNickname(JsonObject args)
+    {
+        var name = StringArg(args, "name");
+        if (string.IsNullOrWhiteSpace(name))
+            name = StringArg(args, "nickname");
+
+        var change = AiNames.SetNickname(name, "dsh");
+        return change.Ok ? AgentToolResult.Ok(change.Message) : AgentToolResult.Error(change.Message);
     }
 
     private static AgentToolResult Screenshot()

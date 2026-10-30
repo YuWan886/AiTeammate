@@ -17,6 +17,7 @@ using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Nodes.Screens.CharacterSelect;
 using MegaCrit.Sts2.Core.Nodes.Screens.MainMenu;
 using MegaCrit.Sts2.Core.Nodes.Vfx.Utilities;
+using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Localization;
 
 namespace AiTeammate.AiTeammateCode.Patches;
@@ -62,6 +63,17 @@ public static class CharacterSelectScreenPatch
         var lobby = __instance.Lobby;
         if (lobby == null || Compat.GameCompat.MaxPlayers(lobby) <= 1)
             return;
+
+        // Register the nickname sync while every client is in the lobby, so the host's first
+        // broadcast at run start cannot race a client that has not registered yet.
+        try
+        {
+            AiNicknameSync.EnsureRegistered(lobby.NetService);
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[Nickname] 大厅昵称同步注册失败: {ex.Message}");
+        }
 
         var existing = __instance.GetNodeOrNull<Control>(AiContainerName);
         existing?.QueueFree();
@@ -179,8 +191,11 @@ public static class CharacterSelectScreenPatch
             return;
 
         nodes.Icon.Texture = aiPlayer.Value.character.IconTexture;
-        nodes.NameLabel.Text = AiLoc.T("charselect.name", "AI: {Name}",
-            ("Name", aiPlayer.Value.character.Title.GetFormattedText()));
+        var characterName = aiPlayer.Value.character.Title.GetFormattedText();
+        nodes.NameLabel.Text = AiNames.HasCustomNickname
+            ? AiLoc.T("charselect.name_custom", "AI: {Nickname} ({Character})",
+                ("Nickname", AiNames.DisplayName), ("Character", characterName))
+            : AiLoc.T("charselect.name", "AI: {Name}", ("Name", characterName));
         nodes.StatusLabel.Text = aiPlayer.Value.isReady
             ? AiLoc.T("charselect.status.ready", "Status: Ready")
             : AiLoc.T("charselect.status.not_ready", "Status: Not ready");

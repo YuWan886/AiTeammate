@@ -60,6 +60,9 @@ public static class EventBeginLogPatch
         }
         if (manager.AiPlayer == null) return;
 
+        // New event: forget the page the previous event ended on.
+        EventAutoChoicePatch.ResetPageMemory();
+
         try
         {
             var eventSync = RunManager.Instance?.EventSynchronizer;
@@ -107,6 +110,41 @@ public static class EventAutoChoicePatch
 {
     private static int _decisionInFlight;
 
+    // 选完一个事件选项并不代表这一页就翻过去了：选项的效果可能是异步的（例如「卷轴箱」先要玩家从两包
+    // 牌里挑一包，屏幕挂着，事件页原地不动）。旧代码在这种情况下会立刻把「同一页」再决策一次，于是同一
+    // 页被反复选中（实测连选 11 次，每次都重放一次 relics 效果），直到撞上深度上限才停。
+    // 记住「已经答过哪一页」，翻页之前只等，不再重复决策。
+    private static string _lastAppliedPage = "";
+    private static int _pageRecheckAttempts;
+
+    private const int PageRecheckDelayMs = 500;
+    private const int MaxPageRecheckAttempts = 60; // 60 × 500ms ≈ 30s：效果还没结算完就一直等
+
+    public static void ResetPageMemory()
+    {
+        _lastAppliedPage = "";
+        _pageRecheckAttempts = 0;
+    }
+
+    /// <summary>
+    /// A page is identified by the event id plus its current option titles. Pages are just swapped
+    /// option sets on <see cref="EventModel"/> (there is no page index for non-shared events), so the
+    /// titles are what actually changes when the event moves on.
+    /// </summary>
+    private static string Fingerprint(EventModel? aiEvent)
+    {
+        try
+        {
+            if (aiEvent?.CurrentOptions == null) return "";
+            var titles = string.Join("|", aiEvent.CurrentOptions.Select(o => o.Title.SafeText(aiEvent)));
+            return $"{aiEvent.Id.Entry}#{aiEvent.CurrentOptions.Count}#{titles}";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
     public static void AutoResolveSingleOption(Player aiPlayer, EventSynchronizer eventSync, int resumeDepth = 0, string reason = "单选自动继续")
     {
         var manager = AiTeammateManager.Instance;
@@ -125,6 +163,7 @@ public static class EventAutoChoicePatch
             if (options == null || options.Count != 1) return;
 
             var title = options[0].Title.SafeText(aiEvent);
+            var pageBefore = Fingerprint(aiEvent);
             if (solo)
             {
                 // Solo: the AI is the local player — use the same path as the event UI.
@@ -135,6 +174,9 @@ public static class EventAutoChoicePatch
                 var method = AccessTools.Method(typeof(EventSynchronizer), "ChooseOptionForEvent");
                 method?.Invoke(eventSync, new object[] { aiPlayer, 0 });
             }
+
+            _lastAppliedPage = pageBefore;
+            _pageRecheckAttempts = 0;
 
             MainFile.Logger.Info($"AI auto-resolving single-option event page: {title}");
             manager.AiLog.Log("AI_ACTION", $"事件继续: {title} | {reason}");
@@ -196,6 +238,7 @@ public static class EventAutoChoicePatch
 
                         // Capture title BEFORE calling ChooseOptionForEvent (it may modify the options list)
                         var title = options[safeChoice].Title.SafeText(aiEvent);
+                        var pageBefore = Fingerprint(aiEvent);
 
                         if (SoloRunController.IsActive)
                         {
@@ -210,6 +253,12 @@ public static class EventAutoChoicePatch
 
                         manager.AiLog.LogEvent("事件选择", $"选择选项 {safeChoice} [{title}] | {finalReason}");
                         manager.AiLog.Log("AI_ACTION", $"事件: 选择选项 {safeChoice} [{title}] | NetId={aiPlayer.NetId}");
+
+                        // Remember the page we just answered: until the event actually swaps its options
+                        // (an async option effect may be waiting on a screen) the resolver must wait, not
+                        // decide the same page again.
+                        _lastAppliedPage = pageBefore;
+                        _pageRecheckAttempts = 0;
 
                         // Release the in-flight guard before chaining the next page, otherwise the
                         // next DecideAndApplyAsync call would be rejected as a duplicate.
@@ -353,6 +402,15 @@ public static class EventAutoChoicePatch
             var opts = aiEvent.CurrentOptions;
             if (opts == null || opts.Count == 0) return;
 
+            // Same page we already answered: its effect is still resolving (a screen the AI has to
+            // answer, an animation, ...). Wait for the options to change instead of answering twice.
+            var pageNow = Fingerprint(aiEvent);
+            if (pageNow.Length > 0 && pageNow == _lastAppliedPage)
+            {
+                SchedulePageRecheck(eventSync, aiPlayer, manager, resumeDepth);
+                return;
+            }
+
             if (opts.Count == 1)
             {
                 // Auto-select single option and continue loop
@@ -377,6 +435,48 @@ public static class EventAutoChoicePatch
                 return; // Async decision will continue resolution
             }
         }
+    }
+
+    /// <summary>
+    /// The page we answered has not moved on yet, so re-run the resolver a bit later instead of
+    /// deciding it again. Retries stop after <see cref="MaxPageRecheckAttempts"/> so a genuinely
+    /// stuck event cannot spin forever.
+    /// </summary>
+    private static void SchedulePageRecheck(EventSynchronizer eventSync, Player aiPlayer,
+        AiTeammateManager manager, int resumeDepth)
+    {
+        if (Interlocked.Increment(ref _pageRecheckAttempts) > MaxPageRecheckAttempts)
+        {
+            MainFile.Logger.Warn("Event page did not advance after the AI's choice; leaving the rest to the player");
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try { await Task.Delay(PageRecheckDelayMs); }
+            catch { return; }
+
+            Compat.MainThread.Post(() =>
+            {
+                try
+                {
+                    if (SoloRunController.IsActive && AiFlowControl.IsPaused) return;
+
+                    var aiEvent = eventSync.GetEventForPlayer(aiPlayer);
+                    if (aiEvent.IsFinished) { _pageRecheckAttempts = 0; return; }
+
+                    // Page moved on (or came back with different options): start counting fresh.
+                    if (Fingerprint(aiEvent) != _lastAppliedPage)
+                        _pageRecheckAttempts = 0;
+
+                    ContinueEventResolution(eventSync, aiPlayer, manager, resumeDepth);
+                }
+                catch (System.Exception ex)
+                {
+                    MainFile.Logger.Warn($"Event page recheck failed: {ex.Message}");
+                }
+            });
+        });
     }
 }
 

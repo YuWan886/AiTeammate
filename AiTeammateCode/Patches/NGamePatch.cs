@@ -13,6 +13,7 @@ using MegaCrit.Sts2.Core.Nodes.Vfx;
 using MegaCrit.Sts2.Core.Nodes.Vfx.Utilities;
 using MegaCrit.Sts2.Core.Runs;
 using AiTeammate.AiTeammateCode.Agent;
+using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Solo;
 using AiTeammate.AiTeammateCode.Localization;
 using AiTeammate.AiTeammateCode.Personality;
@@ -37,6 +38,8 @@ public static class NGamePatch
     private static ScrollContainer? _scrollContainer;
     private static Button? _minimizedButton;
     private static Button? _pauseButton;
+    private static Label? _chatTitleLabel;
+    private static bool _aiNamesHooked;
     private static PanelContainer? _agentBadge;
     private static int _lastAgentClients;
     private static bool _agentBridgeEventsHooked;
@@ -59,6 +62,26 @@ public static class NGamePatch
             return;
 
         AfterGameReady(game);
+    }
+
+    /// <summary>Title bar text: the AI's nickname once it has one, otherwise the generic mod title.</summary>
+    private static string ChatTitleText =>
+        AiNames.HasCustomNickname ? AiNames.DisplayName : AiLoc.T("chat.title", "AI Teammate");
+
+    /// <summary>Keeps the chat title bar and the minimized button in sync after a rename.</summary>
+    public static void RefreshChatTitle()
+    {
+        try
+        {
+            if (_chatTitleLabel != null && GodotObject.IsInstanceValid(_chatTitleLabel))
+                _chatTitleLabel.Text = ChatTitleText;
+
+            UpdateAgentBadge();
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[Nickname] 刷新聊天标题失败: {ex.Message}");
+        }
     }
 
     /// <summary>聊天面板仅在多人模式有 AI 队友、或单人爬塔由 AI 接管时显示。</summary>
@@ -161,6 +184,13 @@ public static class NGamePatch
         {
             AgentBridgeService.ClientCountChanged += OnAgentClientCountChanged;
             _agentBridgeEventsHooked = true;
+        }
+
+        // A rename can happen at any time (AI chat/tool or dsh); the title bar follows it.
+        if (!_aiNamesHooked)
+        {
+            AiNames.Changed += RefreshChatTitle;
+            _aiNamesHooked = true;
         }
 
         // Early in startup the run state may still be half-built; the panel state must never make the
@@ -270,7 +300,8 @@ public static class NGamePatch
         titleRow.MouseFilter = Control.MouseFilterEnum.Pass;
 
         var titleLabel = new Label();
-        titleLabel.Text = AiLoc.T("chat.title", "AI Teammate");
+        titleLabel.Text = ChatTitleText;
+        _chatTitleLabel = titleLabel;
         titleLabel.HorizontalAlignment = HorizontalAlignment.Left;
         titleLabel.AddThemeColorOverride("font_color", new Color(0.7f, 1f, 0.7f));
         titleRow.AddChild(titleLabel);
@@ -474,7 +505,10 @@ public static class NGamePatch
         }
 
         var connected = clients > 0;
-        var title = AiLoc.T("chat.title", "AI Teammate");
+        var title = ChatTitleText;
+
+        if (_chatTitleLabel != null && GodotObject.IsInstanceValid(_chatTitleLabel))
+            _chatTitleLabel.Text = title;
 
         if (_minimizedButton != null && GodotObject.IsInstanceValid(_minimizedButton))
             _minimizedButton.Text = connected ? $"{title} · dsh" : title;

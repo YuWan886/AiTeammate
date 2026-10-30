@@ -27,7 +27,8 @@ v1 只让 dsh 操作**本地真人玩家**。v2 增加了一条更重要的通�
   - 单人爬塔不再需要关掉开关：`SoloRunController` 的循环照常跑，只是每步决策在等 dsh，天然「自动退位」。
   - 多人局里 AI 队友的选牌/事件/商店/篝火/地图投票也一并交给 dsh（这些流程只存在于数据层，本地没有可点的 UI）。
   - 没有 AI 玩家（普通单人局）时行为与 v1 相同：dsh 用 UI 动作自己玩。
-- 失败与超时：单个决策最多等 300 秒；客户端断开（客户端数降到 0）会立刻 `Abort`，等待方返回空内容，走 mod 原有的兜底路径；战斗回合的 45 秒硬安全网在有外部大脑时放宽到 `330 + 90×(单回合决策次数-1)` 秒。
+- 失败与超时：单次决策的等待预算是 `AgentFallbackSeconds × 3`（至少 60 秒，最多 300 秒），这样模型思考得久一点不会被误判；客户端断开（客户端数降到 0）会立刻 `Abort`，等待方返回空内容，走 mod 原有的兜底路径；战斗回合的 45 秒硬安全网在有外部大脑时放宽到 `330 + 90×(单回合决策次数-1)` 秒。
+- 连着 ≠ 在驱动：桥接插着但 dsh 一直没请求（比如 dsh 没在 autoplay、也没人让它干活）时，`AgentDecisionBroker` 不再挂起决策，直接走自带后端。判定依据是 `AgentBridgeService.ClientIdleSeconds`（每次 dsh 请求刷新，正在跑的 `sts2_wait` 也算活着）；静默超过 `AgentFallbackSeconds` 就整段跳过桥接，所以“连着但不干活”不会再让 AI/整局卡 5 分钟。dsh 一旦恢复调用（哪怕是 `sts2_state`），下一次决策又会回到 dsh 手里。
 - 动作归属：`controlled.kind=ai` 时 `sts2_play_card` 等 UI 动作会被拒绝（避免与内置执行器抢同一玩家），只能用 `sts2_decide`。
 
 ### 1.2 战斗中的抽牌（v2.1）
@@ -44,6 +45,7 @@ v1 只让 dsh 操作**本地真人玩家**。v2 增加了一条更重要的通�
 
 - dsh 接管本地玩家时，`CardSelectCmd.FromHand` / `FromHandForUpgrade` 不再打开原版手牌选择 UI（`NPlayerHand.SelectCards` 会一直等真人点击，dsh 无法完成；期间 `play_card` / `end_turn` 还会抢着执行，造成软锁与 ERROR 刷屏）。现在改为在 `AgentDecisionBroker` 挂一个 `kind=hand_select` 决策：`options=[{index, card, upgradable}]`，dsh 用 `sts2_decide {"indices":[...], "reason":"..."}` 回答，模组照原有写法 `SyncLocalChoice` 交回；超时/未回答则启发式兜底，绝不把空选择交给游戏。
 - `sts2_play_card` / `sts2_end_turn` 在 `NPlayerHand.IsInCardSelection` 为真时直接拒绝并提示先回答选牌决策。
+- 选目标：休息处 MEND（以及少数需要点选目标的药水/遗物）会打开原版 `NTargetManager` 的选目标模式并禁用底层按钮；桥接把这一状态识别为 `phase=target_select`，`options` 是可点的角色/生物（遵守 `NTargetManager` 自己的过滤，例如 MEND 不能选自己），最后一个索引是取消。`sts2_choose index=<n>` 会先 hover 该节点再完成选择，等价于鼠标点击；点取消则让原动作返回失败、休息处重新启用选项。
 - 运行控制工具：`sts2_pause` / `sts2_resume` / `sts2_save` / `sts2_quit_to_menu` / `sts2_abandon`。暂停菜单（capstone submenu）不在 overlay 栈里，快照单独识别为 `phase=paused`、不可行动。
 - 人格：`AgentDecisionBroker.Enabled` 时 system prompt 不再包含 mod 的人格档案与长期记忆（改为 `prompt.system.external_agent`），人格由 dsh 自己决定；只保留 JSON/语言等输出要求与团队协作原则。
 
@@ -113,6 +115,10 @@ TCP + UTF-8 行分隔 JSON。每行一个请求，服务器每行一个响应。
 约定：
 
 - `call = "sts2_hello"` 返回 `{name, bridge_version, game_version, allow_actions, port}`，用于连接自检。
+- `call = "sts2_takeover"` 是“邀请”轮询（见 6.5）：成功认领时返回
+  `{take:true, run_token, prompt, workspace, host, port, character}`，否则 `{take:false, reason}`
+  （`disabled | read_only | no_ai_teammate | warmup | already_driving | claimed | exhausted`）。
+  这个调用**不计入** dsh 活动时间，否则 4 秒一次的轮询会让“静默回退”永不触发。
 - 设置里配置了 token 时，每个请求必须带 `token`，否则 `ok:false`。
 - 单条请求上限 1 MB；非法 JSON 返回 `ok:false` 并继续服务。
 - 动作工具在游戏侧串行执行（`SemaphoreSlim(1)`）；只读/等待工具可并发。
@@ -181,6 +187,7 @@ TCP + UTF-8 行分隔 JSON。每行一个请求，服务器每行一个响应。
 | `relic_select` | `NChooseARelicSelection` | `choose` / `proceed`（跳过） |
 | `shop` | `NMerchantRoom` | `choose`（购买）/ `proceed`（关货架/离开） |
 | `rest` | `NRestSiteRoom` | `choose` |
+| `target_select` | `NTargetManager.IsInSelection`（休息处 MEND、部分药水/遗物） | `choose`（选中目标；最后一个索引=取消） |
 | `event` | 事件房间 | `choose` / `proceed`（继续页） |
 | `treasure` | 宝箱房间 | `proceed`（开箱） |
 | `room_proceed` | 其他房间，只剩 proceed | `proceed` |
@@ -263,6 +270,7 @@ export function apply(ctx, config) { /* 注册工具 + 连接 + autoplay */ }
 | `sts2_state` | `{}` | 完整快照 |
 | `sts2_wait` | `{after_token?, timeout_seconds?}` | 长轮询到可行动或状态变化；默认 25s，最大 50s |
 | `sts2_read` | `{subject, pile?, card?, player?, detail?}` | 深读（复用 `AiToolRunner`） |
+| `sts2_set_nickname` | `{name}` | 修改 AI 队友显示昵称（≤24 字；空字符串恢复人格名）；名牌、聊天、提示词与联机客户端同步，只读模式也可用 |
 | `sts2_screenshot` | `{}` | 截图，原生 image content |
 | `sts2_decide` | `{decision}` | **v2**：回答 `phase=ai_decision` 里的挂起决策；内容是 prompt 要求的 JSON（对象或字符串均可） |
 | `sts2_start_run` | `{character?, ascension?, seed?}` | **v2**：从主菜单开一局新的单人游戏 |
@@ -276,7 +284,7 @@ export function apply(ctx, config) { /* 注册工具 + 连接 + autoplay */ }
 | `sts2_use_potion` | `{potion, target?}` | 用药水；`AnyTime` 药水在战斗外也能用 |
 | `sts2_discard_potion` | `{potion}` | **v2**：丢弃药水 |
 | `sts2_end_turn` | `{}` | 结束回合 |
-| `sts2_choose` | `{index, skip?}` | 地图/奖励/卡牌奖励/篝火/事件/商店/遗物/选包/水晶球 |
+| `sts2_choose` | `{index, skip?}` | 地图/奖励/卡牌奖励/篝火/事件/商店/遗物/选包/水晶球/选目标 |
 | `sts2_select_cards` | `{indices}` | `NCardGridSelectionScreen` 家族多选 |
 | `sts2_proceed` | `{}` | 继续/离开/开箱/结束界面/确认选包/关闭水晶球 |
 | `sts2_autoplay` | `{enabled}` | 开关自动续玩（纯插件侧，不访问游戏） |
@@ -311,6 +319,31 @@ Continue with the sts2_* tools. Current state:
 - 断线后指数退避重连；autoplay 定时器在断开期间静默。
 - 每次请求带自增 id，按 id 关联响应；超时可取消。
 - 插件卸载时由 `ctx.effect` 关闭 socket 和定时器。
+
+### 6.5 自动接管（`sts2_takeover`）
+
+目标：多人局一出现 AI 队友就自动开一个 dsh 对话接管，省掉“手动开对话 + 说一句来玩杀戮尖塔2”。
+
+桥接是被动监听、不能主动推事件，所以采用**邀请 + 认领**：
+
+1. 游戏侧（`AgentTakeoverInvite`）在 AI 队友入局时开一个窗口，并每局生成 `run_token`。
+2. 插件每 `takeoverPollMs`（默认 4s）调用一次 `sts2_takeover`；游戏侧按顺序判断：
+   - 自动接管开关是否打开、是否允许操作、是否有 AI 队友；
+   - 入局是否已超过 30s（留给玩家手动接管的窗口）；
+   - 最近 15s 内有没有 dsh 请求（有 ⇒ 已经有人在驱动，不打扰）；
+   - 本局认领次数是否超限（3 次），本次认领是否还在 60s 有效期内。
+3. 通过则**认领**并返回渲染好的首条提示词与工作区；`run_token` 保证一个插件进程只为一个对局建一次会话。
+4. 插件调用 `ctx.get('sessionController').agents.createSession({cwd, reusable:()=>false})`
+   在**当前 dsh 进程里新建一个普通会话**（和 Web UI 点“新建对话”同一条路径），再把工作区注册/挂载到
+   `workspaceRegistry`，最后 `agent.followup(createUserMessage({text: prompt, source:{kind:'plugin',plugin:'sts2'}}))`。
+5. 新会话第一次调用 `sts2_*` 工具时桥接就会看到活动，游戏侧不再发邀请；玩家在 GUI 里能看、能接手打字。
+
+要点：
+
+- 认领过期（60s 内没有任何 dsh 活动）视为建会话失败，允许插件再试，因此坏掉的会话不会把整局卡死。
+- `sts2_takeover` 被排除在“dsh 活动”打点之外，否则轮询会让「dsh 静默回退」永不生效。
+- 没有会话控制器的 profile（headless / ACP）里，插件检测到该服务缺失就永久关闭自动接管，不反复重试。
+- mod **不启动 dsh**：没有开着的 dsh，就没有人轮询、也没有人认领。
 
 ## 7. 动作执行与并发
 
@@ -422,7 +455,7 @@ dsh --profile web --dump-config
 
 1. `dotnet build`（0.107.1）与 `dotnet build -p:VariantTarget=0.111.0`（beta）均通过。
 2. 插件侧：`npm test`（TCP 协议 7 个用例）、`npm pack --dry-run`、`dsh plugin --profile <tmp> add -w <checkout>` 后用 `--dump-config` 确认 `# == dsh-sts2` 层。
-3. 用 `@deepseek-ai/dsh-tools` 的 `defineTool` 实机注册一次工具（fake ctx），确认 11 个工具与 JSON Schema 都能通过校验。
+3. 用 `@deepseek-ai/dsh-tools` 的 `defineTool` 实机注册一次工具（fake ctx），确认全部工具与 JSON Schema 都能通过校验。
 4. 用 `node -e` 起一个 TCP 客户端，验证 `sts2_hello` / `sts2_state` / `sts2_wait` 的帧格式。
 5. 进游戏：开启开关 → dsh 列出工具 → 打一场战斗 → 奖励/地图/商店/篝火/事件/宝箱各走一遍 → autoplay 连续跑 3 个房间。
 6. 关闭开关：端口释放，插件工具返回连接错误，游戏不受影响。

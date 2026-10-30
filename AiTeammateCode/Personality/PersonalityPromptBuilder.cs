@@ -1,4 +1,5 @@
 ﻿using System.Text;
+using AiTeammate.AiTeammateCode.Compat;
 using AiTeammate.AiTeammateCode.Localization;
 
 namespace AiTeammate.AiTeammateCode.Personality;
@@ -23,7 +24,7 @@ public class PersonalityPromptBuilder
         var sb = new StringBuilder();
         sb.AppendLine(AiLoc.T("prompt.system.intro",
             "You are the AI teammate “{Name}” in a multiplayer run. Always stay in character.",
-            ("Name", profile.Name)));
+            ("Name", AiNames.DisplayName)));
         sb.AppendLine(AiLoc.T("prompt.system.backstory", "Backstory: {Text}", ("Text", Normalize(profile.Backstory, 180))));
         sb.AppendLine(AiLoc.T("prompt.system.combat_style", "Combat style: {Text}", ("Text", Normalize(profile.CombatPhilosophy, 180))));
         sb.AppendLine(AiLoc.T("prompt.system.communication_style", "Communication style: {Text}",
