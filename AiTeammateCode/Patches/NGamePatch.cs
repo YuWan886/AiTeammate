@@ -11,6 +11,7 @@ using MegaCrit.Sts2.Core.Nodes.Multiplayer;
 using MegaCrit.Sts2.Core.Nodes.Rooms;
 using MegaCrit.Sts2.Core.Nodes.Vfx;
 using MegaCrit.Sts2.Core.Nodes.Vfx.Utilities;
+using MegaCrit.Sts2.Core.Platform;
 using MegaCrit.Sts2.Core.Runs;
 using AiTeammate.AiTeammateCode.Agent;
 using AiTeammate.AiTeammateCode.Compat;
@@ -418,7 +419,7 @@ public static class NGamePatch
                 return;
 
             _inputField?.Clear();
-            _ = manager.ChatManager.HandlePlayerMessage(AiLoc.T("chat.player_sender", "Player"), trimmed, System.Threading.CancellationToken.None);
+            _ = manager.ChatManager.HandlePlayerMessage(GetLocalPlayerName(), trimmed, System.Threading.CancellationToken.None);
         }
 
         sendButton.Pressed += () => OnSend(_inputField?.Text ?? "");
@@ -435,6 +436,42 @@ public static class NGamePatch
             _chatRoot.Visible = false;
         if (_minimizedButton != null && GodotObject.IsInstanceValid(_minimizedButton))
             _minimizedButton.Visible = false;
+    }
+
+    /// <summary>
+    /// The name the game shows for the local human player (the Steam persona name on Steam builds,
+    /// the same string the nameplates print). Falls back to the localized "Player" only when the
+    /// platform has no name for us. 聊天面板里玩家自己的显示名，即游戏实际显示的玩家名称。
+    /// </summary>
+    private static string GetLocalPlayerName()
+    {
+        try
+        {
+            // In a run the net service knows which platform we play on and who we are.
+            var platform = RunManager.Instance?.NetService?.Platform;
+            var netId = LocalContext.NetId;
+            if (platform.HasValue && netId.HasValue)
+            {
+                var name = PlatformUtil.GetPlayerNameRaw(platform.Value, netId.Value);
+                if (!string.IsNullOrWhiteSpace(name))
+                    return name;
+            }
+
+            // Lobby / character select: ask the primary platform account directly.
+            var primary = PlatformUtil.PrimaryPlatform;
+            if (primary != PlatformType.None)
+            {
+                var name = PlatformUtil.GetPlayerNameRaw(primary, PlatformUtil.GetLocalPlayerId(primary));
+                if (!string.IsNullOrWhiteSpace(name))
+                    return name;
+            }
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[Chat] 无法读取玩家名称: {ex.Message}");
+        }
+
+        return AiLoc.T("chat.player_sender", "Player");
     }
 
     /// <summary>Shows/hides the solo-climb pause button and updates its state. 更新暂停按钮。</summary>

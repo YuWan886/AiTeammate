@@ -160,7 +160,7 @@
   "settings.live.direction": "Scroll direction",
   "settings.live.direction.ltr": "Left to right",
   "settings.live.direction.rtl": "Right to left",
-  "settings.live.direction.desc": "Video danmaku usually move right to left. This mod defaults to left to right; change it here if you prefer the classic direction.",
+  "settings.live.direction.desc": "Defaults to the classic video-danmaku direction (right to left); switch it here if you prefer left to right.",
   "settings.live.speed": "Scroll speed (px/s at 1080p)",
   "settings.live.speed.desc": "Scales with the viewport height.",
   "settings.live.font": "Font size",

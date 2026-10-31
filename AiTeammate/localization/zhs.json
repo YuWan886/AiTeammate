@@ -160,7 +160,7 @@
   "settings.live.direction": "滚动方向",
   "settings.live.direction.ltr": "从左到右",
   "settings.live.direction.rtl": "从右到左",
-  "settings.live.direction.desc": "视频弹幕通常是“从右到左”；本模组默认“从左到右”，需要传统方向可在此切换。",
+  "settings.live.direction.desc": "默认“从右到左”；喜欢另一种方向可在此切换。",
   "settings.live.speed": "滚动速度（1080p 像素/秒）",
   "settings.live.speed.desc": "会按窗口高度自动缩放。",
   "settings.live.font": "字号",

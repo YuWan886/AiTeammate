@@ -103,7 +103,7 @@ public class ChatManager
         };
         RecentMessages.Add(playerMsg);
         OnMessageReceived?.Invoke(playerMsg);
-        AiTeammateManager.Instance?.AiLog.LogChat(playerName, content);
+        AiTeammateManager.Instance.AiLog.LogChat(playerName, content);
 
         var aiPlayer = AiTeammateManager.Instance.AiPlayer;
         var runPrelude = aiPlayer != null ? _conversationContext.BuildRunPrelude(aiPlayer, _contextBuilder) : "";

@@ -400,7 +400,7 @@ public static class AiSettingsPage
                         ? S("settings.live.direction.ltr", "Left to right")
                         : S("settings.live.direction.rtl", "Right to left"),
                     description: S("settings.live.direction.desc",
-                        "Video danmaku usually move right to left. This mod defaults to left to right; change it here if you prefer the classic direction."),
+                        "Defaults to the classic video-danmaku direction (right to left); switch it here if you prefer left to right."),
                     presentation: ModSettingsChoicePresentation.Dropdown)
                     .WithEntryVisibleWhen("live_direction", () => AiSettingsStore.Current.EnableBilibiliDanmaku)
                 .AddIntSlider("live_speed", S("settings.live.speed", "Scroll speed (px/s at 1080p)"),

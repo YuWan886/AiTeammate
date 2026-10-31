@@ -71,7 +71,7 @@ public sealed class AiSettings
     public int DanmakuMaxChars { get; set; } = 50;
 
     /// <summary>Whether danmaku text enters from the left or the right. 弹幕滚动方向。</summary>
-    public DanmakuDirection DanmakuMoveDirection { get; set; } = DanmakuDirection.LeftToRight;
+    public DanmakuDirection DanmakuMoveDirection { get; set; } = DanmakuDirection.RightToLeft;
 
     /// <summary>Scroll speed in pixels per second at a 1080p viewport height. 弹幕速度（1080p 下的像素/秒）。</summary>
     public int DanmakuSpeed { get; set; } = 220;
