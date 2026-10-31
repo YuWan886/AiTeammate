@@ -16,7 +16,7 @@
 
 ## Installation
 
-1. Download the latest [**Release**](https://github.com/YuWan886/AiTeammate/releases/latest) (or `git clone` and run `dotnet build` yourself).
+1. Download the latest [**Release**](https://github.com/YuWan886/STS2-AiTeammate/releases/latest) (or `git clone` and run `dotnet build` yourself).
 2. Install the [**RitsuLib**](https://github.com/BAKAOLC/STS2-RitsuLib) runtime matching your game version.
 3. Drop the whole `AiTeammate/` folder into the game's `mods` directory.
 4. Launch the game. The loader prints the content variant it picked in the log.

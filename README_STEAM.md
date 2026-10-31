@@ -59,7 +59,7 @@ AI 队友为《杀戮尖塔 2》加入一个由大语言模型操控的玩家—
 [h2]相关链接[/h2]
 
 [list]
-[*][url=https://github.com/YuWan886/AiTeammate]GitHub 仓库[/url]
+[*][url=https://github.com/YuWan886/STS2-AiTeammate]GitHub 仓库[/url]
 [*][url=https://github.com/YuWan886/dsh-sts2]dsh-sts2 外部 Agent 插件[/url]
 [*][url=https://space.bilibili.com/438381132]作者的 B 站主页[/url]
 [/list]
@@ -144,7 +144,7 @@ The mod ships as a [b]multi-version bundle[/b]: the loader automatically picks t
 [h2]Related Links[/h2]
 
 [list]
-[*][url=https://github.com/YuWan886/AiTeammate]GitHub Repository[/url]
+[*][url=https://github.com/YuWan886/STS2-AiTeammate]GitHub Repository[/url]
 [*][url=https://github.com/YuWan886/dsh-sts2]dsh-sts2 external agent plugin[/url]
 [*][url=https://space.bilibili.com/438381132]Author's Bilibili homepage[/url]
 [/list]

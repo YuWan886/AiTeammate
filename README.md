@@ -16,7 +16,7 @@
 
 ## 安装
 
-1. 下载最新版本 [**Release**](https://github.com/YuWan886/AiTeammate/releases/latest)
+1. 下载最新版本 [**Release**](https://github.com/YuWan886/STS2-AiTeammate/releases/latest)
 2. 安装与游戏版本匹配的 [**RitsuLib**](https://github.com/BAKAOLC/STS2-RitsuLib)
 3. 将 `AiTeammate/` 整个文件夹放入游戏目录下的 `mods` 文件夹中
 4. 启动游戏，加载器会在日志中打印选择的内容变体
