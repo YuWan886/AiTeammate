@@ -45,13 +45,18 @@ internal static class AiMapVoter
 
         try
         {
-            // The AI slot may have been removed/re-added; GetVote would index out of range.
+            // The AI slot may have been removed/re-added, and a save load rebuilds every Player
+            // instance: GetVote / GetPlayerSlotIndex use reference equality, so the cached reference
+            // would index -1. Resolve the live instance by NetId first.
             var runState = RunManager.Instance?.DebugOnlyGetState();
-            if (runState == null || runState.GetPlayerSlotIndex(aiPlayer.NetId) < 0)
+            var liveAi = runState?.GetPlayer(aiPlayer.NetId);
+            if (runState == null || liveAi == null)
             {
                 ResetState();
                 return;
             }
+
+            aiPlayer = liveAi;
 
             // Already voted for this map generation (includes votes cast before a reconnect).
             var existing = synchronizer.GetVote(aiPlayer);
@@ -152,8 +157,13 @@ internal static class AiMapVoter
             // The map moved on (or regenerated) while the LLM was thinking: discard a stale vote.
             if (synchronizer.MapGenerationCount != generation || !runState.MapLocation.Equals(source))
                 return;
-            if (runState.GetPlayerSlotIndex(aiPlayer.NetId) < 0)
+
+            // Same staleness guard as Request: the reference captured when the decision started may
+            // already belong to a previous run if the player saved and loaded meanwhile.
+            var liveAi = runState.GetPlayer(aiPlayer.NetId);
+            if (liveAi == null)
                 return;
+            aiPlayer = liveAi;
 
             var existing = synchronizer.GetVote(aiPlayer);
             if (existing.HasValue && existing.Value.mapGenerationCount == generation)

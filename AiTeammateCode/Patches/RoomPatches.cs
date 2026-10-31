@@ -413,6 +413,11 @@ public static class RunReadySoloBindPatch
         var manager = AiTeammateManager.Instance;
         if (!manager.TryInitialize()) return;
 
+        // Multiplayer AI teammate: a loaded save rebuilt every Player instance, so the cached one
+        // must be replaced before the first room runs. This is the earliest point where the live
+        // RunState is guaranteed to exist.
+        manager.DetectAndBindAiPlayer();
+
         if (!SoloRunController.TryBind(manager))
             SoloRunController.RequestBindRetry("NRun._Ready");
     }
@@ -1957,6 +1962,11 @@ public static class LoadRunPatch
     {
         var manager = AiTeammateManager.Instance;
         if (!manager.TryInitialize()) return;
+
+        // A loaded run is a brand-new RunState with brand-new Player objects; RunManager.State already
+        // points at it here (SetUpSaved* runs before LoadRun). Re-run detection so the stale cached
+        // reference is replaced — otherwise events and map votes throw IndexOutOfRange
+        // (GetPlayerSlotIndex compares by reference) and the AI sits frozen after SL.
         manager.DetectAndBindAiPlayer();
         if (manager.AiPlayer != null)
             MainFile.Logger.Info($"AI player re-detected after save load: {manager.AiPlayer.Character?.Id.Entry}");

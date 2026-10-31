@@ -146,15 +146,59 @@ public class AiTeammateManager
 
     public void OnAiPlayerJoined(Player aiPlayer)
     {
+        ApplyAiPlayerBinding(aiPlayer, announce: true);
+    }
+
+    /// <summary>
+    /// Rebinds the cached AI player to the instance the live run actually uses. Loading a save
+    /// rebuilds every Player, so the old reference is no longer in <c>RunState.Players</c>:
+    /// <c>GetPlayerSlotIndex(Player)</c> then returns -1 and every per-player lookup (events,
+    /// map votes, combat turn detection) throws or silently never matches.
+    /// 读档后 RunState 换成了新的 Player 实例，旧引用必须换掉。
+    /// </summary>
+    public bool RebindAiPlayer(Player aiPlayer, string reason)
+    {
+        if (ReferenceEquals(aiPlayer, AiPlayer))
+            return false;
+
+        var hadPrevious = AiPlayer != null;
+        ApplyAiPlayerBinding(aiPlayer, announce: !hadPrevious);
+        MainFile.Logger.Info(hadPrevious
+            ? $"[{reason}] AI 玩家已重新绑定到新的 Player 实例（读档重建运行状态）: NetId={aiPlayer.NetId}"
+            : $"[{reason}] AI 玩家已绑定: NetId={aiPlayer.NetId}");
+        return true;
+    }
+
+    /// <summary>Finds the AI player among live Player instances; identity is the reserved NetId.</summary>
+    private static Player? FindAiPlayer(IReadOnlyList<Player>? players)
+    {
+        if (players == null)
+            return null;
+
+        foreach (var player in players)
+        {
+            if (AiIdentity.IsAi(player.NetId))
+                return player;
+        }
+
+        return null;
+    }
+
+    private void ApplyAiPlayerBinding(Player aiPlayer, bool announce)
+    {
         AiPlayer = aiPlayer;
         ConversationContext.ResetAll();
         DirectiveManager.ResetAll();
         ResetExtraPlayerTurnCombatDecisionState();
-        var speakerName = AiNames.DisplayName;
-        ChatManager.AddSystemMessage(AiLoc.T("system.ai_joined", "{Name} joined the team", ("Name", speakerName)));
-        Patches.NGamePatch.RefreshChatUi();
-        MainFile.Logger.Info($"AI 玩家已加入: {aiPlayer.Character?.Id.Entry}");
-        AiLog.Log("SYSTEM", $"AI 玩家加入: {aiPlayer.Character?.Id.Entry} (NetId={aiPlayer.NetId})");
+
+        if (announce)
+        {
+            var speakerName = AiNames.DisplayName;
+            ChatManager.AddSystemMessage(AiLoc.T("system.ai_joined", "{Name} joined the team", ("Name", speakerName)));
+            Patches.NGamePatch.RefreshChatUi();
+            MainFile.Logger.Info($"AI 玩家已加入: {aiPlayer.Character?.Id.Entry}");
+            AiLog.Log("SYSTEM", $"AI 玩家加入: {aiPlayer.Character?.Id.Entry} (NetId={aiPlayer.NetId})");
+        }
 
         // Multiplayer: let every client resolve the same nickname for this AI player.
         try
@@ -366,49 +410,44 @@ public class AiTeammateManager
     }
 
     /// <summary>
-    /// Detect the AI player in a combat state after the run has started.
+    /// Detect the AI player in a combat state after the run has started. The combat state's Player
+    /// instances are authoritative: after a save load they differ from the cached one, and the stale
+    /// reference must be replaced before any per-player lookup runs.
     /// </summary>
     public void DetectAndBindAiPlayer(CombatState state)
     {
+        var live = FindAiPlayer(state.Players);
+        if (live != null)
+        {
+            RebindAiPlayer(live, "Combat");
+            return;
+        }
+
         if (AiPlayer != null) return;
 
-        if (SoloRunController.TryBind(this))
-            return;
-
-        foreach (var player in state.Players)
-        {
-            if (AiIdentity.IsAi(player.NetId))
-            {
-                OnAiPlayerJoined(player);
-                return;
-            }
-        }
+        SoloRunController.TryBind(this);
     }
 
     /// <summary>
-    /// Detect the AI player from RunState (for non-combat scenarios like Neow event).
+    /// Detect the AI player from RunState (for non-combat scenarios like Neow event). Re-checks the
+    /// cached binding every call so a save load can never leave a stale Player behind.
     /// </summary>
     public void DetectAndBindAiPlayer()
     {
         if (AiPlayer != null)
-        {
             SoloRunController.TryBind(this); // keeps solo control in sync with the settings toggle
-            return;
-        }
-
-        if (SoloRunController.TryBind(this))
-            return;
 
         var state = RunManager.Instance?.DebugOnlyGetState();
-        if (state == null) return;
-        foreach (var player in state.Players)
+        var live = FindAiPlayer(state?.Players);
+        if (live != null)
         {
-            if (AiIdentity.IsAi(player.NetId))
-            {
-                OnAiPlayerJoined(player);
-                return;
-            }
+            RebindAiPlayer(live, "Detect");
+            return;
         }
+
+        if (AiPlayer != null) return;
+
+        SoloRunController.TryBind(this);
     }
 
     public async Task ProcessCombatTurnAsync()

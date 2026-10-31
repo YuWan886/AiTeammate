@@ -37,11 +37,10 @@ public static class CombatManagerPatch
         // Solo climb: bind (or release) the local player before combat starts.
         SoloRunController.TryBind(manager);
 
-        // Detect and bind the AI player from the combat state
-        if (manager.AiPlayer == null)
-        {
-            manager.DetectAndBindAiPlayer(state);
-        }    }
+        // Bind from the live combat state. Must run on every combat, not only when nothing is bound:
+        // a save load rebuilds every Player instance and the cached reference would stay stale.
+        manager.DetectAndBindAiPlayer(state);
+    }
 
     [HarmonyPatch(nameof(CombatManager.SetReadyToEndTurn))]
     [HarmonyPrefix]

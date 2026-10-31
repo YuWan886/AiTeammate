@@ -52,12 +52,10 @@ public static class EventBeginLogPatch
         var manager = AiTeammateManager.Instance;
         if (!manager.IsInitialized) return;
 
-        SoloRunController.TryBind(manager);
-        if (manager.AiPlayer == null)
-        {
-            try { manager.DetectAndBindAiPlayer(); }
-            catch (System.Exception ex) { MainFile.Logger.Warn($"AI detect in BeginEvent failed: {ex.Message}"); }
-        }
+        // Always re-run detection: after a save load the cached Player reference is stale even though
+        // the AI is still in the lobby, and GetEventForPlayer(stale) throws IndexOutOfRange.
+        try { manager.DetectAndBindAiPlayer(); }
+        catch (System.Exception ex) { MainFile.Logger.Warn($"AI detect in BeginEvent failed: {ex.Message}"); }
         if (manager.AiPlayer == null) return;
 
         // New event: forget the page the previous event ended on.
