@@ -122,11 +122,14 @@ internal static class AgentBridgeService
         _lastClientCount = clients;
 
         // No client left: stop parking AI decisions, otherwise the AI would keep waiting for an
-        // answer that can no longer arrive.
+        // answer that can no longer arrive. Chat lines waiting for a reply fall back right away too.
         if (clients == 0)
         {
             try { AgentDecisionBroker.Abort("dsh client disconnected"); }
             catch (Exception ex) { MainFile.Logger.Warn($"[Agent] abort pending decision failed: {ex.Message}"); }
+
+            try { AgentChatRelay.AbortPending("dsh client disconnected"); }
+            catch (Exception ex) { MainFile.Logger.Warn($"[Agent] abort pending chat failed: {ex.Message}"); }
         }
 
         try { ClientCountChanged?.Invoke(clients); }

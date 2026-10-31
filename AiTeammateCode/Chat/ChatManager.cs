@@ -10,8 +10,10 @@ using AiTeammate.AiTeammateCode.Settings;
 using AiTeammate.AiTeammateCode.Cache;
 using AiTeammate.AiTeammateCode.Teamwork;
 using AiTeammate.AiTeammateCode.Solo;
+using AiTeammate.AiTeammateCode.Agent;
 using AiTeammate.AiTeammateCode.Localization;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace AiTeammate.AiTeammateCode.Chat;
 
@@ -22,10 +24,44 @@ public class ChatManager
     private readonly ContextBuilder _contextBuilder;
     private readonly ConversationContextManager _conversationContext;
     private readonly PlayerDirectiveManager _directiveManager;
+    private readonly Lock _recentSync = new();
     private DateTime _lastAutoMessage = DateTime.MinValue;
 
     public List<ChatMessage> RecentMessages { get; } = new();
     public event Action<ChatMessage>? OnMessageReceived;
+
+    /// <summary>Thread-safe copy of the last <paramref name="count"/> lines (decision prompts read it off-thread).</summary>
+    public List<ChatMessage> SnapshotRecent(int count = int.MaxValue)
+    {
+        if (count <= 0)
+            return new List<ChatMessage>();
+
+        lock (_recentSync)
+            return count >= RecentMessages.Count
+                ? new List<ChatMessage>(RecentMessages)
+                : RecentMessages.TakeLast(count).ToList();
+    }
+
+    private void AddRecent(ChatMessage message)
+    {
+        lock (_recentSync)
+            RecentMessages.Add(message);
+    }
+
+    private ChatMessage BuildWarning(string content)
+    {
+        var warning = new ChatMessage
+        {
+            SenderName = AiLoc.T("chat.system_sender", "System"),
+            IsAi = false,
+            Content = content,
+            Type = ChatMessageType.Warning
+        };
+        // Display only: a warning must not enter the conversation history, or the next prompt would
+        // feed the error text back to the model as if the player had said it.
+        OnMessageReceived?.Invoke(warning);
+        return warning;
+    }
 
     public ChatManager(BackendManager backend, PersonalityManager personality, ContentQueryService query, ConversationContextManager conversationContext, PlayerDirectiveManager directiveManager)
     {
@@ -45,13 +81,13 @@ public class ChatManager
             Content = content,
             Type = ChatMessageType.SystemInfo
         };
-        RecentMessages.Add(msg);
+        AddRecent(msg);
         OnMessageReceived?.Invoke(msg);
     }
 
-    public void AddAiMessage(string content)
+    public ChatMessage? AddAiMessage(string content)
     {
-        if (string.IsNullOrWhiteSpace(content)) return;
+        if (string.IsNullOrWhiteSpace(content)) return null;
         var msg = new ChatMessage
         {
             SenderName = AiNames.DisplayName,
@@ -59,8 +95,9 @@ public class ChatManager
             Content = content.Trim(),
             Type = ChatMessageType.Normal
         };
-        RecentMessages.Add(msg);
+        AddRecent(msg);
         OnMessageReceived?.Invoke(msg);
+        return msg;
     }
 
     public int GetSpeechLeadInDelayMs(string content)
@@ -83,7 +120,7 @@ public class ChatManager
                 Content = thinking,
                 Type = ChatMessageType.Suggestion
             };
-            RecentMessages.Add(thinkMsg);
+            AddRecent(thinkMsg);
             OnMessageReceived?.Invoke(thinkMsg);
         }
     }
@@ -101,14 +138,53 @@ public class ChatManager
             Content = content,
             Type = ChatMessageType.Normal
         };
-        RecentMessages.Add(playerMsg);
+        AddRecent(playerMsg);
         OnMessageReceived?.Invoke(playerMsg);
         AiTeammateManager.Instance.AiLog.LogChat(playerName, content);
 
+        // Attached and chat-capable dsh answers the panel. The gate reads observed plugin polling, so
+        // an older plugin or one with no bound conversation keeps the built-in backend untouched.
+        if (AgentChatRelay.TryRelay(playerName, content, out var seq))
+        {
+            // Solo climb: hold the automation for as long as dsh may take to answer, otherwise the
+            // AI would resume playing in the middle of the conversation.
+            if (SoloRunController.IsActive)
+                AiFlowControl.BeginConversationPause(TimeSpan.FromSeconds(AgentChatRelay.ReplyTimeoutSeconds));
+
+            var outcome = await AgentChatRelay.AwaitReplyAsync(seq, ct);
+            if (outcome.Message != null)
+            {
+                if (SoloRunController.IsActive)
+                    AiFlowControl.EndConversationPauseSoon(TimeSpan.FromSeconds(3));
+                return outcome.Message;
+            }
+
+            if (!outcome.Fallback)
+            {
+                var warning = BuildWarning(AiLoc.T("chat.dsh_no_reply",
+                    "dsh did not answer this message."));
+                if (SoloRunController.IsActive)
+                    AiFlowControl.EndConversationPauseSoon(TimeSpan.FromSeconds(3));
+                return warning;
+            }
+
+            // dsh went silent or disconnected: tell the player, then let the built-in backend answer
+            // so the chat panel never turns into a dead end. Display-only: the notice must not be
+            // fed back to the model as if the player had said it.
+            BuildWarning(AiLoc.T("chat.dsh_fallback",
+                "dsh did not answer, so the built-in model replied instead."));
+        }
+
+        return await HandlePlayerMessageViaBackendAsync(playerName, content, ct);
+    }
+
+    private async Task<ChatMessage> HandlePlayerMessageViaBackendAsync(
+        string playerName, string content, CancellationToken ct)
+    {
         var aiPlayer = AiTeammateManager.Instance.AiPlayer;
         var runPrelude = aiPlayer != null ? _conversationContext.BuildRunPrelude(aiPlayer, _contextBuilder) : "";
         var combatContext = BuildCombatChatContext(aiPlayer);
-        var chatContext = _contextBuilder.BuildChatContext(RecentMessages, recentWindow: 4);
+        var chatContext = _contextBuilder.BuildChatContext(SnapshotRecent(), recentWindow: 4);
         var directiveContext = _directiveManager.BuildChatDirectiveContext();
         var latestInput = AiLoc.T("prompt.chat.player_said", "Player {Name} says: \"{Text}\"",
             ("Name", playerName), ("Text", content));
@@ -129,16 +205,8 @@ public class ChatManager
             MainFile.Logger.Warn($"[Chat] 回复失败: {parsed.ErrorMessage}");
             AiTeammateManager.Instance?.AiLog.LogError("CHAT", $"回复失败: {parsed.ErrorMessage}");
 
-            var warning = new ChatMessage
-            {
-                SenderName = AiLoc.T("chat.system_sender", "System"),
-                IsAi = false,
-                Content = AiLoc.T("chat.reply.failed", "AI did not reply: {Error}", ("Error", parsed.ErrorMessage)),
-                Type = ChatMessageType.Warning
-            };
-            // Display only: this line must not enter the conversation history, or the next prompt
-            // would feed the error text back to the model as if the player had said it.
-            OnMessageReceived?.Invoke(warning);
+            var warning = BuildWarning(AiLoc.T("chat.reply.failed", "AI did not reply: {Error}",
+                ("Error", parsed.ErrorMessage)));
 
             if (SoloRunController.IsActive)
                 AiFlowControl.EndConversationPauseSoon(TimeSpan.FromSeconds(3));
@@ -177,7 +245,7 @@ public class ChatManager
             Content = replyContent,
             Type = ChatMessageType.Normal
         };
-        RecentMessages.Add(aiMsg);
+        AddRecent(aiMsg);
         OnMessageReceived?.Invoke(aiMsg);
         AiTeammateManager.Instance?.AiLog.LogChat(aiMsg.SenderName, aiMsg.Content);
 
@@ -188,10 +256,103 @@ public class ChatManager
         return aiMsg;
     }
 
+    /// <summary>
+    /// Renders a chat line dsh sent through <c>sts2_chat_send</c>. Must run on the main thread.
+    /// The reply may also carry directives (same schema as the built-in chat JSON) and a nickname,
+    /// so a chat message keeps its usual side effects even when dsh writes it.
+    /// dsh 的聊天回复：写面板、记指令、改昵称。
+    /// </summary>
+    public ChatMessage? ApplyDshReply(string text, JsonArray? directives, string nickname, string sourcePlayerName)
+    {
+        if (!string.IsNullOrWhiteSpace(nickname))
+        {
+            var previous = AiNames.DisplayName;
+            var change = AiNames.SetNickname(nickname, "dsh-chat");
+            if (change.Ok && !string.Equals(previous, change.DisplayName, StringComparison.Ordinal))
+            {
+                AddSystemMessage(AiLoc.T("system.nickname_changed", "{Old} is now called {New}",
+                    ("Old", previous), ("New", change.DisplayName)));
+            }
+        }
+
+        if (directives is { Count: > 0 })
+        {
+            var proposals = ParseDirectiveProposals(directives);
+            if (proposals.Count > 0)
+            {
+                _directiveManager.RecordAcceptedDirectives(
+                    string.IsNullOrWhiteSpace(sourcePlayerName) ? "dsh" : sourcePlayerName,
+                    proposals);
+                foreach (var directive in proposals.Where(d => d.Accepted))
+                    MainFile.Logger.Info($"[ChatDirective] dsh -> {directive.Type}: {directive.Summary}");
+            }
+        }
+
+        var message = AddAiMessage(text);
+        if (message != null)
+            AiTeammateManager.Instance?.AiLog.LogChat(message.SenderName, message.Content);
+        return message;
+    }
+
+    /// <summary>
+    /// Recent chat lines appended to a decision prompt while dsh is the brain, so a tactic a player
+    /// typed into the panel still reaches the decision even if the follow-up message was missed or
+    /// the conversation context was compacted. Thread-safe (called from decision workers).
+    /// 聊天内容进入 dsh 决策提示词。
+    /// </summary>
+    public string BuildRecentChatBlockForPrompt(int take = 4)
+    {
+        var lines = SnapshotRecent(take)
+            .Where(message => message.Type == ChatMessageType.Normal
+                              && !string.IsNullOrWhiteSpace(message.Content))
+            .ToList();
+        if (lines.Count == 0)
+            return "";
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("[玩家最近聊天]");
+        foreach (var line in lines)
+        {
+            // Sender names only: this runs on a decision worker, where localization formatting is
+            // not safe (shared SmartFormat pools).
+            sb.AppendLine($"{line.SenderName}: {PromptTextHelper.Truncate(PromptTextHelper.CleanText(line.Content), 120)}");
+        }
+        sb.AppendLine("[要求] 玩家的最新聊天优先于内置战术；如果与当前局面冲突，以玩家最新的话为准。");
+        return sb.ToString().TrimEnd();
+    }
+
+    private static List<PlayerDirectiveProposal> ParseDirectiveProposals(JsonArray directives)
+    {
+        var proposals = new List<PlayerDirectiveProposal>();
+        try
+        {
+            using var doc = JsonDocument.Parse(directives.ToJsonString());
+            if (doc.RootElement.ValueKind != JsonValueKind.Array)
+                return proposals;
+
+            foreach (var element in doc.RootElement.EnumerateArray())
+            {
+                if (TryParseDirectiveProposal(element, out var proposal))
+                    proposals.Add(proposal);
+            }
+        }
+        catch (Exception ex)
+        {
+            MainFile.Logger.Warn($"[Chat] 解析 dsh 指令失败: {ex.Message}");
+        }
+
+        return proposals;
+    }
+
     public async Task<ChatMessage?> TryAutoMessage(Player aiPlayer, string triggerEvent, CancellationToken ct)
     {
         var settings = AiSettingsStore.Current;
         if (!settings.EnableAIChat)
+            return null;
+
+        // dsh owns the chat voice while it answers the panel; two voices with the same name would
+        // only confuse the player. 聊天由 dsh 接管时不再让自带后端插话。
+        if (AgentChatRelay.ShouldRelay)
             return null;
 
         // Don't chatter while the human has interrupted the AI.
@@ -209,7 +370,7 @@ public class ChatManager
         var systemPrompt = _promptBuilder.BuildSystemPrompt(chatMode: true);
         var runPrelude = _conversationContext.BuildRunPrelude(aiPlayer, _contextBuilder);
         var snapshot = _contextBuilder.BuildCombatPromptSnapshot(aiPlayer).RenderEssentials();
-        var chatContext = _contextBuilder.BuildChatContext(RecentMessages, recentWindow: 4);
+        var chatContext = _contextBuilder.BuildChatContext(SnapshotRecent(), recentWindow: 4);
         var autoTrigger = AiLoc.T("prompt.chat.auto_trigger", "Trigger event: {Event}", ("Event", triggerEvent));
         var autoInstruction = AiLoc.T("prompt.chat.auto_instruction",
             "Say one short line in character (under 15 words). Don't repeat recent lines or use filler like \"let me analyze\" or \"the current situation\"; sound like a real player typing.");
@@ -236,7 +397,7 @@ public class ChatManager
             Content = response.Content.Trim(),
             Type = ChatMessageType.Normal
         };
-        RecentMessages.Add(msg);
+        AddRecent(msg);
         OnMessageReceived?.Invoke(msg);
         return msg;
     }
@@ -328,7 +489,7 @@ public class ChatManager
         if (take == 0)
             return history;
 
-        foreach (var msg in RecentMessages.TakeLast(take))
+        foreach (var msg in SnapshotRecent(take))
         {
             history.Add(new AiMessage
             {

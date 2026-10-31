@@ -174,6 +174,12 @@ public static class AiSettingsPage
         B(s => s.AgentBridgeAllowActions, (s, v) => s.AgentBridgeAllowActions = v);
     private static readonly ModSettingsValueBinding<AiSettings, int> AgentFallbackSeconds =
         B(s => s.AgentFallbackSeconds, (s, v) => s.AgentFallbackSeconds = v);
+    private static readonly ModSettingsValueBinding<AiSettings, bool> AgentChatToDsh =
+        B(s => s.AgentChatToDsh, (s, v) => s.AgentChatToDsh = v);
+    private static readonly ModSettingsValueBinding<AiSettings, int> AgentChatReplyTimeout =
+        B(s => s.AgentChatReplyTimeoutSeconds, (s, v) => s.AgentChatReplyTimeoutSeconds = v);
+    private static readonly ModSettingsValueBinding<AiSettings, bool> AgentChatFallback =
+        B(s => s.AgentChatFallbackToBackend, (s, v) => s.AgentChatFallbackToBackend = v);
     private static readonly ModSettingsValueBinding<AiSettings, bool> AutoLaunchAgentSession =
         B(s => s.AutoLaunchAgentSession, (s, v) => s.AutoLaunchAgentSession = v);
     private static readonly ModSettingsValueBinding<AiSettings, string> AgentLaunchWorkspace =
@@ -496,6 +502,16 @@ public static class AiSettingsPage
                     0, 300, 5,
                     description: S("settings.agent.fallback.desc",
                         "Seconds the AI waits for dsh before using its own backend. When no dsh request arrived for that long, decisions skip the bridge entirely, so a connected-but-idle agent can no longer freeze the AI. 0 keeps waiting forever."))
+                .AddToggle("agent_chat", S("settings.agent.chat", "Let dsh answer the in-game chat"), AgentChatToDsh,
+                    description: S("settings.agent.chat.desc",
+                        "While the dsh plugin is polling for chat, player messages in the chat panel are answered by that conversation instead of the configured LLM backend. An older plugin, or a dsh with no conversation bound, keeps the built-in backend."))
+                .AddIntSlider("agent_chat_timeout", S("settings.agent.chat_timeout", "Chat reply timeout (s)"), AgentChatReplyTimeout,
+                    15, 600, 5,
+                    description: S("settings.agent.chat_timeout.desc",
+                        "How long one chat line waits for dsh before the fallback below applies. Chat becomes dsh's job only while it actually polls, and a dsh that is mid-turn can take a while."))
+                .AddToggle("agent_chat_fallback", S("settings.agent.chat_fallback", "Answer with the built-in model on timeout"), AgentChatFallback,
+                    description: S("settings.agent.chat_fallback.desc",
+                        "When dsh does not answer in time (or disconnects), let the configured backend reply so the chat panel never dead-ends. Late dsh replies to that line are refused to keep one voice."))
                 .AddParagraph("agent_status", ModSettingsText.Dynamic(DescribeAgentBridgeStatus))
                 .AddButton("agent_restart", S("settings.agent.restart.label", "Bridge"),
                     S("settings.agent.restart.button", "Restart"), RestartAgentBridge,
@@ -551,12 +567,18 @@ public static class AiSettingsPage
             {
                 var port = AgentBridgeService.Port.ToString();
                 var clients = AgentBridgeService.ConnectedClients;
-                return clients > 0
-                    ? AiLoc.T("settings.agent.status.connected",
+                if (clients > 0)
+                {
+                    var chat = AgentChatRelay.ShouldRelay
+                        ? AiLoc.T("settings.agent.status.chat.dsh", " Chat is answered by dsh.")
+                        : AiLoc.T("settings.agent.status.chat.backend", " Chat uses the built-in backend.");
+                    return AiLoc.T("settings.agent.status.connected",
                         "Running on 127.0.0.1:{Port} — {Count} dsh client(s) connected.",
-                        ("Port", port), ("Count", clients.ToString()))
-                    : AiLoc.T("settings.agent.status.running",
-                        "Running on 127.0.0.1:{Port} — no dsh client connected yet.", ("Port", port));
+                        ("Port", port), ("Count", clients.ToString())) + chat;
+                }
+
+                return AiLoc.T("settings.agent.status.running",
+                    "Running on 127.0.0.1:{Port} — no dsh client connected yet.", ("Port", port));
             }
 
             var error = AgentBridgeService.LastError;

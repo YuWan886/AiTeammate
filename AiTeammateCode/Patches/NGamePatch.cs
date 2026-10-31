@@ -409,7 +409,7 @@ public static class NGamePatch
         // The panel can be built after the conversation already started (AI joined, solo climb
         // began, or a dsh client connected mid-run), so replay what has been said so far.
         // 面板可能晚于对话创建：把已有消息补进记录。
-        foreach (var existing in manager.ChatManager.RecentMessages.TakeLast(40))
+        foreach (var existing in manager.ChatManager.SnapshotRecent(40))
             AddMessageToPanel(existing);
 
         void OnSend(string text)

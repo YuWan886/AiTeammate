@@ -151,7 +151,7 @@ public class DecisionService
         // follow-up decision is parked again with the results, exactly like the LLM loop below.
         if (AgentDecisionBroker.Enabled)
         {
-            var externalPrompt = firstPrompt;
+            var externalPrompt = AppendRecentChat(firstPrompt);
             var answer = await AgentDecisionBroker.RequestAsync(aiPlayer, kind, systemPrompt, externalPrompt, ct);
 
             for (var round = 0; round < maxToolRounds; round++)
@@ -169,7 +169,7 @@ public class DecisionService
 
                 var toolResult = MainThread.Invoke(() => _tools.Execute(aiPlayer, calls));
                 LogToolCalls(calls, toolResult.Text);
-                externalPrompt = firstPrompt +
+                externalPrompt = AppendRecentChat(firstPrompt) +
                                  "\n\n工具结果：\n" + toolResult.Text +
                                  "\n\n请基于上面的工具结果，直接输出最终决策 JSON；不要再次调用工具。";
                 answer = await AgentDecisionBroker.RequestAsync(aiPlayer, kind, systemPrompt, externalPrompt, ct);
@@ -235,6 +235,24 @@ public class DecisionService
         catch
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Appends the latest player chat lines to a decision prompt answered by dsh, so a tactic typed
+    /// into the chat panel still reaches the decision even when the follow-up message was missed.
+    /// 聊天内容进入 dsh 的决策提示词。
+    /// </summary>
+    private static string AppendRecentChat(string prompt)
+    {
+        try
+        {
+            var block = AiTeammateManager.Instance?.ChatManager?.BuildRecentChatBlockForPrompt();
+            return string.IsNullOrWhiteSpace(block) ? prompt : prompt + "\n\n" + block;
+        }
+        catch
+        {
+            return prompt;
         }
     }
 

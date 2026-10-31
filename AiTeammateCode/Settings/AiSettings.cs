@@ -160,6 +160,25 @@ public sealed class AiSettings
     /// </summary>
     public int AgentFallbackSeconds { get; set; } = 30;
 
+    /// <summary>
+    /// Lets the attached dsh conversation answer the in-game chat panel instead of the built-in
+    /// backend. Only takes effect while a dsh plugin is polling <c>sts2_chat_poll</c>, so an older
+    /// plugin (or one with no bound conversation) keeps the old behaviour. dsh 接管聊天回复。
+    /// </summary>
+    public bool AgentChatToDsh { get; set; } = true;
+
+    /// <summary>
+    /// How long a player chat line waits for dsh before falling back (default two minutes, enough
+    /// for a model that is finishing a turn). 等 dsh 回复聊天的秒数。
+    /// </summary>
+    public int AgentChatReplyTimeoutSeconds { get; set; } = 120;
+
+    /// <summary>
+    /// When dsh does not answer within the timeout (or disconnects), let the built-in backend reply
+    /// instead of leaving the player without an answer. 聊天超时/断线时回退内置后端。
+    /// </summary>
+    public bool AgentChatFallbackToBackend { get; set; } = true;
+
     // ---- Auto-launched dsh session ----
     // The mod can start a dsh session by itself when an AI teammate joins a run, so the player no
     // longer has to open a conversation and type "play Slay the Spire 2" by hand.
@@ -242,6 +261,9 @@ public sealed class AiSettings
         AgentBridgeToken = defaults.AgentBridgeToken;
         AgentBridgeAllowActions = defaults.AgentBridgeAllowActions;
         AgentFallbackSeconds = defaults.AgentFallbackSeconds;
+        AgentChatToDsh = defaults.AgentChatToDsh;
+        AgentChatReplyTimeoutSeconds = defaults.AgentChatReplyTimeoutSeconds;
+        AgentChatFallbackToBackend = defaults.AgentChatFallbackToBackend;
         AutoLaunchAgentSession = defaults.AutoLaunchAgentSession;
         AgentLaunchWorkspace = defaults.AgentLaunchWorkspace;
         AgentLaunchPrompt = defaults.AgentLaunchPrompt;

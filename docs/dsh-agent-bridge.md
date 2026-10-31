@@ -49,6 +49,19 @@ v1 只让 dsh 操作**本地真人玩家**。v2 增加了一条更重要的通�
 - 运行控制工具：`sts2_pause` / `sts2_resume` / `sts2_save` / `sts2_quit_to_menu` / `sts2_abandon`。暂停菜单（capstone submenu）不在 overlay 栈里，快照单独识别为 `phase=paused`、不可行动。
 - 人格：`AgentDecisionBroker.Enabled` 时 system prompt 不再包含 mod 的人格档案与长期记忆（改为 `prompt.system.external_agent`），人格由 dsh 自己决定；只保留 JSON/语言等输出要求与团队协作原则。
 
+### 1.4 聊天面板由 dsh 回复（v2.3）
+
+dsh 接管时，游戏聊天面板里的玩家发言也交给 dsh，而不是配置的 LLM 后端：
+
+- 玩家在面板发言 → `ChatManager` 记录消息后询问 `AgentChatRelay`：只要**最近 10 秒内有插件在轮询 `sts2_chat_poll`**，就把这条消息放进中继队列、不再请求后端。
+- 插件以 `<sts2_chat>` 消息把队列内容注入当前对话，模型用 `sts2_chat_send {text, reply_to}` 回复；mod 走 `ChatManager.AddAiMessage` 渲染，面板、气泡、历史与内置后端完全一致。
+- `sts2_chat_send` 可带 `directives`（与内置聊天 JSON 同构）与 `nickname`，所以聊天原有的“记录战术 / 改昵称”副作用不会丢。
+- **影响决策的三层保障**：① 消息进入 dsh 的对话上下文；② `sts2_state` / `sts2_wait` 快照带 `chat.recent` 与 `chat.unread`，未读时 `notes` 提示调用 `sts2_chat_poll`；③ dsh 决策提示词末尾追加 `[玩家最近聊天]`（`DecisionService.AppendRecentChat`），即使对话上下文被压缩，玩家最新的话仍会进入本次决策。
+- **能力探测而非版本猜测**：插件只有在绑定了一个 dsh 对话后才轮询（任意 `sts2_*` 工具调用、`sts2_autoplay`、自动接管都会绑定）。旧版插件、没绑定对话的 dsh、桥接关闭时不会产生轮询，聊天自动走回内置后端。
+- **回退**：超过 `AgentChatReplyTimeoutSeconds`（默认 120 秒）未回复、或客户端断开，`AgentChatFallbackToBackend` 打开时由内置后端补答并在面板注明；该 `reply_to` 随即标记为“已由内置模型回答”，dsh 迟到的同一 `reply_to` 会被拒绝（不带 `reply_to` 的新发言仍然可以发）。
+- **不污染决策活性**：`sts2_chat_poll` / `sts2_chat_send` 与 `sts2_takeover` 一样不计入 `AgentBridgeService` 的“dsh 还活着”打点，否则 1 秒一次的聊天轮询会让“dsh 静默回退”永久失效。聊天也不再触发内置的 `TryAutoMessage` 自动闲聊，避免两个声音。
+- 只读模式（`AgentBridgeAllowActions=false`）下聊天中继照常工作：聊天不是游戏动作。
+
 
 ## 2. 为什么用 dsh 插件而不是 MCP
 
@@ -273,6 +286,8 @@ export function apply(ctx, config) { /* 注册工具 + 连接 + autoplay */ }
 | `sts2_set_nickname` | `{name}` | 修改 AI 队友显示昵称（≤24 字；空字符串恢复人格名）；名牌、聊天、提示词与联机客户端同步，只读模式也可用 |
 | `sts2_screenshot` | `{}` | 截图，原生 image content |
 | `sts2_decide` | `{decision}` | **v2**：回答 `phase=ai_decision` 里的挂起决策；内容是 prompt 要求的 JSON（对象或字符串均可） |
+| `sts2_chat_poll` | `{after_seq?, wait_seconds?}` | **v2.3**：长轮询玩家聊天（默认等 15s、上限 25s）。返回 `seq` 与 `messages[{seq,from,text,kind,at}]`；无消息时 `wait_timed_out=true` |
+| `sts2_chat_send` | `{text, reply_to?, directives?, nickname?}` | **v2.3**：在聊天面板发言；`reply_to` 回答某条玩家消息（已由内置模型回答的会被拒绝），`directives` 记录战术，`nickname` 改显示名 |
 | `sts2_start_run` | `{character?, ascension?, seed?}` | **v2**：从主菜单开一局新的单人游戏 |
 | `sts2_continue_run` | `{}` | **v2**：读取存档继续 |
 | `sts2_pause` | `{}` | 打开暂停菜单（`NPauseMenu`）；单人爬塔/AI 队友模式下同时挂起自动化。快照变为 `phase=paused`、不可行动 |
@@ -373,6 +388,9 @@ Continue with the sts2_* tools. Current state:
 | `AgentBridgePort` | `26333` | 监听端口 |
 | `AgentBridgeToken` | `""` | 可选请求 token |
 | `AgentBridgeAllowActions` | `true` | 允许动作工具；关闭后只能读 |
+| `AgentChatToDsh` | `true` | 由 dsh 回复游戏聊天（仅在插件轮询 `sts2_chat_poll` 时生效） |
+| `AgentChatReplyTimeoutSeconds` | `120` | 一条聊天等 dsh 的秒数 |
+| `AgentChatFallbackToBackend` | `true` | 超时/断开时由内置后端补答 |
 
 设置页显示运行状态（运行中 / 端口占用 / 错误）和**已连接的 dsh 客户端数**。连接/断开时 `AiLogger` 记录 `[Agent] client connected/disconnected`。由于插件是懒连接，只有 dsh 第一次调用 `sts2_*` 工具后才会看到客户端。
 
@@ -471,6 +489,7 @@ dsh --profile web --dump-config
 | `AiTeammateCode/Agent/AgentSnapshot.cs` | 阶段判定、快照 JSON、token、options |
 | `AiTeammateCode/Agent/AgentActions.cs` | 各动作的游戏 API/UI 实现 |
 | `AiTeammateCode/Agent/AgentDecisionBroker.cs` | v2：把 AI 的决策调用挂起，等 dsh 用 `sts2_decide` 回答 |
+| `AiTeammateCode/Agent/AgentChatRelay.cs` | v2.3：聊天中继（玩家发言队列、`sts2_chat_poll` / `sts2_chat_send`、能力探测、超时回退） |
 | `AiTeammateCode/Settings/AiSettings.cs` | 4 个新设置字段 |
 | `AiTeammateCode/Settings/AiSettingsPage.cs` | 新分区、状态段落、重启按钮 |
 | `AiTeammateCode/Patches/NGamePatch.cs` | 挂载 supervisor |

@@ -153,6 +153,15 @@ internal static class AgentSnapshotBuilder
         ctx.Json["ai_name"] = AiNames.DisplayName;
         ctx.Json["ai_nickname"] = AiNames.ConfiguredNickname;
 
+        // Chat relay state: recent lines are always visible, and an unanswered one is announced in
+        // the notes so the autoplay loop notices it even if the plugin's follow-up was missed.
+        ctx.Json["chat"] = AgentChatRelay.SnapshotJson();
+        if (AgentChatRelay.UnreadCount > 0)
+        {
+            ctx.Notes.Add("The player wrote in the in-game chat. "
+                          + "Call sts2_chat_poll and answer with sts2_chat_send {text, reply_to}.");
+        }
+
         if (state == null)
         {
             DetectMenu(ctx);

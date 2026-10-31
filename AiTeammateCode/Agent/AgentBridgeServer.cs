@@ -156,9 +156,9 @@ internal sealed class AgentBridgeServer : IDisposable
         var args = request["args"] as JsonObject ?? new JsonObject();
 
         // Poll-style calls must not count as "dsh is alive": the plugin asks for a take-over
-        // invitation every few seconds even when no session is driving, and stamping them would
-        // keep the silence fallback from ever firing.
-        var passive = call is "sts2_takeover";
+        // invitation every few seconds even when no session is driving, and it polls for player
+        // chat lines every second. Stamping either would keep the silence fallback from ever firing.
+        var passive = call is "sts2_takeover" or "sts2_chat_poll" or "sts2_chat_send";
 
         AgentToolResult result;
         if (!passive)

@@ -58,6 +58,12 @@ internal static class AgentToolExecutor
                 case "sts2_set_nickname":
                     // Cosmetic self-rename: allowed even in read-only mode, like sts2_read.
                     return SetNickname(args);
+                case "sts2_chat_poll":
+                    // The in-game chat panel is relayed through this long poll; the plugin only asks
+                    // when it has a conversation that can answer. 聊天中继：插件取走玩家发言。
+                    return await AgentChatRelay.PollAsync(args, ct);
+                case "sts2_chat_send":
+                    return ChatSend(args);
                 case "sts2_screenshot":
                     return Screenshot();
             }
@@ -83,9 +89,10 @@ internal static class AgentToolExecutor
         var json = new JsonObject
         {
             ["name"] = "sts2-agent-bridge",
-            ["bridge_version"] = "2.0.0",
+            ["bridge_version"] = "2.1.0",
             ["allow_actions"] = AgentBridgeService.AllowActions,
             ["agent_driving"] = AgentDecisionBroker.Enabled,
+            ["chat"] = true,
             ["port"] = AgentBridgeService.Port,
             ["instructions"] =
                 "Call sts2_state to inspect the game, sts2_wait to block until input is needed. "
@@ -96,7 +103,10 @@ internal static class AgentToolExecutor
                 + "when it shows kind=ai the AI player is yours and decisions come as phase=ai_decision, "
                 + "answered with sts2_decide. Start or resume a run with sts2_start_run / sts2_continue_run; "
                 + "run control is sts2_pause / sts2_resume / sts2_save / sts2_quit_to_menu / sts2_abandon. "
-                + "sts2_set_nickname changes the AI teammate's display name at any time."
+                + "sts2_set_nickname changes the AI teammate's display name at any time. "
+                + "sts2_chat_poll returns player chat lines waiting for an answer; reply with "
+                + "sts2_chat_send {text, reply_to} (the poll seq), and use its directives field to record "
+                + "tactics the player asked for."
         };
         return AgentToolResult.Ok(json.ToJsonString(AgentJson.Options));
     }
@@ -221,6 +231,16 @@ internal static class AgentToolExecutor
             var result = runner.Execute(player, new[] { call });
             return AgentToolResult.Ok(result.Text);
         });
+    }
+
+    /// <summary>
+    /// dsh writes a line into the in-game chat panel (the reply half of the chat relay).
+    /// 外部 Agent 在游戏聊天面板里发言。
+    /// </summary>
+    private static AgentToolResult ChatSend(JsonObject args)
+    {
+        var (ok, message) = AgentChatRelay.SendReply(args);
+        return ok ? AgentToolResult.Ok(message) : AgentToolResult.Error(message);
     }
 
     /// <summary>
