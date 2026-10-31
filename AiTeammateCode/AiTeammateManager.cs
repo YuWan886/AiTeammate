@@ -62,6 +62,7 @@ public class AiTeammateManager
     private readonly Lock _turnLock = new();
     private readonly Lock _restSiteUpgradeLock = new();
     private CancellationTokenSource? _turnCts;
+    private ulong _staleBindingNotifiedNetId;
     private List<int>? _pendingRestSiteUpgradeIndices;
     private bool _hasTriggeredExtraPlayerTurnCombatDecision;
     private bool _pendingExtraPlayerTurnCombatDecision;
@@ -182,6 +183,45 @@ public class AiTeammateManager
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// True when the cached AI player really takes part in the given combat. A binding left over from
+    /// an earlier run keeps a Player whose Creature died with that run, and a fresh run reuses net ids,
+    /// so identity has to be judged by instance membership, not by NetId. Signalling end-of-turn for
+    /// such a leftover is not harmless: in singleplayer <c>AllPlayersReadyToEndTurn()</c> returns true
+    /// without consulting the ready set, so the call ends the current player's turn immediately.
+    /// </summary>
+    private bool IsAiPlayerInCurrentCombat(CombatState state)
+    {
+        var aiPlayer = AiPlayer;
+        if (aiPlayer == null)
+            return false;
+
+        lock (_turnLock)
+        {
+            if (state.Players.Contains(aiPlayer))
+                return true;
+        }
+
+        // Solo climb binds the RunState Player instance, while a save load may rebuild the combat's
+        // own instances. Accept the same NetId only while solo control is genuinely active; a leftover
+        // from a finished run has solo control released and stays rejected.
+        if (!IsSoloControlled)
+            return false;
+
+        return state.Players.Any(p => p.NetId == aiPlayer.NetId && p.Creature?.IsAlive == true);
+    }
+
+    /// <summary>Drops a binding that cannot belong to the run that is being set up now.</summary>
+    private void ClearStaleAiPlayerBinding(string origin)
+    {
+        var stale = AiPlayer;
+        if (stale == null)
+            return;
+
+        AiPlayer = null;
+        MainFile.Logger.Info($"[{origin}] 清除过期的AI玩家绑定 (NetId={stale.NetId}, 角色={stale.Character?.Id.Entry})");
     }
 
     private void ApplyAiPlayerBinding(Player aiPlayer, bool announce)
@@ -423,6 +463,15 @@ public class AiTeammateManager
             return;
         }
 
+        // No AI-identity player is in this combat. The manager is process-wide while players belong
+        // to one run, so a binding whose NetId is not among the live players is a leftover from an
+        // earlier run and must be dropped instead of being reused for the new one.
+        if (AiPlayer != null && state.Players.Count > 0
+            && !state.Players.Any(p => p.NetId == AiPlayer.NetId))
+        {
+            ClearStaleAiPlayerBinding("Combat");
+        }
+
         if (AiPlayer != null) return;
 
         SoloRunController.TryBind(this);
@@ -443,6 +492,14 @@ public class AiTeammateManager
         {
             RebindAiPlayer(live, "Detect");
             return;
+        }
+
+        // Same leftover rule as the combat overload: a binding that is not part of the run that is
+        // loaded right now belongs to a finished run (fresh runs reuse NetIds, the player objects do not).
+        if (AiPlayer != null && state is { Players.Count: > 0 }
+            && !state.Players.Any(p => p.NetId == AiPlayer.NetId))
+        {
+            ClearStaleAiPlayerBinding("Detect");
         }
 
         if (AiPlayer != null) return;
@@ -466,6 +523,22 @@ public class AiTeammateManager
 
         var state = CombatManager.Instance.DebugOnlyGetState();
         if (state == null) return;
+
+        // A binding left over from an earlier run keeps a Player whose Creature died with that run.
+        // Never let it drive turn handling: in singleplayer AllPlayersReadyToEndTurn() returns true
+        // without looking at the ready set, so ANY SetReadyToEndTurn call below ends the human's
+        // turn on the spot — the run then looks like it skips every single turn.
+        if (!IsAiPlayerInCurrentCombat(state))
+        {
+            var staleNetId = AiPlayer?.NetId ?? 0;
+            if (_staleBindingNotifiedNetId != staleNetId)
+            {
+                _staleBindingNotifiedNetId = staleNetId;
+                AiLog.Log("SYSTEM", $"AI 玩家不属于当前战斗(NetId={staleNetId})，忽略本次回合处理");
+            }
+            return;
+        }
+        _staleBindingNotifiedNetId = 0;
 
         // === CRITICAL: AI death detection ===
         // If the AI died during the enemy turn, immediately end turn
